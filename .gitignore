@@ -1,6 +1,10 @@
 .env
 chips/
 results.csv
+*_results.csv
+*_results_detail.csv
+*_results.xlsx
+*_EXECUTIVE_SUMMARY.md
 __pycache__/
 .venv/
 

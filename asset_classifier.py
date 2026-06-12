@@ -876,6 +876,176 @@ def _row_error(record: dict) -> str | None:
     return err or None
 
 
+def _format_asset_label(record: dict) -> str:
+    label = str(record.get("label", "")).strip()
+    aid = record.get("id", "")
+    return f"{aid} ({label})" if label else str(aid)
+
+
+def _format_located(record: dict) -> str:
+    off = record.get("asset_offset_m")
+    if off is not None and not (isinstance(off, float) and pd.isna(off)):
+        return f"{off:.0f} m off"
+    if record.get("asset_view"):
+        return f"on {record['asset_view']}"
+    return "—"
+
+
+def _format_cell_equip(record: dict) -> str:
+    ce = record.get("cell_equipment")
+    ev = str(record.get("cell_equipment_evidence") or "").strip()
+    if ce is True:
+        return f"true — {ev}" if ev else "true"
+    if ce is False:
+        return f"false — {ev}" if ev else "false"
+    if ce is None:
+        return "unknown"
+    return str(ce)
+
+
+def _format_confidence(record: dict) -> str | float:
+    conf = record.get("site_confidence")
+    if conf is None or (isinstance(conf, float) and pd.isna(conf)):
+        return "—"
+    if isinstance(conf, (int, float)):
+        return round(float(conf), 2)
+    return conf
+
+
+def pick_review_image_path(asset_id: str, record: dict) -> Path | None:
+    """Pick the best saved chip for stakeholder review (oblique > NAIP > zoom)."""
+    chip = CHIP_DIR
+    nm = (record.get("nearmap_views") or "").lower()
+    asset_view = (record.get("asset_view") or "").lower()
+
+    oblique_dirs = {
+        "north": "north", "east": "east", "south": "south", "west": "west",
+    }
+    if record.get("cell_equipment") is True:
+        for name, suffix in oblique_dirs.items():
+            if name in nm or name in asset_view:
+                path = chip / f"{asset_id}_nearmap_{suffix}.jpg"
+                if path.exists():
+                    return path
+
+    for name, suffix in oblique_dirs.items():
+        if name in asset_view:
+            path = chip / f"{asset_id}_nearmap_{suffix}.jpg"
+            if path.exists():
+                return path
+
+    if "nearmap top-down" in asset_view or "vert" in nm:
+        path = chip / f"{asset_id}_nearmap_vert.jpg"
+        if path.exists():
+            return path
+
+    chip_path = record.get("chip_path")
+    if chip_path:
+        path = Path(chip_path)
+        if path.exists():
+            return path
+
+    for name in (f"{asset_id}_nearmap_vert.jpg", f"{asset_id}_NAIP.jpg"):
+        path = chip / name
+        if path.exists():
+            return path
+
+    zooms = sorted(chip.glob(f"{asset_id}_zoom_*.jpg"))
+    return zooms[0] if zooms else None
+
+
+def build_stakeholder_row(record: dict) -> dict:
+    err = _row_error(record)
+    if err:
+        return {
+            "Asset": _format_asset_label(record),
+            "Site type": "error",
+            "Conf": "—",
+            "Located": "—",
+            "Cell equip": err[:120],
+            "Views": record.get("view_count", 0),
+            "Review image": record.get("review_image"),
+        }
+    if record.get("site_type") == "no_imagery":
+        return {
+            "Asset": _format_asset_label(record),
+            "Site type": "no imagery",
+            "Conf": "—",
+            "Located": "—",
+            "Cell equip": "—",
+            "Views": 0,
+            "Review image": None,
+        }
+    return {
+        "Asset": _format_asset_label(record),
+        "Site type": record.get("site_type"),
+        "Conf": _format_confidence(record),
+        "Located": _format_located(record),
+        "Cell equip": _format_cell_equip(record),
+        "Views": record.get("view_count", 0),
+        "Review image": record.get("review_image"),
+    }
+
+
+def write_stakeholder_report(results: list[dict], report_csv: str, report_xlsx: str):
+    """Write a clean CSV + Excel workbook with embedded review images."""
+    rows = [build_stakeholder_row(r) for r in results]
+    report_df = pd.DataFrame(rows)
+    report_df.to_csv(report_csv, index=False)
+
+    try:
+        from openpyxl import Workbook
+        from openpyxl.drawing.image import Image as XLImage
+        from openpyxl.styles import Font, PatternFill, Alignment
+        from openpyxl.utils import get_column_letter
+    except ImportError:
+        print(f"Stakeholder CSV written to {report_csv} "
+              "(install openpyxl for Excel export)")
+        return
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Results"
+
+    headers = ["Asset", "Site type", "Conf", "Located", "Cell equip", "Views", "Photo"]
+    header_fill = PatternFill("solid", fgColor="1F4E79")
+    header_font = Font(color="FFFFFF", bold=True)
+    for col, header in enumerate(headers, start=1):
+        cell = ws.cell(row=1, column=col, value=header)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center")
+
+    for row_idx, row in enumerate(rows, start=2):
+        ws.row_dimensions[row_idx].height = 95
+        ws.cell(row=row_idx, column=1, value=row["Asset"])
+        ws.cell(row=row_idx, column=2, value=row["Site type"])
+        ws.cell(row=row_idx, column=3, value=row["Conf"])
+        ws.cell(row=row_idx, column=4, value=row["Located"])
+        ws.cell(row=row_idx, column=5, value=row["Cell equip"])
+        ws.cell(row=row_idx, column=6, value=row["Views"])
+
+        img_path = row.get("Review image")
+        if img_path and Path(img_path).exists():
+            thumb = CHIP_DIR / f"_thumb_{Path(img_path).name}"
+            with Image.open(img_path) as im:
+                im = im.convert("RGB")
+                im.thumbnail((160, 120))
+                thumb_w, thumb_h = im.size
+                im.save(thumb, quality=85)
+            xl_img = XLImage(str(thumb))
+            xl_img.width, xl_img.height = thumb_w, thumb_h
+            col = get_column_letter(7)
+            ws.add_image(xl_img, f"{col}{row_idx}")
+
+    widths = {"A": 22, "B": 12, "C": 8, "D": 14, "E": 42, "F": 8, "G": 24}
+    for col, width in widths.items():
+        ws.column_dimensions[col].width = width
+
+    wb.save(report_xlsx)
+    print(f"Stakeholder report written to {report_csv} and {report_xlsx}")
+
+
 def write_executive_summary(results: list[dict], assets_df: pd.DataFrame):
     """Write a stakeholder-friendly markdown summary of the latest run."""
     total = len(assets_df)
@@ -1058,19 +1228,31 @@ def main():
     parser.add_argument("--input", "-i", default=INPUT_CSV,
                         help=f"Input CSV (default: {INPUT_CSV})")
     parser.add_argument("--output", "-o", default=None,
-                        help="Output CSV (default: results.csv or WI_results.csv pattern)")
+                        help="Detail output CSV for resume (auto-derived from input)")
+    parser.add_argument("--report-csv", default=None,
+                        help="Stakeholder summary CSV (default: WI_results.csv pattern)")
+    parser.add_argument("--report-xlsx", default=None,
+                        help="Stakeholder Excel with photos (default: WI_results.xlsx pattern)")
     args = parser.parse_args()
 
     INPUT_CSV = args.input
+    stem = Path(INPUT_CSV).stem
+    prefix = stem.replace("_assets", "") if stem.endswith("_assets") else stem
+
     if args.output:
         OUTPUT_CSV = args.output
-    elif INPUT_CSV.endswith("_assets.csv"):
-        OUTPUT_CSV = INPUT_CSV.replace("_assets.csv", "_results.csv")
+    elif stem.endswith("_assets"):
+        OUTPUT_CSV = f"{prefix}_results_detail.csv"
     else:
         OUTPUT_CSV = "results.csv"
-    stem = Path(OUTPUT_CSV).stem
-    EXECUTIVE_SUMMARY_MD = f"{stem.replace('_results', '')}_EXECUTIVE_SUMMARY.md"
-    if stem == "results":
+
+    report_csv = args.report_csv or (
+        f"{prefix}_results.csv" if stem.endswith("_assets") else None)
+    report_xlsx = args.report_xlsx or (
+        f"{prefix}_results.xlsx" if stem.endswith("_assets") else None)
+
+    EXECUTIVE_SUMMARY_MD = f"{prefix}_EXECUTIVE_SUMMARY.md"
+    if OUTPUT_CSV == "results.csv":
         EXECUTIVE_SUMMARY_MD = "EXECUTIVE_SUMMARY.md"
 
     if not (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")):
@@ -1083,7 +1265,9 @@ def main():
     CHIP_DIR.mkdir(exist_ok=True)
 
     print(f"Input:  {INPUT_CSV}")
-    print(f"Output: {OUTPUT_CSV}")
+    print(f"Output: {OUTPUT_CSV} (detail/resume)")
+    if report_csv:
+        print(f"Report: {report_csv} + {report_xlsx}")
 
     df = pd.read_csv(INPUT_CSV)
     validate_input_csv(df)
@@ -1228,6 +1412,7 @@ def main():
                 "nearmap_views": ",".join(nearmap_views) or None,
                 "nearmap_aoi_m": nearmap_aoi_m,
                 "chip_path": str(chip_path) if chip_path else None,
+                "view_count": len(views),
                 "site_type": res.get("site_type"),
                 "site_confidence": res.get("site_confidence"),
                 "site_evidence": res.get("site_evidence"),
@@ -1248,6 +1433,9 @@ def main():
                     and res.get("cell_equipment") is False),
                 "model": res.get("model"),
             })
+            review_path = pick_review_image_path(row["id"], record)
+            if review_path:
+                record["review_image"] = str(review_path)
             loc = (f"({asset_lat:.6f},{asset_lon:.6f}, {asset_offset_m:.0f}m off)"
                    if asset_lat is not None else f"(box on: {box_view})")
             print(f"[{row['id']}] {record['site_type']} "
@@ -1268,6 +1456,8 @@ def main():
         time.sleep(12.0)  # well under the free tier's ~10 requests/min limit
 
     write_executive_summary(results, df)
+    if report_csv and report_xlsx:
+        write_stakeholder_report(results, report_csv, report_xlsx)
     print(f"\nDone. {len(results)} records written to {OUTPUT_CSV}")
     print(f"Executive summary written to {EXECUTIVE_SUMMARY_MD}")
 
