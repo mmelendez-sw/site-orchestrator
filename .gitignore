@@ -3,3 +3,6 @@ chips/
 results.csv
 __pycache__/
 .venv/
+
+# Architecture diagrams (local only — edit/regenerate outside git)
+docs/diagrams/
