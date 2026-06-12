@@ -1,5 +1,6 @@
 .env
 chips/
+runs/
 results.csv
 *_results.csv
 *_results_detail.csv

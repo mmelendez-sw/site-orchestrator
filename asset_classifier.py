@@ -36,6 +36,7 @@ import math
 import os
 import time
 import argparse
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -50,6 +51,12 @@ from PIL import Image
 from google import genai
 from google.genai import types as genai_types
 from dotenv import load_dotenv
+
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(iterable, **kwargs):
+        return iterable
 
 load_dotenv()  # picks up GEMINI_API_KEY from a local .env file if present
 
@@ -72,6 +79,8 @@ INPUT_CSV = "assets.csv"    # columns: id; lat+lon OR address; optional: label, 
 INPUT_CONFIDENCE_LEVELS = ("high", "medium", "low")
 OUTPUT_CSV = "results.csv"
 CHIP_DIR = Path("chips")
+RUNS_DIR = Path("runs")
+RUN_DIR = Path(".")
 
 # Geocoding: free US Census API first (good for CONUS rooftop addresses), then
 # OpenStreetMap Nominatim. Set GEOCODER=nominatim to skip Census.
@@ -1219,41 +1228,136 @@ def write_executive_summary(results: list[dict], assets_df: pd.DataFrame):
 
     Path(EXECUTIVE_SUMMARY_MD).write_text("\n".join(lines), encoding="utf-8")
 
+
+def setup_run_directory(prefix: str, run_dir: str | None) -> Path:
+    """Create or reopen a timestamped run folder for all outputs."""
+    if run_dir:
+        run_root = Path(run_dir)
+        if not run_root.is_dir():
+            raise SystemExit(f"Run directory not found: {run_root}")
+        print(f"Resuming run folder: {run_root}", flush=True)
+    else:
+        stamp = time.strftime("%Y-%m-%d_%H%M%S")
+        run_root = RUNS_DIR / f"{stamp}_{prefix}"
+        run_root.mkdir(parents=True, exist_ok=True)
+        print(f"Created run folder: {run_root}", flush=True)
+    (run_root / "chips").mkdir(exist_ok=True)
+    return run_root
+
+
+def _print_run_banner(total: int, pending: int, skipped: int, input_csv: str,
+                      run_dir: Path, output_csv: str, report_csv: str | None):
+    """Startup summary so the operator can monitor the run in the terminal."""
+    est_min = max(1, round(pending * 0.35))  # ~12s pacing + API work per site
+    print("\n" + "=" * 60, flush=True)
+    print("  SITE CLASSIFIER RUN", flush=True)
+    print("=" * 60, flush=True)
+    print(f"  Run folder: {run_dir}", flush=True)
+    print(f"  Input:      {input_csv}", flush=True)
+    print(f"  Detail CSV: {output_csv}", flush=True)
+    if report_csv:
+        print(f"  Report:     {report_csv} (+ Excel with photos)", flush=True)
+    print(f"  Chips:      {run_dir / 'chips'}", flush=True)
+    print(f"  Total:      {total} assets | {skipped} already done | {pending} to run",
+          flush=True)
+    print(f"  Est. time:  ~{est_min} min for {pending} remaining", flush=True)
+    print("=" * 60 + "\n", flush=True)
+
+
+def _print_asset_start(idx: int, total: int, asset_id: str, row):
+    """Mark the start of each asset in the terminal log."""
+    addr = _clean_address(row)
+    coord = (f"{row['lat']}, {row['lon']}" if _has_coordinates(row)
+             else (addr[:55] + "…" if addr and len(addr) > 55 else addr))
+    print(f"\n>>> [{idx}/{total}] {asset_id} — {coord}", flush=True)
+
+
+def _print_asset_result(record: dict):
+    """One-line success/failure summary after each asset."""
+    err = _row_error(record)
+    if err:
+        print(f"    RESULT: ERROR — {err[:100]}", flush=True)
+        return
+    site = record.get("site_type", "—")
+    conf = record.get("site_confidence")
+    conf_s = f"{conf:.2f}" if isinstance(conf, (int, float)) else "—"
+    cell = record.get("cell_equipment")
+    cell_s = {True: "yes", False: "no", None: "?"}.get(cell, str(cell))
+    located = _format_located(record)
+    views = record.get("view_count", 0)
+    photo = "photo saved" if record.get("review_image") else "no photo"
+    print(f"    RESULT: {site} | conf {conf_s} | cell {cell_s} | "
+          f"{located} | {views} views | {photo}", flush=True)
+
+
+def _print_run_complete(results: list[dict], run_dir: Path, output_csv: str,
+                        report_csv: str | None, report_xlsx: str | None,
+                        summary_md: str):
+    """Final terminal summary when the batch finishes."""
+    errors = sum(1 for r in results if _row_error(r))
+    ok = len(results) - errors
+    towers = sum(1 for r in results if r.get("site_type") == "tower")
+    rooftops = sum(1 for r in results if r.get("site_type") == "rooftop")
+    cell_hits = sum(1 for r in results if r.get("cell_equipment") is True)
+    print("\n" + "=" * 60, flush=True)
+    print("  RUN COMPLETE", flush=True)
+    print("=" * 60, flush=True)
+    print(f"  Folder:   {run_dir}", flush=True)
+    print(f"  Classified: {ok}/{len(results)}  |  Errors: {errors}", flush=True)
+    print(f"  Towers: {towers}  |  Rooftops: {rooftops}  |  Cell equip: {cell_hits}",
+          flush=True)
+    print(f"  Detail:   {output_csv}", flush=True)
+    if report_csv:
+        print(f"  Report:   {report_csv}", flush=True)
+        print(f"  Excel:    {report_xlsx}  (includes embedded photos)", flush=True)
+    print(f"  Summary:  {summary_md}", flush=True)
+    print("=" * 60 + "\n", flush=True)
+
 # --------------------------------- pipeline ---------------------------------
 
 def main():
-    global INPUT_CSV, OUTPUT_CSV, EXECUTIVE_SUMMARY_MD
+    global INPUT_CSV, OUTPUT_CSV, EXECUTIVE_SUMMARY_MD, CHIP_DIR, RUN_DIR
 
     parser = argparse.ArgumentParser(description="Classify cell sites from aerial imagery")
     parser.add_argument("--input", "-i", default=INPUT_CSV,
                         help=f"Input CSV (default: {INPUT_CSV})")
+    parser.add_argument("--run-dir", default=None,
+                        help="Resume an existing timestamped run folder under runs/")
     parser.add_argument("--output", "-o", default=None,
-                        help="Detail output CSV for resume (auto-derived from input)")
+                        help="Detail output CSV filename inside the run folder")
     parser.add_argument("--report-csv", default=None,
-                        help="Stakeholder summary CSV (default: WI_results.csv pattern)")
+                        help="Stakeholder summary CSV filename inside the run folder")
     parser.add_argument("--report-xlsx", default=None,
-                        help="Stakeholder Excel with photos (default: WI_results.xlsx pattern)")
+                        help="Stakeholder Excel with photos inside the run folder")
     args = parser.parse_args()
 
     INPUT_CSV = args.input
     stem = Path(INPUT_CSV).stem
     prefix = stem.replace("_assets", "") if stem.endswith("_assets") else stem
 
-    if args.output:
-        OUTPUT_CSV = args.output
-    elif stem.endswith("_assets"):
-        OUTPUT_CSV = f"{prefix}_results_detail.csv"
-    else:
-        OUTPUT_CSV = "results.csv"
+    run_root = setup_run_directory(prefix, args.run_dir)
+    RUN_DIR = run_root
+    CHIP_DIR = run_root / "chips"
 
-    report_csv = args.report_csv or (
-        f"{prefix}_results.csv" if stem.endswith("_assets") else None)
-    report_xlsx = args.report_xlsx or (
-        f"{prefix}_results.xlsx" if stem.endswith("_assets") else None)
+    detail_name = (Path(args.output).name if args.output
+                   else f"{prefix}_results_detail.csv"
+                   if stem.endswith("_assets") else "results_detail.csv")
+    OUTPUT_CSV = str(run_root / detail_name)
 
-    EXECUTIVE_SUMMARY_MD = f"{prefix}_EXECUTIVE_SUMMARY.md"
-    if OUTPUT_CSV == "results.csv":
-        EXECUTIVE_SUMMARY_MD = "EXECUTIVE_SUMMARY.md"
+    report_csv = None
+    report_xlsx = None
+    if stem.endswith("_assets") or args.report_csv or args.report_xlsx:
+        report_csv = str(run_root / (Path(args.report_csv).name if args.report_csv
+                                       else f"{prefix}_results.csv"))
+        report_xlsx = str(run_root / (Path(args.report_xlsx).name if args.report_xlsx
+                                        else f"{prefix}_results.xlsx"))
+
+    EXECUTIVE_SUMMARY_MD = str(run_root / (
+        f"{prefix}_EXECUTIVE_SUMMARY.md"
+        if stem.endswith("_assets") else "EXECUTIVE_SUMMARY.md"))
+
+    if not args.run_dir:
+        shutil.copy2(INPUT_CSV, run_root / Path(INPUT_CSV).name)
 
     if not (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")):
         raise SystemExit(
@@ -1262,7 +1366,6 @@ def main():
             "  bash/zsh:   export GEMINI_API_KEY=AIza..."
         )
     client = genai.Client()  # reads GEMINI_API_KEY from environment
-    CHIP_DIR.mkdir(exist_ok=True)
 
     print(f"Input:  {INPUT_CSV}")
     print(f"Output: {OUTPUT_CSV} (detail/resume)")
@@ -1289,9 +1392,14 @@ def main():
                 print(f"Resuming: {len(done_ids)} assets already done, "
                       f"{len(df) - len(done_ids)} remaining")
 
-    for _, row in df.iterrows():
-        if row["id"] in done_ids:
-            continue
+    pending_rows = [row for _, row in df.iterrows() if row["id"] not in done_ids]
+    _print_run_banner(len(df), len(pending_rows), len(done_ids),
+                      INPUT_CSV, run_root, OUTPUT_CSV, report_csv)
+
+    progress = tqdm(pending_rows, desc="Progress", unit="site", dynamic_ncols=True)
+    for row in progress:
+        progress.set_postfix_str(str(row["id"]), refresh=False)
+        _print_asset_start(len(done_ids) + progress.n + 1, len(df), row["id"], row)
         # Carry all input columns (id, lat, lon, address, label, ...) into results
         record = row.to_dict()
         try:
@@ -1300,8 +1408,8 @@ def main():
             record["lon"] = lon
             record.update(geocode_meta)
             if geocode_meta:
-                print(f"  [{row['id']}] geocoded via {geocode_meta.get('geocode_source')}: "
-                      f"{lat:.6f}, {lon:.6f}")
+                print(f"    geocoded ({geocode_meta.get('geocode_source')}): "
+                      f"{lat:.6f}, {lon:.6f}", flush=True)
 
             img, img_date, naip_geo = fetch_chip(lat, lon)
 
@@ -1315,7 +1423,9 @@ def main():
             if img is None and not nearmap_views:
                 record["site_type"] = "no_imagery"
                 results.append(record)
-                print(f"[{row['id']}] no imagery coverage")
+                _print_asset_result(record)
+                pd.DataFrame(results).to_csv(OUTPUT_CSV, index=False)
+                time.sleep(12.0)
                 continue
 
             def build_views(nm_views):
@@ -1438,17 +1548,15 @@ def main():
                 record["review_image"] = str(review_path)
             loc = (f"({asset_lat:.6f},{asset_lon:.6f}, {asset_offset_m:.0f}m off)"
                    if asset_lat is not None else f"(box on: {box_view})")
-            print(f"[{row['id']}] {record['site_type']} "
-                  f"({record['site_confidence']}) {loc} "
-                  f"| cell equip: {record['cell_equipment']} "
-                  f"| stage: {classification_stage} "
-                  f"| views: {len(views)}"
-                  f"{f' +{zoom_count} zoom' if zoom_count else ''} "
-                  f"- {record['site_evidence']}")
+            print(f"    {record['site_type']} ({record['site_confidence']}) {loc} "
+                  f"| cell: {record['cell_equipment']} | stage: {classification_stage}",
+                  flush=True)
+            _print_asset_result(record)
 
         except Exception as e:
             record["error"] = str(e)
-            print(f"[{row['id']}] ERROR: {e}")
+            print(f"    ERROR: {e}", flush=True)
+            _print_asset_result(record)
 
         results.append(record)
         # Rewrite after every row so a mid-run crash never loses completed work
@@ -1458,8 +1566,8 @@ def main():
     write_executive_summary(results, df)
     if report_csv and report_xlsx:
         write_stakeholder_report(results, report_csv, report_xlsx)
-    print(f"\nDone. {len(results)} records written to {OUTPUT_CSV}")
-    print(f"Executive summary written to {EXECUTIVE_SUMMARY_MD}")
+    _print_run_complete(results, run_root, OUTPUT_CSV, report_csv, report_xlsx,
+                      EXECUTIVE_SUMMARY_MD)
 
 
 if __name__ == "__main__":
