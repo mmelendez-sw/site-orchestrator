@@ -67,7 +67,9 @@ STAC_URL = "https://planetarycomputer.microsoft.com/api/stac/v1"
 COLLECTION = "naip"
 CHIP_SIZE_M = 250          # side length of the extracted chip, in meters
 # Primary model first; hops to the next on persistent rate limits or 404.
-_default_models = "claude-sonnet-4-20250514,claude-3-5-haiku-20241022"
+# claude-sonnet-4-20250514 was retired 2026-06-15; use current IDs from:
+# https://docs.anthropic.com/en/docs/about-claude/models/overview
+_default_models = "claude-sonnet-4-6,claude-haiku-4-5-20251001"
 MODELS = [
     m.strip() for m in os.environ.get("CLAUDE_MODELS", _default_models).split(",")
     if m.strip()
@@ -793,10 +795,18 @@ def _call_claude_json(client: Anthropic, content: list, schema: dict,
             raise
         except anthropic.APIStatusError as e:
             if e.status_code == 404 and _model_idx + 1 < len(MODELS):
-                print(f"  {model} unavailable -> hopping to {MODELS[_model_idx + 1]}")
+                print(f"  {model} not found (404) -> hopping to {MODELS[_model_idx + 1]}")
                 _model_idx += 1
                 attempt = 0
                 continue
+            if e.status_code == 404:
+                raise SystemExit(
+                    f"\nClaude model '{model}' returned 404 (not found). "
+                    f"Tried: {', '.join(MODELS)}\n"
+                    "Set CLAUDE_MODELS to valid IDs, e.g. "
+                    "claude-sonnet-4-6,claude-haiku-4-5-20251001\n"
+                    "See https://docs.anthropic.com/en/docs/about-claude/models/overview"
+                ) from e
             if e.status_code in (429, 529, 503, 500) and attempt < retries:
                 attempt += 1
                 wait = 15 * attempt

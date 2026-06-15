@@ -40,7 +40,7 @@ assets.csv            # your input — replace the sample rows with real coordin
 
    Or add `ANTHROPIC_API_KEY=sk-ant-...` to a local `.env` file.
 
-   Default model: `claude-sonnet-4-20250514`, with `claude-3-5-haiku-20241022`
+   Default model: `claude-sonnet-4-6`, with `claude-haiku-4-5-20251001`
    as fallback. Override with `CLAUDE_MODELS=model-a,model-b` (comma-separated).
 
 4. (Optional) Nearmap oblique imagery. If you have a Nearmap subscription, set:
