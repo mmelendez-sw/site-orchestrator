@@ -58,7 +58,7 @@ except ImportError:
     def tqdm(iterable, **kwargs):
         return iterable
 
-load_dotenv()  # picks up GEMINI_API_KEY from a local .env file if present
+load_dotenv()  # picks up ANTHROPIC_API_KEY from a local .env file if present
 
 # ----------------------------- configuration --------------------------------
 
