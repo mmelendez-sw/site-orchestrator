@@ -85,6 +85,11 @@ assets.csv            # your input — replace the sample rows with real coordin
 
 ## Notes & knobs
 
+See **[CONFIGURATION.md](CONFIGURATION.md)** for the full list of environment
+variables, pipeline mode flags (`NEARMAP_TIERED`, `BIFURCATED_AI`, `NAIP_ONLY`),
+and hardcoded constants. Settings load from a local `.env` file (via
+`python-dotenv`) or from shell variables; copy `.env.example` to `.env` to start.
+
 - `CHIP_SIZE_M` (default 250) — shrink to ~150 for tighter zoom if towers
   are being missed; grow for more context.
 - `CLAUDE_MODELS` — comma-separated model list; first is primary, rest are

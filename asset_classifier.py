@@ -51,6 +51,8 @@ import planetary_computer
 from PIL import Image
 import anthropic
 from anthropic import Anthropic
+from google import genai
+from google.genai import types as genai_types
 from dotenv import load_dotenv
 
 try:
@@ -59,7 +61,22 @@ except ImportError:
     def tqdm(iterable, **kwargs):
         return iterable
 
-load_dotenv()  # picks up ANTHROPIC_API_KEY from a local .env file if present
+load_dotenv()  # picks up ANTHROPIC_API_KEY / GEMINI_API_KEY from .env if present
+
+
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.environ.get(name, default).strip().lower() in ("1", "true", "yes")
+
+
+NEARMAP_TIERED = _env_flag("NEARMAP_TIERED")
+BIFURCATED_AI = _env_flag("BIFURCATED_AI")
+NAIP_ONLY = _env_flag("NAIP_ONLY")
+TIER_CONF_HIGH = float(os.environ.get("TIER_CONF_HIGH", "0.75"))
+TIER_CONF_MEDIUM = float(os.environ.get("TIER_CONF_MEDIUM", "0.6"))
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+CLAUDE_ESCALATION_MODEL = os.environ.get(
+    "CLAUDE_ESCALATION_MODEL", "claude-sonnet-4-6")
+OBLIQUE_VIEWS = ["North", "East", "South", "West"]
 
 # ----------------------------- configuration --------------------------------
 
@@ -248,6 +265,29 @@ RESPONSE_SCHEMA = {
     "required": ["site_type", "site_confidence", "site_evidence"],
 }
 
+# Gemini SDK uses a distinct schema dialect; kept in sync with RESPONSE_SCHEMA.
+GEMINI_RESPONSE_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "site_type": {
+            "type": "STRING",
+            "enum": ["tower", "rooftop", "other", "unclear"],
+        },
+        "site_confidence": {"type": "NUMBER"},
+        "site_evidence": {"type": "STRING"},
+        "asset_box_2d": {
+            "type": "ARRAY",
+            "items": {"type": "INTEGER"},
+            "nullable": True,
+        },
+        "asset_view": {"type": "STRING", "nullable": True},
+        "cell_equipment": {"type": "BOOLEAN", "nullable": True},
+        "cell_equipment_confidence": {"type": "NUMBER"},
+        "cell_equipment_evidence": {"type": "STRING"},
+    },
+    "required": ["site_type", "site_confidence", "site_evidence"],
+}
+
 SCAN_PROMPT = """\
 You are reviewing a single top-down aerial image where a cellular tower or \
 rooftop site is expected, but a first-pass classifier could not identify it. \
@@ -282,6 +322,27 @@ SCAN_SCHEMA = {
                         "items": {"type": "integer"},
                     },
                     "reason": {"type": "string"},
+                },
+                "required": ["box_2d", "reason"],
+            },
+        },
+    },
+    "required": ["candidates"],
+}
+
+GEMINI_SCAN_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "candidates": {
+            "type": "ARRAY",
+            "items": {
+                "type": "OBJECT",
+                "properties": {
+                    "box_2d": {
+                        "type": "ARRAY",
+                        "items": {"type": "INTEGER"},
+                    },
+                    "reason": {"type": "STRING"},
                 },
                 "required": ["box_2d", "reason"],
             },
@@ -370,7 +431,7 @@ def build_classification_prompt(row) -> str:
     return prompt
 
 
-def maybe_recheck_equipment(client, res: dict, views: list,
+def maybe_recheck_equipment(provider: str, clients: dict, res: dict, views: list,
                             input_confidence: str) -> dict:
     """Second pass when a trusted source expects gear but the model said false."""
     if input_confidence not in ("high", "medium"):
@@ -380,7 +441,8 @@ def maybe_recheck_equipment(client, res: dict, views: list,
     if len(views) < 2:
         return res
     print("  equipment recheck (trusted source, obliques/shadow pass)")
-    recheck = classify_chip(client, views, prompt=EQUIPMENT_RECHECK_PROMPT)
+    recheck = classify_site(
+        provider, clients, views, prompt=EQUIPMENT_RECHECK_PROMPT)
     if recheck.get("cell_equipment") is True:
         res["cell_equipment"] = True
         res["cell_equipment_confidence"] = recheck.get(
@@ -643,25 +705,23 @@ def _tile_range(lat: float, lon: float, half_m: float, zoom: int):
     return int(x_west), int(x_east), int(y_north), int(y_south)
 
 
-def fetch_nearmap_views(lat: float, lon: float, chip_m: float = NEARMAP_CHIP_M):
+def fetch_nearmap_views(lat: float, lon: float, chip_m: float = NEARMAP_CHIP_M,
+                        views: list[str] | None = None):
     """Fetch Nearmap content for a point via the Tile API: high-res vertical
     plus 45-degree oblique panoramas (N/E/S/W), stitched from XYZ tiles.
 
     Returns ({view_name: PIL.Image}, capture_date). Empty dict when the key is
     not set or the location has no Nearmap coverage.
 
-    Panorama tiles are stored rotated for orientations other than North
-    (per Nearmap's "Panorama Imagery and Coordinate Systems" doc: South tiles
-    are south-up, East tiles east-up, West tiles west-up), so each orientation
-    needs its own paste arrangement. Obliques are also vertically foreshortened
-    in storage; the recommended 256->192 (75%) display squash is applied after
-    stitching.
+    Optional `views` limits which orientations to fetch (e.g. ["Vert"] or
+    OBLIQUE_VIEWS). Defaults to all NEARMAP_VIEWS when omitted.
     """
     if not NEARMAP_API_KEY:
         return {}, None
 
-    views = {}
-    for view in NEARMAP_VIEWS:
+    fetch_views = views if views is not None else NEARMAP_VIEWS
+    result = {}
+    for view in fetch_views:
         zoom = NEARMAP_VERT_ZOOM if view == "Vert" else NEARMAP_OBLIQUE_ZOOM
         x0, x1, y0, y1 = _tile_range(lat, lon, chip_m / 2.0, zoom)
         cols, rows = x1 - x0 + 1, y1 - y0 + 1
@@ -700,9 +760,9 @@ def fetch_nearmap_views(lat: float, lon: float, chip_m: float = NEARMAP_CHIP_M):
             canvas = canvas.resize(
                 (canvas.width, max(1, int(canvas.height * 0.75))))
         canvas.thumbnail((NEARMAP_MAX_PX, NEARMAP_MAX_PX))
-        views[view] = canvas
+        result[view] = canvas
 
-    if not views:
+    if not result:
         return {}, None
 
     # Capture date metadata via the standard (non-transactional) coverage API;
@@ -717,7 +777,7 @@ def fetch_nearmap_views(lat: float, lon: float, chip_m: float = NEARMAP_CHIP_M):
                 capture_date = surveys[0].get("captureDate")
     except Exception:
         pass
-    return views, capture_date
+    return result, capture_date
 
 # --------------------------- classification stage ---------------------------
 
@@ -756,16 +816,17 @@ def _extract_tool_result(resp, tool_name: str, default: dict) -> dict:
 
 
 def _call_claude_json(client: Anthropic, content: list, schema: dict,
-                      tool_name: str, retries: int = 3) -> dict:
+                      tool_name: str, retries: int = 3,
+                      model: str | None = None) -> dict:
     """Shared Claude vision call with tool-based JSON and retry logic."""
     global _model_idx
     attempt = 0
     default = {"site_type": "unclear", "site_confidence": 0.0}
     while True:
-        model = MODELS[_model_idx]
+        use_model = model or MODELS[_model_idx]
         try:
             resp = client.messages.create(
-                model=model,
+                model=use_model,
                 max_tokens=1000,
                 tools=[{
                     "name": tool_name,
@@ -777,31 +838,35 @@ def _call_claude_json(client: Anthropic, content: list, schema: dict,
             )
             res = _extract_tool_result(resp, tool_name, default)
             normalize_model_result(res)
-            res["model"] = model
+            res["model"] = use_model
             return res
         except anthropic.RateLimitError:
+            if model:
+                raise
             if attempt < retries:
                 attempt += 1
                 wait = 15 * attempt
-                print(f"  rate limit on {model}, retrying in {wait}s "
+                print(f"  rate limit on {use_model}, retrying in {wait}s "
                       f"({attempt}/{retries})...")
                 time.sleep(wait)
                 continue
             if _model_idx + 1 < len(MODELS):
-                print(f"  {model} rate limited -> hopping to {MODELS[_model_idx + 1]}")
+                print(f"  {use_model} rate limited -> hopping to {MODELS[_model_idx + 1]}")
                 _model_idx += 1
                 attempt = 0
                 continue
             raise
         except anthropic.APIStatusError as e:
+            if model:
+                raise
             if e.status_code == 404 and _model_idx + 1 < len(MODELS):
-                print(f"  {model} not found (404) -> hopping to {MODELS[_model_idx + 1]}")
+                print(f"  {use_model} not found (404) -> hopping to {MODELS[_model_idx + 1]}")
                 _model_idx += 1
                 attempt = 0
                 continue
             if e.status_code == 404:
                 raise SystemExit(
-                    f"\nClaude model '{model}' returned 404 (not found). "
+                    f"\nClaude model '{use_model}' returned 404 (not found). "
                     f"Tried: {', '.join(MODELS)}\n"
                     "Set CLAUDE_MODELS to valid IDs, e.g. "
                     "claude-sonnet-4-6,claude-haiku-4-5-20251001\n"
@@ -815,23 +880,181 @@ def _call_claude_json(client: Anthropic, content: list, schema: dict,
                 time.sleep(wait)
                 continue
             if e.status_code in (429, 529) and _model_idx + 1 < len(MODELS):
-                print(f"  {model} overloaded -> hopping to {MODELS[_model_idx + 1]}")
+                print(f"  {use_model} overloaded -> hopping to {MODELS[_model_idx + 1]}")
                 _model_idx += 1
                 attempt = 0
                 continue
             raise
 
 
-def classify_chip(client: Anthropic, views: list[tuple[str, Image.Image]],
-                  prompt: str = CLASSIFICATION_PROMPT, retries: int = 3) -> dict:
-    """Classify one asset from a list of (label, image) views."""
+def _gemini_image_part(img: Image.Image) -> genai_types.Part:
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=90)
+    return genai_types.Part.from_bytes(data=buf.getvalue(), mime_type="image/jpeg")
+
+
+def _call_gemini_json(client: genai.Client, contents: list, schema: dict,
+                      retries: int = 3) -> dict:
+    """Gemini vision call with structured JSON output (single model)."""
+    attempt = 0
+    while True:
+        try:
+            resp = client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=contents,
+                config=genai_types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=schema,
+                    max_output_tokens=1000,
+                    **({"thinking_config": genai_types.ThinkingConfig(thinking_budget=0)}
+                       if not GEMINI_MODEL.startswith("gemini-2.0") else {}),
+                ),
+            )
+            break
+        except genai.errors.APIError as e:
+            if e.code in (429, 503) and attempt < retries:
+                attempt += 1
+                wait = 15 * attempt
+                print(f"  transient Gemini {e.code}, retrying in {wait}s "
+                      f"({attempt}/{retries})...")
+                time.sleep(wait)
+                continue
+            raise
+    text = (resp.text or "").strip()
+    start, end = text.find("{"), text.rfind("}")
+    if start != -1 and end > start:
+        text = text[start:end + 1]
+    try:
+        res = json.loads(text)
+    except json.JSONDecodeError:
+        res = {"site_type": "unclear", "site_confidence": 0.0,
+               "site_evidence": f"unparseable model reply: {text[:200]}"}
+    normalize_model_result(res)
+    res["model"] = GEMINI_MODEL
+    return res
+
+
+def _views_to_claude_content(views: list[tuple[str, Image.Image]], prompt: str) -> list:
     content = []
     for label, img in views:
         content.append({"type": "text", "text": f"View: {label}"})
         content.append(_image_block(img))
     content.append({"type": "text", "text": prompt})
+    return content
+
+
+def _views_to_gemini_contents(views: list[tuple[str, Image.Image]], prompt: str) -> list:
+    contents = []
+    for label, img in views:
+        contents.append(f"View: {label}")
+        contents.append(_gemini_image_part(img))
+    contents.append(prompt)
+    return contents
+
+
+def classify_site(provider: str, clients: dict,
+                  views: list[tuple[str, Image.Image]],
+                  prompt: str = CLASSIFICATION_PROMPT, retries: int = 3,
+                  scan: bool = False, claude_model: str | None = None) -> dict:
+    """Classify one asset via Gemini or Claude using the same prompt."""
+    if scan:
+        claude_schema, gemini_schema = SCAN_SCHEMA, GEMINI_SCAN_SCHEMA
+        tool_name = "scan_candidates"
+        classify_prompt = SCAN_PROMPT
+    else:
+        claude_schema, gemini_schema = RESPONSE_SCHEMA, GEMINI_RESPONSE_SCHEMA
+        tool_name = "classify_site"
+        classify_prompt = prompt
+    if provider == "gemini":
+        contents = _views_to_gemini_contents(views, classify_prompt)
+        return _call_gemini_json(clients["gemini"], contents, gemini_schema, retries)
+    content = _views_to_claude_content(views, classify_prompt)
     return _call_claude_json(
-        client, content, RESPONSE_SCHEMA, "classify_site", retries)
+        clients["claude"], content, claude_schema, tool_name, retries,
+        model=claude_model)
+
+
+def site_confidence_band(res: dict) -> str:
+    """Map numeric site_confidence to high | medium | low for tier gating."""
+    conf = normalize_confidence(res.get("site_confidence"))
+    if conf is None:
+        return "low"
+    if conf >= TIER_CONF_HIGH:
+        return "high"
+    if conf >= TIER_CONF_MEDIUM:
+        return "medium"
+    return "low"
+
+
+def tier_confident_stop(res: dict) -> bool:
+    """True when tiered fetch can stop without pulling the next Nearmap tier."""
+    if res.get("site_type") not in ("tower", "rooftop"):
+        return False
+    if site_confidence_band(res) == "low":
+        return False
+    if res.get("cell_equipment") is None:
+        return False
+    return True
+
+
+def escalation_reason(res: dict) -> str | None:
+    """Why a Gemini result should escalate to Claude; None if no escalation."""
+    if res.get("site_type") == "other":
+        return "other_type"
+    if res.get("site_type") == "unclear":
+        return "unclear_type"
+    if site_confidence_band(res) == "low":
+        return "low_confidence"
+    return None
+
+
+def classify_with_tiers(lat: float, lon: float, img: Image.Image | None,
+                        provider: str, clients: dict, prompt: str,
+                        input_confidence: str,
+                        build_views) -> tuple[dict, dict, str | None, str, list]:
+    """Tier 0 (NAIP) -> Tier 1 (Vert) -> Tier 2 (obliques). Returns
+    (result, nearmap_views, nearmap_date, nearmap_tier, views)."""
+    nearmap_views: dict = {}
+    nearmap_date = None
+
+    views = build_views({})
+    res = classify_site(provider, clients, views, prompt=prompt)
+    res = maybe_recheck_equipment(provider, clients, res, views, input_confidence)
+    if tier_confident_stop(res):
+        return res, nearmap_views, nearmap_date, "naip_only", views
+
+    if not NEARMAP_API_KEY:
+        return res, nearmap_views, nearmap_date, "naip_only", views
+
+    vert_views, vert_date = fetch_nearmap_views(lat, lon, views=["Vert"])
+    nearmap_views.update(vert_views)
+    nearmap_date = vert_date or nearmap_date
+    if not nearmap_views:
+        return res, nearmap_views, nearmap_date, "naip_only", views
+
+    views = build_views(nearmap_views)
+    res = classify_site(provider, clients, views, prompt=prompt)
+    res = maybe_recheck_equipment(provider, clients, res, views, input_confidence)
+    if tier_confident_stop(res):
+        return res, nearmap_views, nearmap_date, "vert_only", views
+
+    missing = [v for v in OBLIQUE_VIEWS if v not in nearmap_views]
+    if missing:
+        oblique_views, ob_date = fetch_nearmap_views(lat, lon, views=missing)
+        nearmap_views.update(oblique_views)
+        nearmap_date = ob_date or nearmap_date
+
+    views = build_views(nearmap_views)
+    res = classify_site(provider, clients, views, prompt=prompt)
+    res = maybe_recheck_equipment(provider, clients, res, views, input_confidence)
+    return res, nearmap_views, nearmap_date, "full", views
+
+
+def classify_chip(client: Anthropic, views: list[tuple[str, Image.Image]],
+                  prompt: str = CLASSIFICATION_PROMPT, retries: int = 3) -> dict:
+    """Legacy wrapper — prefer classify_site()."""
+    return classify_site(
+        "claude", {"claude": client}, views, prompt=prompt, retries=retries)
 
 
 def _valid_box(box) -> list[int] | None:
@@ -879,15 +1102,11 @@ def _crop_zoom(img: Image.Image, box: list[int]) -> Image.Image:
     return crop
 
 
-def scout_candidates(client: Anthropic, label: str,
+def scout_candidates(provider: str, clients: dict, label: str,
                      img: Image.Image) -> list[dict]:
-    """Ask Claude to propose candidate regions on a single top-down image."""
-    content = [
-        {"type": "text", "text": f"View: {label}"},
-        _image_block(img),
-        {"type": "text", "text": SCAN_PROMPT},
-    ]
-    res = _call_claude_json(client, content, SCAN_SCHEMA, "scan_candidates")
+    """Ask the vision model to propose candidate regions on one top-down image."""
+    views = [(label, img)]
+    res = classify_site(provider, clients, views, scan=True)
     return res.get("candidates") or []
 
 
@@ -923,12 +1142,12 @@ def build_zoom_views(asset_id: str, source_label: str, source_img: Image.Image,
     return zoom_views
 
 
-def run_zoom_stage(client: Anthropic, asset_id: str,
+def run_zoom_stage(provider: str, clients: dict, asset_id: str,
                    context_views: list[tuple[str, Image.Image]],
                    source_label: str, source_img: Image.Image,
                    max_crops: int = ZOOM_MAX_CANDIDATES) -> tuple[dict, int]:
     """Scout + magnify + re-classify. Returns (result dict, zoom crop count)."""
-    scouted = scout_candidates(client, source_label, source_img)
+    scouted = scout_candidates(provider, clients, source_label, source_img)
     candidates = _anchor_candidates() + scouted
     if not scouted:
         print(f"  [{asset_id}] scout found no extra candidates")
@@ -942,9 +1161,9 @@ def run_zoom_stage(client: Anthropic, asset_id: str,
         return {"site_type": "unclear", "site_confidence": 0.0,
                 "site_evidence": "Zoom stage could not build valid crops."}, 0
 
-    # Keep one wide context view plus all zoom crops
     context = context_views[:1] if context_views else []
-    res = classify_chip(client, context + zoom_views, ZOOM_CLASSIFICATION_PROMPT)
+    res = classify_site(
+        provider, clients, context + zoom_views, prompt=ZOOM_CLASSIFICATION_PROMPT)
     res["classification_stage"] = "zoom"
     return res, len(zoom_views)
 
@@ -1428,7 +1647,33 @@ def regenerate_reports_from_detail(run_root: Path, output_csv: str,
         print(f"  Excel:   {report_xlsx}", flush=True)
     print(f"  Summary: {summary_md}", flush=True)
 
-# --------------------------------- pipeline ---------------------------------
+def classify_with_routing(provider: str, clients: dict, views: list,
+                          prompt: str, input_confidence: str
+                          ) -> tuple[dict, str, str | None, str | None]:
+    """Run primary classification; optionally escalate Gemini -> Claude."""
+    primary_model = provider
+    res = classify_site(provider, clients, views, prompt=prompt)
+    res = maybe_recheck_equipment(provider, clients, res, views, input_confidence)
+
+    escalation_model = None
+    escalation_reason_str = None
+    if BIFURCATED_AI and provider == "gemini":
+        reason = escalation_reason(res)
+        if reason:
+            escalation_reason_str = reason
+            escalation_model = "claude"
+            print(f"  escalating to Claude ({reason.replace('_', ' ')})")
+            res = classify_site(
+                "claude", clients, views, prompt=prompt,
+                claude_model=CLAUDE_ESCALATION_MODEL)
+            res = maybe_recheck_equipment(
+                "claude", clients, res, views, input_confidence)
+    return res, primary_model, escalation_model, escalation_reason_str
+
+
+def _effective_provider(primary_model: str, escalation_model: str | None) -> str:
+    return escalation_model or primary_model
+
 
 def main():
     global INPUT_CSV, OUTPUT_CSV, EXECUTIVE_SUMMARY_MD, CHIP_DIR, RUN_DIR
@@ -1492,7 +1737,28 @@ def main():
             '  PowerShell: $env:ANTHROPIC_API_KEY="sk-ant-..."\n'
             "  bash/zsh:   export ANTHROPIC_API_KEY=sk-ant-..."
         )
-    client = Anthropic()  # reads ANTHROPIC_API_KEY from environment
+    if BIFURCATED_AI and not os.environ.get("GEMINI_API_KEY"):
+        raise SystemExit(
+            "BIFURCATED_AI=1 requires GEMINI_API_KEY. Get a key at "
+            "https://aistudio.google.com/apikey"
+        )
+
+    clients = {
+        "claude": Anthropic(),
+        "gemini": genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+        if BIFURCATED_AI else None,
+    }
+    primary_provider = "gemini" if BIFURCATED_AI else "claude"
+
+    if NAIP_ONLY:
+        print("[BREAKPOINT] NAIP_ONLY=1 — Nearmap fetch disabled. "
+              "Running on NAIP imagery only.", flush=True)
+    if NEARMAP_TIERED and not NAIP_ONLY:
+        print("NEARMAP_TIERED=1 — tiered Nearmap fetch enabled "
+              "(NAIP -> Vert -> obliques)", flush=True)
+    if BIFURCATED_AI:
+        print(f"BIFURCATED_AI=1 — Gemini first ({GEMINI_MODEL}), "
+              f"Claude escalation ({CLAUDE_ESCALATION_MODEL})", flush=True)
 
     print(f"Input:  {INPUT_CSV}")
     print(f"Output: {OUTPUT_CSV} (detail/resume)")
@@ -1541,11 +1807,12 @@ def main():
             img, img_date, naip_geo = fetch_chip(lat, lon)
 
             nearmap_views, nearmap_date = {}, None
-            try:
-                nearmap_views, nearmap_date = fetch_nearmap_views(lat, lon)
-            except Exception as e:
-                # Nearmap is an optional enrichment; never let it sink the row
-                print(f"  [{row['id']}] nearmap fetch failed: {e}")
+            if not NAIP_ONLY:
+                try:
+                    if not NEARMAP_TIERED:
+                        nearmap_views, nearmap_date = fetch_nearmap_views(lat, lon)
+                except Exception as e:
+                    print(f"  [{row['id']}] nearmap fetch failed: {e}")
 
             if img is None and not nearmap_views:
                 record["site_type"] = "no_imagery"
@@ -1574,20 +1841,53 @@ def main():
                 chip_path = CHIP_DIR / f"{row['id']}_NAIP.jpg"
                 img.save(chip_path, quality=90)
 
-            nearmap_aoi_m = NEARMAP_CHIP_M if nearmap_views else None
-            views = build_views(nearmap_views)
             label_hint = str(row.get("label", "")).strip().lower()
             input_confidence = normalize_input_confidence(row.get("input_confidence"))
             prompt = build_classification_prompt(row)
-            res = classify_chip(client, views, prompt=prompt)
-            res = maybe_recheck_equipment(client, res, views, input_confidence)
+
+            primary_model = primary_provider
+            escalation_model = None
+            escalation_reason_str = None
+
+            if NAIP_ONLY:
+                views = build_views({})
+                nearmap_tier = "naip_only"
+                res, primary_model, escalation_model, escalation_reason_str = (
+                    classify_with_routing(
+                        primary_provider, clients, views, prompt, input_confidence))
+            elif NEARMAP_TIERED:
+                res, nearmap_views, nearmap_date, nearmap_tier, views = (
+                    classify_with_tiers(
+                        lat, lon, img, primary_provider, clients, prompt,
+                        input_confidence, build_views))
+                if BIFURCATED_AI:
+                    reason = escalation_reason(res)
+                    if reason:
+                        escalation_reason_str = reason
+                        escalation_model = "claude"
+                        print(f"  escalating to Claude ({reason.replace('_', ' ')})")
+                        res = classify_site(
+                            "claude", clients, views, prompt=prompt,
+                            claude_model=CLAUDE_ESCALATION_MODEL)
+                        res = maybe_recheck_equipment(
+                            "claude", clients, res, views, input_confidence)
+            else:
+                nearmap_tier = "full" if nearmap_views else "naip_only"
+                views = build_views(nearmap_views)
+                res, primary_model, escalation_model, escalation_reason_str = (
+                    classify_with_routing(
+                        primary_provider, clients, views, prompt, input_confidence))
+
+            nearmap_aoi_m = NEARMAP_CHIP_M if nearmap_views else None
             classification_stage = "primary"
             zoom_count = 0
+            stage_provider = _effective_provider(primary_model, escalation_model)
 
             # Wide-AOI fallback: rural sites often have vert-only Nearmap
             # coverage, and the asset may sit outside the narrow AOI entirely
             has_obliques = any(n != "Vert" for n in nearmap_views)
-            if (NEARMAP_API_KEY and res.get("site_type") in ("other", "unclear")
+            if (not NAIP_ONLY and NEARMAP_API_KEY
+                    and res.get("site_type") in ("other", "unclear")
                     and not has_obliques):
                 print(f"  [{row['id']}] unidentified with narrow AOI -> "
                       f"retrying Nearmap at {NEARMAP_FALLBACK_CHIP_M}m")
@@ -1602,10 +1902,14 @@ def main():
                     nearmap_date = wide_date or nearmap_date
                     nearmap_aoi_m = NEARMAP_FALLBACK_CHIP_M
                     views = build_views(wide_views)
-                    res = classify_chip(client, views, prompt=prompt)
-                    res = maybe_recheck_equipment(
-                        client, res, views, input_confidence)
+                    res, _, esc_m, esc_r = classify_with_routing(
+                        stage_provider, clients, views, prompt, input_confidence)
+                    if esc_m:
+                        escalation_model = esc_m
+                        escalation_reason_str = esc_r or escalation_reason_str
                     classification_stage = "wide_aoi"
+                    nearmap_tier = "wide_aoi"
+                    stage_provider = _effective_provider(primary_model, escalation_model)
 
             # Two-stage zoom: scout suspicious regions, magnify, re-classify.
             # Stealth-tagged sites always get a zoom pass - wide imagery often
@@ -1620,7 +1924,8 @@ def main():
                 if source_img is not None:
                     print(f"  [{row['id']}] running two-stage zoom on {source_label}")
                     zoom_res, zoom_count = run_zoom_stage(
-                        client, row["id"], views, source_label, source_img,
+                        stage_provider, clients, row["id"], views,
+                        source_label, source_img,
                         max_crops=3 if force_zoom else ZOOM_MAX_CANDIDATES)
                     prior_conf = res.get("site_confidence") or 0
                     zoom_conf = zoom_res.get("site_confidence") or 0
@@ -1628,11 +1933,12 @@ def main():
                         zoom_res.get("site_type") in ("tower", "rooftop")
                         or zoom_conf > prior_conf
                         or (force_zoom and zoom_res.get("cell_equipment") is True)
-                        or force_zoom  # stealth sites: always trust the zoom pass
+                        or force_zoom
                     )
                     if zoom_wins:
                         res = zoom_res
                         classification_stage = "zoom"
+                        nearmap_tier = "zoom"
 
             # Convert the detection box to real-world coordinates - only valid
             # when the box was drawn on the georeferenced NAIP chip
@@ -1669,6 +1975,10 @@ def main():
                     input_confidence == "high"
                     and res.get("cell_equipment") is False),
                 "model": res.get("model"),
+                "nearmap_tier": nearmap_tier,
+                "primary_model": primary_model,
+                "escalation_model": escalation_model,
+                "escalation_reason": escalation_reason_str,
             })
             review_path = pick_review_image_path(row["id"], record)
             if review_path:
