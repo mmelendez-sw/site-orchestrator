@@ -11,3 +11,5 @@ numpy==2.2.5
 requests==2.32.5
 openpyxl==3.1.5
 tqdm==4.67.1
+simple-salesforce==1.12.6
+rapidfuzz==3.13.0

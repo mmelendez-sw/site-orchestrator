@@ -93,7 +93,7 @@ MODELS = [
 ]
 _model_idx = 0
 API_DELAY_S = float(os.environ.get("CLAUDE_DELAY_S", "12"))
-INPUT_CSV = "assets.csv"    # columns: id; lat+lon OR address; optional: label, input_confidence
+INPUT_CSV = "data/assets.csv"    # columns: id; lat+lon OR address; optional: label, input_confidence
 INPUT_CONFIDENCE_LEVELS = ("high", "medium", "low")
 OUTPUT_CSV = "results.csv"
 CHIP_DIR = Path("chips")
@@ -1673,6 +1673,46 @@ def classify_with_routing(provider: str, clients: dict, views: list,
 
 def _effective_provider(primary_model: str, escalation_model: str | None) -> str:
     return escalation_model or primary_model
+
+
+def classify_record(canonical: dict, run_dir: Path | str | None = None) -> dict:
+    """Run the full classifier pipeline for one orchestrator canonical record."""
+    import sys
+
+    run_path = Path(run_dir) if run_dir else (RUNS_DIR / "orchestrator")
+    run_path.mkdir(parents=True, exist_ok=True)
+
+    site_id = canonical.get("id") or f"site_{abs(hash(canonical.get('address', ''))) % 10**8:08d}"
+    lon = canonical.get("lng") if canonical.get("lng") is not None else canonical.get("lon")
+    input_csv = run_path / f"{site_id}.csv"
+    pd.DataFrame([{
+        "id": site_id,
+        "lat": canonical.get("lat"),
+        "lon": lon,
+        "address": canonical.get("address", ""),
+    }]).to_csv(input_csv, index=False)
+
+    argv = [
+        "asset_classifier",
+        "--input", str(input_csv),
+        "--run-dir", str(run_path),
+    ]
+    prior_argv = sys.argv
+    try:
+        sys.argv = argv
+        main()
+    finally:
+        sys.argv = prior_argv
+
+    detail_path = run_path / "results_detail.csv"
+    if not detail_path.exists():
+        raise RuntimeError(f"Classifier did not produce detail output in {run_path}")
+
+    result = pd.read_csv(detail_path).iloc[-1].to_dict()
+    result["permit_metadata"] = canonical.get("permit_metadata", {})
+    if canonical.get("source_url"):
+        result["source_url"] = canonical["source_url"]
+    return result
 
 
 def main():

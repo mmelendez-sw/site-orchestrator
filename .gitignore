@@ -1,13 +1,16 @@
+.venv/
+venv/
+__pycache__/
 .env
-chips/
+.DS_Store
 runs/
+chips/
 results.csv
 *_results.csv
 *_results_detail.csv
 *_results.xlsx
 *_EXECUTIVE_SUMMARY.md
-__pycache__/
-.venv/
+data/*.csv
 
 # Architecture diagrams (local only — edit/regenerate outside git)
-docs/diagrams/
+classifier/docs/diagrams/

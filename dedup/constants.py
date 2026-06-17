@@ -1,0 +1,5 @@
+"""Dedup thresholds and defaults."""
+
+DUPLICATE_THRESHOLD = 85
+REVIEW_THRESHOLD = 60
+DEFAULT_RADIUS_METERS = 250
