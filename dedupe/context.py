@@ -40,7 +40,7 @@ def build_dataset_bounding_box(
     *,
     meters: float = DEFAULT_RADIUS_METERS,
 ) -> dict[str, float] | None:
-    """Expand the dataset min/max lat/lng by ±meters."""
+    """Expand the dataset-wide min/max lat/lng by ±meters (not per site)."""
     lats = [float(record["lat"]) for record in records if record.get("lat") is not None]
     lngs = [float(record["lng"]) for record in records if record.get("lng") is not None]
     if not lats or not lngs:

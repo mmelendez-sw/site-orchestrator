@@ -94,14 +94,15 @@ class SiteResolver:
         candidates: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """Run spatial + fuzzy dedupe and return status, score, and match."""
-        lat = record["lat"]
-        lng = record["lng"]
         address = record["address"]
 
         pool = candidates if candidates is not None else self._candidate_cache
         if pool is None:
-            bbox = self.build_bounding_box(lat, lng)
-            pool = self.query_salesforce(bbox=bbox)
+            raise RuntimeError(
+                "Call prefetch() with the full dataset before resolve(). "
+                "Dedupe uses one expanded bounding box from the dataset min/max "
+                "lat/lng, not a per-site radius."
+            )
 
         score, matched = self.fuzzy_match(address, pool)
 
