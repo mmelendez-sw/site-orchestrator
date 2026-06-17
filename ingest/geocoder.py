@@ -27,6 +27,13 @@ def _first_result(payload: dict[str, Any]) -> dict[str, Any]:
     return results[0]
 
 
+def _extract_postal_code(result: dict[str, Any]) -> str | None:
+    for component in result.get("address_components") or []:
+        if "postal_code" in component.get("types", []):
+            return component.get("short_name")
+    return None
+
+
 def geocode(address: str) -> dict[str, Any]:
     """Forward-geocode a street address to lat/lng and formatted address."""
     response = requests.get(
@@ -37,11 +44,15 @@ def geocode(address: str) -> dict[str, Any]:
     response.raise_for_status()
     result = _first_result(response.json())
     location = result["geometry"]["location"]
-    return {
+    payload = {
         "lat": location["lat"],
         "lng": location["lng"],
         "address": result.get("formatted_address", address),
     }
+    zip_code = _extract_postal_code(result)
+    if zip_code:
+        payload["zip_code"] = zip_code
+    return payload
 
 
 def reverse_geocode(lat: float, lng: float) -> dict[str, Any]:
@@ -54,8 +65,12 @@ def reverse_geocode(lat: float, lng: float) -> dict[str, Any]:
     response.raise_for_status()
     result = _first_result(response.json())
     location = result["geometry"]["location"]
-    return {
+    payload = {
         "lat": location["lat"],
         "lng": location["lng"],
         "address": result.get("formatted_address", ""),
     }
+    zip_code = _extract_postal_code(result)
+    if zip_code:
+        payload["zip_code"] = zip_code
+    return payload

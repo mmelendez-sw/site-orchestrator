@@ -17,6 +17,9 @@ def source_records_from_dataframe(
     address_col: str = "Address",
     city_col: str = "City",
     state_col: str = "State",
+    zip_col: str | None = None,
+    county_col: str | None = None,
+    country_col: str | None = None,
     label: str | None = None,
     id_prefix: str | None = None,
     metadata_cols: list[str] | None = None,
@@ -25,9 +28,9 @@ def source_records_from_dataframe(
     """Convert a permit dataframe into SourceRecord objects."""
     prefix = (id_prefix or label or source_name).lower().replace(" ", "_")
     records: list[SourceRecord] = []
-    meta_cols = metadata_cols or [
-        c for c in df.columns if c not in {address_col, city_col, state_col}
-    ]
+    reserved = {address_col, city_col, state_col, zip_col, county_col, country_col}
+    reserved = {col for col in reserved if col}
+    meta_cols = metadata_cols or [c for c in df.columns if c not in reserved]
 
     for idx, row in df.iterrows():
         address = str(row.get(address_col, "")).strip()
@@ -39,6 +42,9 @@ def source_records_from_dataframe(
             address=address,
             city=_optional_str(row.get(city_col)),
             state=_optional_str(row.get(state_col)),
+            county=_optional_str(row.get(county_col)) if county_col else None,
+            country=_optional_str(row.get(country_col)) if country_col else None,
+            zip_code=_optional_str(row.get(zip_col)) if zip_col else None,
             label=label or _optional_str(row.get(state_col)),
             permit_metadata={
                 col: _clean_value(row.get(col))
@@ -85,6 +91,9 @@ def export_source_json(records: list[SourceRecord], path: str | Path) -> Path:
             "address": r.full_address,
             "city": r.city,
             "state": r.state,
+            "county": r.county,
+            "country": r.country,
+            "zip_code": r.zip_code,
             "lat": r.lat,
             "lng": r.lng,
             "label": r.label,

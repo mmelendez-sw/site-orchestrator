@@ -13,8 +13,10 @@ from dedupe.constants import (
     DEFAULT_RADIUS_METERS,
     DUPLICATE_THRESHOLD,
     REVIEW_THRESHOLD,
+    SF_ADDRESS_FIELD,
 )
-from dedupe.soql import build_bbox_query
+from dedupe.context import build_dataset_context
+from dedupe.soql import build_dedupe_query
 
 
 class SiteResolver:
@@ -31,6 +33,8 @@ class SiteResolver:
             security_token=security_token,
             domain=domain,
         )
+        self._candidate_cache: list[dict[str, Any]] | None = None
+        self._dataset_context: dict[str, Any] | None = None
 
     @staticmethod
     def build_bounding_box(
@@ -46,14 +50,26 @@ class SiteResolver:
             "max_lng": lng + delta_lng,
         }
 
-    def query_salesforce(self, bbox: dict[str, float]) -> list[dict[str, Any]]:
-        """Return Salesforce site records within the bounding box."""
-        soql = build_bbox_query(
-            bbox["min_lat"],
-            bbox["max_lat"],
-            bbox["min_lng"],
-            bbox["max_lng"],
-        )
+    def prefetch(self, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Load Salesforce candidates for the full dataset zip codes + expanded bbox."""
+        self._dataset_context = build_dataset_context(records)
+        zip_codes = self._dataset_context["zip_codes"]
+        bbox = self._dataset_context["bbox"]
+        self._candidate_cache = self.query_salesforce(zip_codes=zip_codes, bbox=bbox)
+        return self._candidate_cache
+
+    def query_salesforce(
+        self,
+        *,
+        zip_codes: list[str] | None = None,
+        bbox: dict[str, float] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return Salesforce site records for zip codes and/or a bounding box."""
+        if zip_codes or bbox:
+            soql = build_dedupe_query(zip_codes or [], bbox)
+        else:
+            raise ValueError("query_salesforce requires zip codes and/or a bounding box")
+
         result = self.sf.query(soql)
         return list(result.get("records") or [])
 
@@ -65,22 +81,29 @@ class SiteResolver:
         best_score = 0
         best_record: dict[str, Any] | None = None
         for record in sf_records:
-            candidate = record.get("Address__c") or record.get("Name") or ""
+            candidate = record.get(SF_ADDRESS_FIELD) or record.get("Name") or ""
             score = fuzz.token_sort_ratio(incoming_address, candidate)
             if score > best_score:
                 best_score = score
                 best_record = record
         return best_score, best_record
 
-    def resolve(self, record: dict[str, Any]) -> dict[str, Any]:
+    def resolve(
+        self,
+        record: dict[str, Any],
+        candidates: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
         """Run spatial + fuzzy dedupe and return status, score, and match."""
         lat = record["lat"]
         lng = record["lng"]
         address = record["address"]
 
-        bbox = self.build_bounding_box(lat, lng)
-        candidates = self.query_salesforce(bbox)
-        score, matched = self.fuzzy_match(address, candidates)
+        pool = candidates if candidates is not None else self._candidate_cache
+        if pool is None:
+            bbox = self.build_bounding_box(lat, lng)
+            pool = self.query_salesforce(bbox=bbox)
+
+        score, matched = self.fuzzy_match(address, pool)
 
         if score >= DUPLICATE_THRESHOLD:
             status = "duplicate"
@@ -93,4 +116,6 @@ class SiteResolver:
             "status": status,
             "score": score,
             "matched_record": matched,
+            "candidate_count": len(pool),
+            "dataset_context": self._dataset_context,
         }

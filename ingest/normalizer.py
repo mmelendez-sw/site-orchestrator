@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 from typing import Any
 
+from dedupe.context import extract_zip_code
 from ingest.geocoder import geocode, reverse_geocode
 from ingest.scraper import IngestRecord
 
@@ -43,15 +44,18 @@ def normalize(record: IngestRecord | dict[str, Any]) -> dict[str, Any]:
     lat = ingest.lat
     lng = ingest.lng
     address = ingest.address.strip() if _has_address(ingest) else None
+    geo_zip: str | None = None
 
     if _has_address(ingest) and not _has_coords(ingest):
         geo = geocode(address)
         lat, lng = geo["lat"], geo["lng"]
         address = geo["address"]
+        geo_zip = geo.get("zip_code")
     elif _has_coords(ingest) and not _has_address(ingest):
         geo = reverse_geocode(lat, lng)
         lat, lng = geo["lat"], geo["lng"]
         address = geo["address"]
+        geo_zip = geo.get("zip_code")
     elif _has_coords(ingest) and _has_address(ingest):
         geo = geocode(address)
         distance = _distance_meters(lat, lng, geo["lat"], geo["lng"])
@@ -61,6 +65,7 @@ def normalize(record: IngestRecord | dict[str, Any]) -> dict[str, Any]:
                 f"(max {_MAX_ALIGNMENT_METERS}m)"
             )
         address = geo["address"]
+        geo_zip = geo.get("zip_code")
 
     if lat is None or lng is None or not address:
         raise ValueError("Record must resolve to lat, lng, and address")
@@ -71,6 +76,13 @@ def normalize(record: IngestRecord | dict[str, Any]) -> dict[str, Any]:
         "address": address,
         "permit_metadata": dict(ingest.permit_metadata),
     }
+    zip_code = (
+        ingest.permit_metadata.get("zip_code")
+        or geo_zip
+        or extract_zip_code({"address": address})
+    )
+    if zip_code:
+        canonical["zip_code"] = zip_code
     if ingest.source_url:
         canonical["source_url"] = ingest.source_url
     return canonical

@@ -18,6 +18,7 @@ from ingest.scraper import IngestRecord
 from salesforce.sf_client import SalesforceClient
 from source.record import SourceRecord
 from source.runner import list_sources, run_source
+from source.scope import parse_scope
 
 load_dotenv()
 
@@ -87,25 +88,49 @@ def _to_ingest(raw: dict[str, Any] | IngestRecord | SourceRecord) -> IngestRecor
     )
 
 
+def _normalize_batch(
+    raw_records: list[dict[str, Any] | IngestRecord | SourceRecord],
+) -> tuple[list[dict[str, Any]], list[tuple[Any, Exception]]]:
+    canonical_records: list[dict[str, Any]] = []
+    failures: list[tuple[Any, Exception]] = []
+    for raw in raw_records:
+        try:
+            canonical_records.append(normalize(_to_ingest(raw)))
+        except Exception as exc:
+            failures.append((raw, exc))
+    return canonical_records, failures
+
+
 def run_dedupe_pipeline(
     raw_records: list[dict[str, Any] | IngestRecord | SourceRecord],
 ) -> dict[str, int]:
     """Normalize source records and run Salesforce dedupe only."""
+    canonical_records, failures = _normalize_batch(raw_records)
     resolver = SiteResolver()
     sf_client = SalesforceClient()
+
     summary = {
-        "processed": 0,
+        "processed": len(raw_records),
         "duplicates": 0,
         "review": 0,
         "net_new": 0,
         "loaded": 0,
-        "errors": 0,
+        "errors": len(failures),
     }
 
-    for raw in raw_records:
-        summary["processed"] += 1
+    if canonical_records:
+        candidates = resolver.prefetch(canonical_records)
+        logger.info(
+            "Prefetched %s Salesforce candidates for %s dataset zip codes",
+            len(candidates),
+            len((resolver._dataset_context or {}).get("zip_codes", [])),
+        )
+
+    for _, exc in failures:
+        logger.exception("Failed to normalize record: %s", exc)
+
+    for canonical in canonical_records:
         try:
-            canonical = normalize(_to_ingest(raw))
             resolution = resolver.resolve(canonical)
             status = resolution["status"]
 
@@ -160,6 +185,7 @@ def main(
     if not classify:
         return run_dedupe_pipeline(raw_records)
 
+    canonical_records, failures = _normalize_batch(raw_records)
     run_dir = RUNS_DIR / f"orchestrator_{datetime.now().strftime('%Y-%m-%d_%H%M%S')}"
     run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -167,18 +193,23 @@ def main(
     sf_client = SalesforceClient()
 
     summary = {
-        "processed": 0,
+        "processed": len(raw_records),
         "duplicates": 0,
         "review": 0,
         "net_new": 0,
         "loaded": 0,
-        "errors": 0,
+        "errors": len(failures),
     }
 
-    for raw in raw_records:
-        summary["processed"] += 1
+    for _, exc in failures:
+        logger.exception("Failed to normalize record: %s", exc)
+
+    if canonical_records:
+        candidates = resolver.prefetch(canonical_records)
+        logger.info("Prefetched %s Salesforce candidates for dedupe", len(candidates))
+
+    for canonical in canonical_records:
         try:
-            canonical = normalize(_to_ingest(raw))
             resolution = resolver.resolve(canonical)
             status = resolution["status"]
 
@@ -229,10 +260,11 @@ def run_from_source(
     source_name: str,
     *,
     classify: bool = False,
+    scope: Any = None,
     **source_kwargs: Any,
 ) -> dict[str, int]:
     """Run a permit source adapter, then hand off to ingest + Salesforce dedupe."""
-    records = run_source(source_name, **source_kwargs)
+    records = run_source(source_name, scope=scope, **source_kwargs)
     logger.info("Source '%s' produced %s records", source_name, len(records))
     return main(records, classify=classify)
 
@@ -245,10 +277,19 @@ def _parse_args() -> argparse.Namespace:
         help="Permit source adapter to run before dedupe",
     )
     parser.add_argument(
+        "--input",
+        help="Input CSV/JSON path when using the file source",
+    )
+    parser.add_argument(
         "--classify",
         action="store_true",
         help="Run classifier + Salesforce load for net-new records",
     )
+    parser.add_argument("--country", help="Country scope (e.g. US)")
+    parser.add_argument("--state", help="State scope (e.g. WI)")
+    parser.add_argument("--county", help="County scope")
+    parser.add_argument("--city", help="City scope")
+    parser.add_argument("--zip", dest="zip_codes", help="Comma-separated zip codes")
     parser.add_argument(
         "--no-enrich",
         action="store_true",
@@ -265,12 +306,28 @@ def _parse_args() -> argparse.Namespace:
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     args = _parse_args()
+    scope = parse_scope(
+        country=args.country,
+        state=args.state,
+        county=args.county,
+        city=args.city,
+        zip_codes=args.zip_codes,
+    ) if any([args.country, args.state, args.county, args.city, args.zip_codes]) else None
+
     if args.source:
+        source_kwargs: dict[str, Any] = {
+            "enrich": not args.no_enrich,
+            "dedupe_addresses": not args.no_dedupe_addresses,
+        }
+        if args.source == "file":
+            if not args.input:
+                raise SystemExit("The file source requires --input")
+            source_kwargs["input_path"] = args.input
         run_from_source(
             args.source,
             classify=args.classify,
-            enrich=not args.no_enrich,
-            dedupe_addresses=not args.no_dedupe_addresses,
+            scope=scope,
+            **source_kwargs,
         )
     else:
         main([])

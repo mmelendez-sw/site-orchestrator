@@ -6,6 +6,7 @@ from abc import ABC, abstractmethod
 from typing import Any
 
 from source.record import SourceRecord
+from source.scope import SourceScope
 
 
 class BaseSourceAdapter(ABC):
@@ -15,5 +16,14 @@ class BaseSourceAdapter(ABC):
     description: str
 
     @abstractmethod
-    def fetch(self, **kwargs: Any) -> list[SourceRecord]:
+    def fetch(
+        self,
+        *,
+        scope: SourceScope | None = None,
+        **kwargs: Any,
+    ) -> list[SourceRecord]:
         """Return candidate site records from the upstream data source."""
+
+    def supports_scope(self, scope: SourceScope | None) -> bool:
+        """Return True when this adapter can serve the requested geography."""
+        return scope is None

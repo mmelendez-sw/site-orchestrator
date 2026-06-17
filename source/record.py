@@ -15,6 +15,9 @@ class SourceRecord:
     address: str
     city: str | None = None
     state: str | None = None
+    county: str | None = None
+    country: str | None = None
+    zip_code: str | None = None
     lat: float | None = None
     lng: float | None = None
     permit_metadata: dict[str, Any] = field(default_factory=dict)
@@ -28,7 +31,12 @@ class SourceRecord:
     def full_address(self) -> str:
         """Return a full address string suitable for geocoding."""
         addr = self.address.strip()
-        if self.city and self.state:
+        suffix_parts = [part for part in (self.city, self.state, self.zip_code) if part]
+        if suffix_parts:
+            suffix = ", ".join(suffix_parts)
+            if suffix.upper() not in addr.upper():
+                return f"{addr}, {suffix}"
+        elif self.city and self.state:
             city_state = f"{self.city}, {self.state}"
             if city_state.upper() not in addr.upper():
                 return f"{addr}, {city_state}"
@@ -43,6 +51,12 @@ class SourceRecord:
             metadata.setdefault("site_id", self.site_id)
         if self.label:
             metadata.setdefault("label", self.label)
+        if self.zip_code:
+            metadata.setdefault("zip_code", self.zip_code)
+        if self.county:
+            metadata.setdefault("county", self.county)
+        if self.country:
+            metadata.setdefault("country", self.country)
         return IngestRecord(
             address=self.full_address,
             lat=self.lat,

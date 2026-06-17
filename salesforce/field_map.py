@@ -1,8 +1,9 @@
 """Canonical record key -> Salesforce API field names."""
 
 FIELD_MAP: dict[str, str] = {
-    "lat": "Latitude__c",
-    "lng": "Longitude__c",
+    "lat": "Site_Latitude__c",
+    "lng": "Site_Longitude__c",
+    "zip_code": "Zip_Code__c",
     "address": "Address__c",
     "permit_metadata": "Permit_Metadata__c",
     "site_type": "Site_Type__c",
