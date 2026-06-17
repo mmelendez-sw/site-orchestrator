@@ -1,7 +1,8 @@
-"""Site orchestrator: ingest -> dedup -> classify -> Salesforce."""
+"""Site orchestrator: source -> ingest -> dedupe -> classify -> Salesforce."""
 
 from __future__ import annotations
 
+import argparse
 import csv
 import logging
 from datetime import datetime
@@ -11,10 +12,12 @@ from typing import Any
 from dotenv import load_dotenv
 
 from classifier.asset_classifier import classify_record
-from dedup.resolver import SiteResolver
+from dedupe.resolver import SiteResolver
 from ingest.normalizer import normalize
 from ingest.scraper import IngestRecord
 from salesforce.sf_client import SalesforceClient
+from source.record import SourceRecord
+from source.runner import list_sources, run_source
 
 load_dotenv()
 
@@ -70,7 +73,9 @@ def _log_review(record: dict[str, Any], resolution: dict[str, Any]) -> None:
         })
 
 
-def _to_ingest(raw: dict[str, Any] | IngestRecord) -> IngestRecord:
+def _to_ingest(raw: dict[str, Any] | IngestRecord | SourceRecord) -> IngestRecord:
+    if isinstance(raw, SourceRecord):
+        return raw.to_ingest_record()
     if isinstance(raw, IngestRecord):
         return raw
     return IngestRecord(
@@ -82,10 +87,78 @@ def _to_ingest(raw: dict[str, Any] | IngestRecord) -> IngestRecord:
     )
 
 
-def main(raw_records: list[dict[str, Any] | IngestRecord] | None = None) -> dict[str, int]:
-    """Process permit records through normalize, dedup, classify, and load."""
+def run_dedupe_pipeline(
+    raw_records: list[dict[str, Any] | IngestRecord | SourceRecord],
+) -> dict[str, int]:
+    """Normalize source records and run Salesforce dedupe only."""
+    resolver = SiteResolver()
+    sf_client = SalesforceClient()
+    summary = {
+        "processed": 0,
+        "duplicates": 0,
+        "review": 0,
+        "net_new": 0,
+        "loaded": 0,
+        "errors": 0,
+    }
+
+    for raw in raw_records:
+        summary["processed"] += 1
+        try:
+            canonical = normalize(_to_ingest(raw))
+            resolution = resolver.resolve(canonical)
+            status = resolution["status"]
+
+            if status == "duplicate":
+                matched = resolution.get("matched_record") or {}
+                sf_client.log_duplicate(canonical, matched.get("Id", ""))
+                summary["duplicates"] += 1
+                logger.info(
+                    "Duplicate skipped: %s (score=%s)",
+                    canonical["address"],
+                    resolution["score"],
+                )
+                continue
+
+            if status == "review":
+                _log_review(canonical, resolution)
+                summary["review"] += 1
+                logger.info(
+                    "Review queued: %s (score=%s)",
+                    canonical["address"],
+                    resolution["score"],
+                )
+                continue
+
+            summary["net_new"] += 1
+            logger.info("Net-new candidate: %s", canonical["address"])
+
+        except Exception as exc:
+            summary["errors"] += 1
+            logger.exception("Failed to dedupe record: %s", exc)
+
+    logger.info(
+        "Dedupe summary — processed=%s duplicates=%s review=%s net_new=%s errors=%s",
+        summary["processed"],
+        summary["duplicates"],
+        summary["review"],
+        summary["net_new"],
+        summary["errors"],
+    )
+    return summary
+
+
+def main(
+    raw_records: list[dict[str, Any] | IngestRecord | SourceRecord] | None = None,
+    *,
+    classify: bool = True,
+) -> dict[str, int]:
+    """Process records through normalize, dedupe, optional classify, and load."""
     if raw_records is None:
         raw_records = []
+
+    if not classify:
+        return run_dedupe_pipeline(raw_records)
 
     run_dir = RUNS_DIR / f"orchestrator_{datetime.now().strftime('%Y-%m-%d_%H%M%S')}"
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -113,13 +186,21 @@ def main(raw_records: list[dict[str, Any] | IngestRecord] | None = None) -> dict
                 matched = resolution.get("matched_record") or {}
                 sf_client.log_duplicate(canonical, matched.get("Id", ""))
                 summary["duplicates"] += 1
-                logger.info("Duplicate skipped: %s (score=%s)", canonical["address"], resolution["score"])
+                logger.info(
+                    "Duplicate skipped: %s (score=%s)",
+                    canonical["address"],
+                    resolution["score"],
+                )
                 continue
 
             if status == "review":
                 _log_review(canonical, resolution)
                 summary["review"] += 1
-                logger.info("Review queued: %s (score=%s)", canonical["address"], resolution["score"])
+                logger.info(
+                    "Review queued: %s (score=%s)",
+                    canonical["address"],
+                    resolution["score"],
+                )
                 continue
 
             summary["net_new"] += 1
@@ -144,6 +225,52 @@ def main(raw_records: list[dict[str, Any] | IngestRecord] | None = None) -> dict
     return summary
 
 
+def run_from_source(
+    source_name: str,
+    *,
+    classify: bool = False,
+    **source_kwargs: Any,
+) -> dict[str, int]:
+    """Run a permit source adapter, then hand off to ingest + Salesforce dedupe."""
+    records = run_source(source_name, **source_kwargs)
+    logger.info("Source '%s' produced %s records", source_name, len(records))
+    return main(records, classify=classify)
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run the site orchestrator pipeline")
+    parser.add_argument(
+        "--source",
+        choices=list_sources(),
+        help="Permit source adapter to run before dedupe",
+    )
+    parser.add_argument(
+        "--classify",
+        action="store_true",
+        help="Run classifier + Salesforce load for net-new records",
+    )
+    parser.add_argument(
+        "--no-enrich",
+        action="store_true",
+        help="Skip MPROP enrichment when using the Milwaukee source",
+    )
+    parser.add_argument(
+        "--no-dedupe-addresses",
+        action="store_true",
+        help="Keep all permit rows from the source instead of one per address",
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
-    main([])
+    args = _parse_args()
+    if args.source:
+        run_from_source(
+            args.source,
+            classify=args.classify,
+            enrich=not args.no_enrich,
+            dedupe_addresses=not args.no_dedupe_addresses,
+        )
+    else:
+        main([])

@@ -1,4 +1,4 @@
-"""Dedup thresholds and defaults."""
+"""Dedupe thresholds and defaults."""
 
 DUPLICATE_THRESHOLD = 85
 REVIEW_THRESHOLD = 60

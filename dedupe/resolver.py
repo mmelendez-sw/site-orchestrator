@@ -9,12 +9,12 @@ from typing import Any
 from rapidfuzz import fuzz
 from simple_salesforce import Salesforce
 
-from dedup.constants import (
+from dedupe.constants import (
     DEFAULT_RADIUS_METERS,
     DUPLICATE_THRESHOLD,
     REVIEW_THRESHOLD,
 )
-from dedup.soql import build_bbox_query
+from dedupe.soql import build_bbox_query
 
 
 class SiteResolver:
@@ -73,7 +73,7 @@ class SiteResolver:
         return best_score, best_record
 
     def resolve(self, record: dict[str, Any]) -> dict[str, Any]:
-        """Run spatial + fuzzy dedup and return status, score, and match."""
+        """Run spatial + fuzzy dedupe and return status, score, and match."""
         lat = record["lat"]
         lng = record["lng"]
         address = record["address"]

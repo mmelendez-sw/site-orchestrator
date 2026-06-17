@@ -1,7 +1,7 @@
-"""Placeholder tests for dedup resolver."""
+"""Placeholder tests for dedupe resolver."""
 
-from dedup.constants import DEFAULT_RADIUS_METERS
-from dedup.resolver import SiteResolver
+from dedupe.constants import DEFAULT_RADIUS_METERS
+from dedupe.resolver import SiteResolver
 
 
 def test_build_bounding_box_symmetric():
