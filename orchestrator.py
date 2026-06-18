@@ -12,12 +12,14 @@ from typing import Any
 from dotenv import load_dotenv
 
 from classifier.asset_classifier import classify_record
+from dedupe.batch_postprocess import apply_batch_postprocess
 from dedupe.constants import (
     SF_ADDRESS_FIELD,
     SF_CITY_FIELD,
     SF_STATE_FIELD,
     SF_ZIP_FIELD,
 )
+from dedupe.context import extract_zip_code
 from dedupe.resolver import SiteResolver
 from ingest.normalizer import normalize
 from ingest.scraper import IngestRecord
@@ -36,14 +38,47 @@ REVIEW_LOG_FIELDS = [
     "address",
     "lat",
     "lng",
-    "score",
     "address_score",
     "combined_score",
     "matched_distance_m",
-    "search_radius_m",
+    "urbanicity_prefilter_radius_m",
     "urbanicity_tier",
     "matched_id",
     "matched_address",
+    "proximity_rule",
+    "override_reason",
+    "status_source",
+    "zip_mismatch",
+    "resolution_detail",
+]
+
+DEDUPE_RESULT_FIELDS = [
+    "address",
+    "lat",
+    "lng",
+    "zip_code",
+    "urbanicity_tier",
+    "zip_population",
+    "urbanicity_prefilter_radius_m",
+    "status",
+    "address_score",
+    "proximity_score",
+    "combined_score",
+    "matched_distance_m",
+    "matched_coordinate_source",
+    "spatial_candidate_count",
+    "prefilter_candidate_count",
+    "potential_duplicate",
+    "candidate_count",
+    "matched_id",
+    "matched_address",
+    "matched_city",
+    "matched_state",
+    "matched_zip",
+    "proximity_rule",
+    "override_reason",
+    "status_source",
+    "zip_mismatch",
     "resolution_detail",
 ]
 
@@ -76,14 +111,19 @@ def _log_review(
             "address": record.get("address"),
             "lat": record.get("lat"),
             "lng": record.get("lng"),
-            "score": resolution.get("score"),
             "address_score": resolution.get("address_score"),
             "combined_score": resolution.get("combined_score"),
             "matched_distance_m": resolution.get("matched_distance_m"),
-            "search_radius_m": (resolution.get("urbanicity") or {}).get("search_radius_m"),
+            "urbanicity_prefilter_radius_m": (resolution.get("urbanicity") or {}).get(
+                "search_radius_m"
+            ),
             "urbanicity_tier": (resolution.get("urbanicity") or {}).get("urbanicity_tier"),
             "matched_id": matched.get("Id"),
             "matched_address": matched.get(SF_ADDRESS_FIELD) or matched.get("Name"),
+            "proximity_rule": resolution.get("proximity_rule"),
+            "override_reason": resolution.get("override_reason"),
+            "status_source": resolution.get("status_source"),
+            "zip_mismatch": resolution.get("zip_mismatch"),
             "resolution_detail": resolution.get("resolution_detail"),
         })
 
@@ -122,6 +162,10 @@ def _normalize_batch(
         source_address = _source_address(raw)
         try:
             canonical = normalize(_to_ingest(raw))
+            if not canonical.get("zip_code"):
+                zip_code = extract_zip_code(canonical)
+                if zip_code:
+                    canonical["zip_code"] = zip_code
             canonical_records.append(canonical)
             if verbose:
                 logger.info(
@@ -159,42 +203,101 @@ def _source_address(raw: dict[str, Any] | IngestRecord | SourceRecord) -> str:
     return str(raw.get("address") or "")
 
 
+def _format_export_number(value: Any, *, precision: int = 2) -> Any:
+    if value is None or value == "":
+        return ""
+    if isinstance(value, bool):
+        return value
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return value
+    if precision == 0:
+        return int(round(number))
+    return round(number, precision)
+
+
+def _format_dedupe_export_row(row: dict[str, Any]) -> dict[str, Any]:
+    formatted = {field: row.get(field, "") for field in DEDUPE_RESULT_FIELDS}
+    formatted["lat"] = _format_export_number(row.get("lat"), precision=6)
+    formatted["lng"] = _format_export_number(row.get("lng"), precision=6)
+    formatted["zip_population"] = _format_export_number(row.get("zip_population"), precision=0)
+    formatted["urbanicity_prefilter_radius_m"] = _format_export_number(
+        row.get("urbanicity_prefilter_radius_m"), precision=1
+    )
+    formatted["address_score"] = _format_export_number(row.get("address_score"), precision=0)
+    formatted["proximity_score"] = _format_export_number(row.get("proximity_score"), precision=0)
+    formatted["combined_score"] = _format_export_number(row.get("combined_score"), precision=0)
+    formatted["matched_distance_m"] = _format_export_number(
+        row.get("matched_distance_m"), precision=1
+    )
+    formatted["spatial_candidate_count"] = _format_export_number(
+        row.get("spatial_candidate_count"), precision=0
+    )
+    formatted["prefilter_candidate_count"] = _format_export_number(
+        row.get("prefilter_candidate_count"), precision=0
+    )
+    formatted["candidate_count"] = _format_export_number(row.get("candidate_count"), precision=0)
+    formatted["potential_duplicate"] = bool(row.get("potential_duplicate"))
+    formatted["zip_mismatch"] = bool(row.get("zip_mismatch"))
+    return formatted
+
+
+def _summarize_result_rows(rows: list[dict[str, Any]]) -> dict[str, int]:
+    return {
+        "duplicates": sum(1 for row in rows if row.get("status") == "duplicate"),
+        "review": sum(1 for row in rows if row.get("status") == "review"),
+        "net_new": sum(1 for row in rows if row.get("status") == "net_new"),
+    }
+
+
+def _write_review_log_from_rows(run_dir: Path, rows: list[dict[str, Any]]) -> None:
+    review_rows = [row for row in rows if row.get("status") == "review"]
+    review_log = _review_log_path(run_dir)
+    if not review_rows:
+        if review_log.exists():
+            review_log.unlink()
+        return
+
+    with review_log.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=REVIEW_LOG_FIELDS)
+        writer.writeheader()
+        for row in review_rows:
+            writer.writerow({
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+                "address": row.get("address"),
+                "lat": row.get("lat"),
+                "lng": row.get("lng"),
+                "address_score": _format_export_number(row.get("address_score"), precision=0),
+                "combined_score": _format_export_number(row.get("combined_score"), precision=0),
+                "matched_distance_m": _format_export_number(
+                    row.get("matched_distance_m"), precision=1
+                ),
+                "urbanicity_prefilter_radius_m": _format_export_number(
+                    row.get("urbanicity_prefilter_radius_m"), precision=1
+                ),
+                "urbanicity_tier": row.get("urbanicity_tier"),
+                "matched_id": row.get("matched_id"),
+                "matched_address": row.get("matched_address"),
+                "proximity_rule": row.get("proximity_rule"),
+                "override_reason": row.get("override_reason"),
+                "status_source": row.get("status_source"),
+                "zip_mismatch": row.get("zip_mismatch"),
+                "resolution_detail": row.get("resolution_detail"),
+            })
+
+
 def _write_dedupe_results(
     run_dir: Path,
     rows: list[dict[str, Any]],
 ) -> Path:
     run_dir.mkdir(parents=True, exist_ok=True)
     output = run_dir / "dedupe_results.csv"
-    fieldnames = [
-        "address",
-        "lat",
-        "lng",
-        "zip_code",
-        "urbanicity_tier",
-        "zip_population",
-        "search_radius_m",
-        "status",
-        "score",
-        "address_score",
-        "proximity_score",
-        "combined_score",
-        "matched_distance_m",
-        "matched_coordinate_source",
-        "spatial_candidate_count",
-        "prefilter_candidate_count",
-        "potential_duplicate",
-        "candidate_count",
-        "matched_id",
-        "matched_address",
-        "matched_city",
-        "matched_state",
-        "matched_zip",
-        "resolution_detail",
-    ]
+    export_rows = [_format_dedupe_export_row(row) for row in rows]
     with output.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer = csv.DictWriter(handle, fieldnames=DEDUPE_RESULT_FIELDS)
         writer.writeheader()
-        writer.writerows(rows)
+        writer.writerows(export_rows)
     return output
 
 
@@ -232,9 +335,8 @@ def _process_dedupe_record(
         "zip_code": canonical.get("zip_code"),
         "urbanicity_tier": urbanicity.get("urbanicity_tier"),
         "zip_population": urbanicity.get("zip_population"),
-        "search_radius_m": urbanicity.get("search_radius_m"),
+        "urbanicity_prefilter_radius_m": urbanicity.get("search_radius_m"),
         "status": status,
-        "score": resolution.get("score"),
         "address_score": resolution.get("address_score"),
         "proximity_score": resolution.get("proximity_score"),
         "combined_score": resolution.get("combined_score"),
@@ -249,6 +351,10 @@ def _process_dedupe_record(
         "matched_city": matched.get(SF_CITY_FIELD),
         "matched_state": matched.get(SF_STATE_FIELD),
         "matched_zip": matched.get(SF_ZIP_FIELD),
+        "proximity_rule": resolution.get("proximity_rule"),
+        "override_reason": resolution.get("override_reason"),
+        "status_source": resolution.get("status_source"),
+        "zip_mismatch": resolution.get("zip_mismatch"),
         "resolution_detail": resolution.get("resolution_detail"),
     }
 
@@ -270,7 +376,6 @@ def _process_dedupe_record(
         return result_row, summary_delta
 
     if status == "review":
-        _log_review(canonical, resolution, review_log=_review_log_path(run_dir))
         summary_delta["review"] = 1
         logger.info(
             "Review queued: %s (combined=%s %s)",
@@ -361,7 +466,20 @@ def run_dedupe_pipeline(
             logger.exception("Failed to dedupe record: %s", exc)
 
     if result_rows:
+        batch_changes = apply_batch_postprocess(result_rows)
+        if verbose and any(batch_changes.values()):
+            logger.info(
+                "Batch postprocess — input_dupes=%d matched_id=%d potential=%d",
+                batch_changes["input_duplicates"],
+                batch_changes["matched_id_reconciled"],
+                batch_changes["potential_duplicate_promoted"],
+            )
+        status_counts = _summarize_result_rows(result_rows)
+        summary["duplicates"] = status_counts["duplicates"]
+        summary["review"] = status_counts["review"]
+        summary["net_new"] = status_counts["net_new"]
         output = _write_dedupe_results(run_dir, result_rows)
+        _write_review_log_from_rows(run_dir, result_rows)
         logger.info("Wrote dedupe results to %s", output.resolve())
         if summary["review"]:
             logger.info("Wrote review log to %s", review_log.resolve())
@@ -466,7 +584,13 @@ def main(
             logger.exception("Failed to process record: %s", exc)
 
     if result_rows:
+        apply_batch_postprocess(result_rows)
+        status_counts = _summarize_result_rows(result_rows)
+        summary["duplicates"] = status_counts["duplicates"]
+        summary["review"] = status_counts["review"]
+        summary["net_new"] = status_counts["net_new"]
         output = _write_dedupe_results(run_dir, result_rows)
+        _write_review_log_from_rows(run_dir, result_rows)
         logger.info("Wrote dedupe results to %s", output)
         if summary["review"]:
             logger.info("Wrote review log to %s", _review_log_path(run_dir))

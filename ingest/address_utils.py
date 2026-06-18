@@ -11,6 +11,7 @@ _STATE_ZIP_RE = re.compile(
 )
 _TRAILING_ZIP_RE = re.compile(r"(?:,\s*)(\d{5})(?:-\d{4})?\s*$")
 _BARE_ZIP_RE = re.compile(r"^\d{5}$")
+_ANY_ZIP_RE = re.compile(r"\b(\d{5})(?:-\d{4})?\b")
 
 
 def parse_zip_from_address(address: str | None) -> str | None:
@@ -26,4 +27,7 @@ def parse_zip_from_address(address: str | None) -> str | None:
     match = _TRAILING_ZIP_RE.search(text)
     if match:
         return match.group(1)
+    matches = _ANY_ZIP_RE.findall(text)
+    if matches:
+        return matches[-1]
     return None

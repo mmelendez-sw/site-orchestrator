@@ -6,7 +6,9 @@ from dedupe.address_match import (
     extract_house_number,
     extract_street_line,
     house_numbers_equivalent,
+    street_token_jaccard,
 )
+from ingest.address_utils import parse_zip_from_address
 
 
 def test_extract_street_line_strips_city_state_zip():
@@ -64,3 +66,19 @@ def test_address_match_score_penalizes_geocoder_collision():
         "1810 North Water Street, Milwaukee, WI 53202",
     )
     assert score <= 45
+
+
+def test_street_token_jaccard_detects_different_streets():
+    score = street_token_jaccard(
+        "10700 W BROWN DEER RD, MILWAUKEE, WI 53224",
+        "8847 North 107th Street, Milwaukee, WI 53224",
+    )
+    assert score < 0.5
+
+
+def test_parse_zip_from_verbose_address():
+    address = (
+        "West Carmen Avenue, Silverswan, Milwaukee, Milwaukee County, "
+        "Wisconsin, 53225, United States"
+    )
+    assert parse_zip_from_address(address) == "53225"

@@ -16,13 +16,22 @@ URBANICITY_DEFAULT_TIER = "suburban"
 ADDRESS_SCORE_WEIGHT = 0.65
 PROXIMITY_SCORE_WEIGHT = 0.35
 
-# Strong address match — duplicate despite geocoder distance noise (same street, different pins).
-STRONG_ADDRESS_DUPLICATE_MIN = 95
-STRONG_ADDRESS_DUPLICATE_MAX_M = 200
+# Tiered high-address override (cap at 2x urbanicity prefilter radius — R4).
+HIGH_ADDRESS_EXACT_MIN = 98
+HIGH_ADDRESS_STRONG_MIN = 90
+HIGH_ADDRESS_RADIUS_MULTIPLIER = 2.0
 
 # Geocoder collision — very close pins but clearly different addresses.
 GEOCODER_COLLISION_MAX_M = 25
 GEOCODER_COLLISION_MAX_ADDRESS = 60
+GEOCODER_COLLISION_JACCARD_MIN = 0.50
+
+# Address-score floor (house-number mismatch cap) + moderate proximity → review (R6).
+ADDRESS_FLOOR_SCORE = 45
+ADDRESS_FLOOR_PROXIMITY_MIN = 50
+
+# Zip mismatch at low distance — surface for review unless high-address duplicate (R8).
+ZIP_MISMATCH_REVIEW_MAX_M = 50
 
 # Outside-radius fuzzy matches never promote to review/duplicate (in-radius only).
 OUTSIDE_RADIUS_REVIEW_MAX_M = 0
@@ -41,6 +50,9 @@ PROX_REVIEW_MAX_M = 50
 PROX_REVIEW_MIN_ADDRESS = 70
 PROX_REVIEW_EXTENDED_MAX_M = 100
 PROX_REVIEW_EXTENDED_MIN_ADDRESS = 80
+
+# Input batch self-dedupe coordinate rounding (degrees).
+INPUT_DEDUPE_COORD_PRECISION = 5
 
 SF_OBJECT_NAME = "Site__c"
 SF_LAT_FIELD = "Site_Latitude__c"

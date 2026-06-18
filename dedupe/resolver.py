@@ -8,14 +8,20 @@ from typing import Any
 
 from simple_salesforce import Salesforce
 
-from dedupe.address_match import address_match_score, normalize_sf_address
+from dedupe.address_match import address_match_score, normalize_sf_address, street_token_jaccard
 from dedupe.constants import (
+    ADDRESS_FLOOR_PROXIMITY_MIN,
+    ADDRESS_FLOOR_SCORE,
     ADDRESS_SCORE_WEIGHT,
     DEFAULT_RADIUS_METERS,
     DUPLICATE_THRESHOLD,
     FUZZY_PREFILTER_MAX_M,
+    GEOCODER_COLLISION_JACCARD_MIN,
     GEOCODER_COLLISION_MAX_ADDRESS,
     GEOCODER_COLLISION_MAX_M,
+    HIGH_ADDRESS_EXACT_MIN,
+    HIGH_ADDRESS_RADIUS_MULTIPLIER,
+    HIGH_ADDRESS_STRONG_MIN,
     POTENTIAL_DUPLICATE_MAX_DISTANCE_M,
     POTENTIAL_DUPLICATE_MIN_COMBINED,
     PROX_DUPLICATE_MAX_M,
@@ -30,8 +36,7 @@ from dedupe.constants import (
     SF_LAT_FIELD,
     SF_LNG_FIELD,
     SF_ZIP_FIELD,
-    STRONG_ADDRESS_DUPLICATE_MAX_M,
-    STRONG_ADDRESS_DUPLICATE_MIN,
+    ZIP_MISMATCH_REVIEW_MAX_M,
 )
 from dedupe.context import build_dataset_context
 from dedupe.soql import build_dedupe_query
@@ -246,7 +251,7 @@ class SiteResolver:
         distance_m = haversine_meters(incoming_lat, incoming_lng, lat, lng)
         within_radius = distance_m <= search_radius_m
         prox = proximity_score(distance_m, search_radius_m) if within_radius else 0
-        if address_score >= STRONG_ADDRESS_DUPLICATE_MIN:
+        if address_score >= HIGH_ADDRESS_STRONG_MIN:
             combined = address_score
         elif within_radius:
             combined = combined_score(
@@ -274,8 +279,13 @@ class SiteResolver:
         return max(candidates, key=lambda item: item[key])
 
     @staticmethod
-    def _eligible_for_resolution(scored: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _eligible_for_resolution(
+        scored: list[dict[str, Any]],
+        *,
+        search_radius_m: float,
+    ) -> list[dict[str, Any]]:
         """Candidates that can influence duplicate/review/net-new status."""
+        max_review_m = search_radius_m * HIGH_ADDRESS_RADIUS_MULTIPLIER
         eligible: list[dict[str, Any]] = []
         for item in scored:
             distance_m = item.get("distance_m")
@@ -285,10 +295,7 @@ class SiteResolver:
             if item["within_radius"]:
                 eligible.append(item)
                 continue
-            if (
-                address_score >= STRONG_ADDRESS_DUPLICATE_MIN
-                and distance_m <= STRONG_ADDRESS_DUPLICATE_MAX_M
-            ):
+            if address_score >= HIGH_ADDRESS_STRONG_MIN and distance_m <= max_review_m:
                 eligible.append(item)
                 continue
             if (
@@ -297,6 +304,80 @@ class SiteResolver:
             ):
                 eligible.append(item)
         return eligible
+
+    @staticmethod
+    def _resolve_match_status(
+        match: dict[str, Any],
+        *,
+        search_radius_m: float,
+        incoming_zip: str | None,
+        matched_zip: str | None,
+        incoming_address: str,
+        candidate_address: str,
+    ) -> tuple[str, int, str | None, bool]:
+        """Return status, score, override_reason, and zip_mismatch flag."""
+        combined = match["combined_score"]
+        address_score = match["address_score"]
+        proximity_score = match["proximity_score"]
+        distance_m = match.get("distance_m")
+        max_review_m = search_radius_m * HIGH_ADDRESS_RADIUS_MULTIPLIER
+        zip_mismatch = bool(
+            incoming_zip and matched_zip and incoming_zip != matched_zip
+        )
+
+        if distance_m is not None and distance_m < GEOCODER_COLLISION_MAX_M:
+            jaccard = street_token_jaccard(incoming_address, candidate_address)
+            if jaccard < GEOCODER_COLLISION_JACCARD_MIN:
+                return "review", combined, "geocoder_collision_suspect", zip_mismatch
+            if address_score < GEOCODER_COLLISION_MAX_ADDRESS:
+                return "review", combined, "geocoder_collision", zip_mismatch
+
+        if (
+            distance_m is not None
+            and address_score <= ADDRESS_FLOOR_SCORE
+            and proximity_score > ADDRESS_FLOOR_PROXIMITY_MIN
+            and incoming_zip
+            and matched_zip
+            and incoming_zip == matched_zip
+        ):
+            return "review", combined, "address_floor_proximity", zip_mismatch
+
+        if (
+            zip_mismatch
+            and distance_m is not None
+            and distance_m <= ZIP_MISMATCH_REVIEW_MAX_M
+            and address_score < HIGH_ADDRESS_STRONG_MIN
+        ):
+            return "review", combined, "zip_mismatch_low_distance", zip_mismatch
+
+        if address_score >= HIGH_ADDRESS_EXACT_MIN and (
+            distance_m is None or distance_m <= max_review_m
+        ):
+            return "duplicate", max(combined, address_score), "high_address_exact", zip_mismatch
+
+        if address_score >= HIGH_ADDRESS_STRONG_MIN and distance_m is not None:
+            if distance_m <= search_radius_m:
+                return "duplicate", max(combined, address_score), "high_address_match", zip_mismatch
+            if distance_m <= max_review_m:
+                return "review", max(combined, address_score), "high_address_far", zip_mismatch
+            return "net_new", combined, "high_address_beyond_2x_radius", zip_mismatch
+
+        if not match.get("within_radius"):
+            return "net_new", combined, None, zip_mismatch
+
+        if distance_m is not None:
+            if distance_m <= PROX_DUPLICATE_MAX_M and address_score >= PROX_DUPLICATE_MIN_ADDRESS:
+                return "duplicate", combined, "proximity_duplicate", zip_mismatch
+            if distance_m <= PROX_REVIEW_MAX_M and address_score >= PROX_REVIEW_MIN_ADDRESS:
+                return "review", combined, "proximity_review", zip_mismatch
+            if (
+                distance_m <= PROX_REVIEW_EXTENDED_MAX_M
+                and address_score >= PROX_REVIEW_EXTENDED_MIN_ADDRESS
+            ):
+                return "review", combined, "proximity_review_extended", zip_mismatch
+
+        status = SiteResolver._status_from_combined_score(combined)
+        return status, combined, None, zip_mismatch
 
     @staticmethod
     def _pick_best_match(candidates: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -318,46 +399,6 @@ class SiteResolver:
         if score >= REVIEW_THRESHOLD:
             return "review"
         return "net_new"
-
-    @staticmethod
-    def _resolve_match_status(match: dict[str, Any]) -> tuple[str, int, str | None]:
-        """Apply geocoder-collision, strong-address, proximity, and score thresholds."""
-        combined = match["combined_score"]
-        address_score = match["address_score"]
-        distance_m = match.get("distance_m")
-
-        if (
-            distance_m is not None
-            and distance_m < GEOCODER_COLLISION_MAX_M
-            and address_score < GEOCODER_COLLISION_MAX_ADDRESS
-        ):
-            return "review", combined, "geocoder_collision"
-
-        if address_score >= STRONG_ADDRESS_DUPLICATE_MIN and (
-            distance_m is None or distance_m <= STRONG_ADDRESS_DUPLICATE_MAX_M
-        ):
-            return "duplicate", max(combined, address_score), "high_address_match"
-
-        if not match.get("within_radius"):
-            return "net_new", combined, None
-
-        if distance_m is not None:
-            if distance_m <= PROX_DUPLICATE_MAX_M and address_score >= PROX_DUPLICATE_MIN_ADDRESS:
-                return "duplicate", combined, f"<= {int(PROX_DUPLICATE_MAX_M)}m addr>={PROX_DUPLICATE_MIN_ADDRESS}"
-            if distance_m <= PROX_REVIEW_MAX_M and address_score >= PROX_REVIEW_MIN_ADDRESS:
-                return "review", combined, f"<= {int(PROX_REVIEW_MAX_M)}m addr>={PROX_REVIEW_MIN_ADDRESS}"
-            if (
-                distance_m <= PROX_REVIEW_EXTENDED_MAX_M
-                and address_score >= PROX_REVIEW_EXTENDED_MIN_ADDRESS
-            ):
-                return (
-                    "review",
-                    combined,
-                    f"<= {int(PROX_REVIEW_EXTENDED_MAX_M)}m addr>={PROX_REVIEW_EXTENDED_MIN_ADDRESS}",
-                )
-
-        status = SiteResolver._status_from_combined_score(combined)
-        return status, combined, None
 
     @staticmethod
     def is_potential_duplicate(
@@ -457,15 +498,36 @@ class SiteResolver:
         ]
         in_radius = [item for item in scored if item["within_radius"]]
         spatial_candidate_count = len(in_radius)
-        eligible = self._eligible_for_resolution(scored)
+        eligible = self._eligible_for_resolution(
+            scored,
+            search_radius_m=urbanicity.search_radius_m,
+        )
         match = self._pick_best_match(eligible)
+        matched_zip = (
+            self._normalize_zip(match["record"].get(SF_ZIP_FIELD)) if match else None
+        )
+        candidate_address = (
+            normalize_sf_address(
+                match["record"].get(SF_ADDRESS_FIELD) or match["record"].get("Name") or ""
+            )
+            if match
+            else ""
+        )
 
         if match is not None:
-            status, score, proximity_rule = self._resolve_match_status(match)
+            status, score, override_reason, zip_mismatch = self._resolve_match_status(
+                match,
+                search_radius_m=urbanicity.search_radius_m,
+                incoming_zip=incoming_zip,
+                matched_zip=matched_zip,
+                incoming_address=address,
+                candidate_address=candidate_address,
+            )
         else:
             score = 0
             status = "net_new"
-            proximity_rule = None
+            override_reason = None
+            zip_mismatch = False
 
         potential_duplicate = self.is_potential_duplicate(status=status, match=match)
         matched_record = match["record"] if match else None
@@ -475,7 +537,7 @@ class SiteResolver:
             prefilter_count=len(filtered_pool),
             match=match,
             status=status,
-            proximity_rule=proximity_rule,
+            proximity_rule=override_reason,
         )
 
         if self.verbose:
@@ -535,5 +597,9 @@ class SiteResolver:
             "urbanicity": urbanicity.as_dict(),
             "resolution_detail": resolution_detail,
             "potential_duplicate": potential_duplicate,
+            "proximity_rule": override_reason,
+            "override_reason": override_reason,
+            "status_source": "resolver",
+            "zip_mismatch": zip_mismatch,
             "dataset_context": self._dataset_context,
         }

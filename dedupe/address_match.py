@@ -162,3 +162,16 @@ def address_match_score(incoming_address: str, candidate_address: str) -> int:
 
     score = int(round(fuzz.WRatio(left, right)))
     return max(0, min(100, score))
+
+
+def street_token_jaccard(left_address: str, right_address: str) -> float:
+    """Jaccard similarity on street tokens (ignores house numbers)."""
+    left_tokens = set(strip_house_number(extract_street_line(left_address)).split())
+    right_tokens = set(strip_house_number(extract_street_line(right_address)).split())
+    left_tokens.discard("")
+    right_tokens.discard("")
+    if not left_tokens or not right_tokens:
+        return 0.0
+    intersection = left_tokens & right_tokens
+    union = left_tokens | right_tokens
+    return len(intersection) / len(union)
