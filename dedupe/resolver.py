@@ -13,11 +13,13 @@ from dedupe.constants import (
     ADDRESS_SCORE_WEIGHT,
     DEFAULT_RADIUS_METERS,
     DUPLICATE_THRESHOLD,
+    OUTSIDE_RADIUS_REVIEW_MAX_M,
     PROXIMITY_SCORE_WEIGHT,
     REVIEW_THRESHOLD,
     SF_ADDRESS_FIELD,
     SF_LAT_FIELD,
     SF_LNG_FIELD,
+    SF_ZIP_FIELD,
 )
 from dedupe.context import build_dataset_context
 from dedupe.soql import build_dedupe_query
@@ -174,6 +176,55 @@ class SiteResolver:
         return best_score, best_record
 
     @staticmethod
+    def _normalize_sf_address(value: Any) -> str:
+        text = str(value or "")
+        return text.replace("<br>", " ").replace("<BR>", " ").strip()
+
+    @staticmethod
+    def _normalize_zip(value: Any) -> str | None:
+        if value is None:
+            return None
+        digits = "".join(ch for ch in str(value) if ch.isdigit())
+        if len(digits) >= 5:
+            return digits[:5]
+        return None
+
+    @staticmethod
+    def _outside_radius_review_cap(search_radius_m: float) -> float:
+        return max(search_radius_m * 3, float(OUTSIDE_RADIUS_REVIEW_MAX_M))
+
+    @staticmethod
+    def _resolve_outside_radius_match(
+        best_outside: dict[str, Any],
+        *,
+        incoming_zip: str | None,
+        search_radius_m: float,
+    ) -> tuple[str, int, bool]:
+        """Decide status for the best address match outside the urbanicity circle."""
+        score = best_outside["address_score"]
+        matched_zip = SiteResolver._normalize_zip(best_outside["record"].get(SF_ZIP_FIELD))
+        distance_m = best_outside.get("distance_m")
+        max_review_m = SiteResolver._outside_radius_review_cap(search_radius_m)
+
+        if distance_m is not None and distance_m > max_review_m:
+            return "net_new", score, False
+
+        if distance_m is None:
+            if not (incoming_zip and matched_zip and incoming_zip == matched_zip):
+                return "net_new", score, False
+            if score >= DUPLICATE_THRESHOLD:
+                return "duplicate", score, True
+            if score >= REVIEW_THRESHOLD:
+                return "review", score, True
+            return "net_new", score, False
+
+        if score >= DUPLICATE_THRESHOLD:
+            return "duplicate", score, True
+        if score >= REVIEW_THRESHOLD:
+            return "review", score, True
+        return "net_new", score, False
+
+    @staticmethod
     def _score_candidate(
         incoming_address: str,
         incoming_lat: float,
@@ -182,7 +233,9 @@ class SiteResolver:
         *,
         search_radius_m: float,
     ) -> dict[str, Any]:
-        candidate_address = sf_record.get(SF_ADDRESS_FIELD) or sf_record.get("Name") or ""
+        candidate_address = SiteResolver._normalize_sf_address(
+            sf_record.get(SF_ADDRESS_FIELD) or sf_record.get("Name") or ""
+        )
         address_score = fuzz.token_sort_ratio(incoming_address, candidate_address)
         coords = sf_coordinates(sf_record, lat_field=SF_LAT_FIELD, lng_field=SF_LNG_FIELD)
 
@@ -263,6 +316,12 @@ class SiteResolver:
         )
         if used_outside_radius_match:
             detail += "; address_match_outside_radius"
+        elif (
+            match is not None
+            and match.get("distance_m") is not None
+            and match["distance_m"] > urbanicity.search_radius_m
+        ):
+            detail += "; address_match_too_far_for_review"
         detail += f"; status={status}"
         return detail
 
@@ -313,9 +372,11 @@ class SiteResolver:
             and best_outside["address_score"] >= REVIEW_THRESHOLD
         ):
             match = best_outside
-            score = match["address_score"]
-            status = "review"
-            used_outside_radius_match = True
+            status, score, used_outside_radius_match = SiteResolver._resolve_outside_radius_match(
+                best_outside,
+                incoming_zip=self._normalize_zip(record.get("zip_code")),
+                search_radius_m=urbanicity.search_radius_m,
+            )
         else:
             match = best_outside
             score = match["address_score"] if match else 0

@@ -16,6 +16,10 @@ URBANICITY_DEFAULT_TIER = "suburban"
 ADDRESS_SCORE_WEIGHT = 0.65
 PROXIMITY_SCORE_WEIGHT = 0.35
 
+# Max distance (meters) for an outside-radius address match to count as review/duplicate.
+# Beyond this, fuzzy-only matches from the zip/bbox pool are treated as net_new.
+OUTSIDE_RADIUS_REVIEW_MAX_M = 500
+
 SF_OBJECT_NAME = "Site__c"
 SF_LAT_FIELD = "Site_Latitude__c"
 SF_LNG_FIELD = "Site_Longitude__c"

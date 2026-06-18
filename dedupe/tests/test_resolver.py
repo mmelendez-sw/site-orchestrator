@@ -39,6 +39,50 @@ def test_score_candidate_within_radius_boosts_combined_score():
     assert scored["combined_score"] >= scored["address_score"]
 
 
+def test_resolve_outside_radius_rejects_far_matches():
+    best_outside = {
+        "address_score": 70,
+        "distance_m": 8413.0,
+        "record": {"Site_Zip_Code__c": "53220"},
+    }
+    status, score, flagged = SiteResolver._resolve_outside_radius_match(
+        best_outside,
+        incoming_zip="53226",
+        search_radius_m=50,
+    )
+    assert status == "net_new"
+    assert flagged is False
+
+
+def test_resolve_outside_radius_duplicate_on_same_zip_without_coords():
+    best_outside = {
+        "address_score": 90,
+        "distance_m": None,
+        "record": {"Site_Zip_Code__c": "53215"},
+    }
+    status, score, flagged = SiteResolver._resolve_outside_radius_match(
+        best_outside,
+        incoming_zip="53215",
+        search_radius_m=50,
+    )
+    assert status == "duplicate"
+    assert flagged is True
+
+
+def test_resolve_outside_radius_rejects_different_zip_without_coords():
+    best_outside = {
+        "address_score": 66,
+        "distance_m": None,
+        "record": {"Site_Zip_Code__c": "53225"},
+    }
+    status, score, flagged = SiteResolver._resolve_outside_radius_match(
+        best_outside,
+        incoming_zip="53212",
+        search_radius_m=150,
+    )
+    assert status == "net_new"
+    assert flagged is False
+
+
 def test_resolve_returns_status_shape():
-    resolver = SiteResolver
     assert DEFAULT_RADIUS_METERS == 250
