@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import os
-import re
 import time
 from typing import Any
 
 import requests
+
+from ingest.address_utils import parse_zip_from_address
 
 CENSUS_GEOCODE_URL = (
     "https://geocoding.geo.census.gov/geocoder/locations/onelineaddress"
@@ -16,7 +17,6 @@ CENSUS_BENCHMARK = "Public_AR_Current"
 NOMINATIM_SEARCH_URL = "https://nominatim.openstreetmap.org/search"
 NOMINATIM_REVERSE_URL = "https://nominatim.openstreetmap.org/reverse"
 GEOCODE_DELAY_S = 1.1
-_ZIP_RE = re.compile(r"\b(\d{5})(?:-\d{4})?\b")
 
 GEOCODER = os.environ.get("GEOCODER", "auto").strip().lower()
 GEOCODER_USER_AGENT = os.environ.get(
@@ -36,10 +36,7 @@ def _throttle_nominatim() -> None:
 
 
 def _extract_zip_code(text: str | None) -> str | None:
-    if not text:
-        return None
-    match = _ZIP_RE.search(str(text))
-    return match.group(1) if match else None
+    return parse_zip_from_address(text)
 
 
 def geocode_census(address: str) -> dict[str, Any] | None:

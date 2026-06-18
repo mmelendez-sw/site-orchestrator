@@ -3,12 +3,10 @@
 from __future__ import annotations
 
 import math
-import re
 from typing import Any
 
 from dedupe.constants import DEFAULT_RADIUS_METERS
-
-_ZIP_RE = re.compile(r"\b(\d{5})(?:-\d{4})?\b")
+from ingest.address_utils import parse_zip_from_address
 
 
 def extract_zip_code(record: dict[str, Any]) -> str | None:
@@ -25,8 +23,7 @@ def extract_zip_code(record: dict[str, Any]) -> str | None:
             return normalized
 
     address = record.get("address") or ""
-    match = _ZIP_RE.search(str(address))
-    return match.group(1) if match else None
+    return parse_zip_from_address(str(address))
 
 
 def extract_zip_codes(records: list[dict[str, Any]]) -> list[str]:

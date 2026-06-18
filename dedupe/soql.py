@@ -17,6 +17,11 @@ def _quote_zips(zip_codes: list[str]) -> str:
     return ", ".join(f"'{zip_code}'" for zip_code in zip_codes)
 
 
+def _quote_coord(value: float) -> str:
+    """Quote lat/lng for SOQL — UAT Site__c geo fields are stored as text."""
+    return f"'{value}'"
+
+
 def build_bbox_query(
     min_lat: float,
     max_lat: float,
@@ -34,8 +39,8 @@ def build_bbox_query(
         f"SELECT Id, Name, {lat_field}, {lng_field}, {address_field}, "
         f"{SF_CITY_FIELD}, {SF_STATE_FIELD}, {zip_field} "
         f"FROM {object_name} "
-        f"WHERE {lat_field} >= {min_lat} AND {lat_field} <= {max_lat} "
-        f"AND {lng_field} >= {min_lng} AND {lng_field} <= {max_lng}"
+        f"WHERE {lat_field} >= {_quote_coord(min_lat)} AND {lat_field} <= {_quote_coord(max_lat)} "
+        f"AND {lng_field} >= {_quote_coord(min_lng)} AND {lng_field} <= {_quote_coord(max_lng)}"
     )
 
 
@@ -55,8 +60,10 @@ def build_dedupe_query(
         clauses.append(f"{zip_field} IN ({_quote_zips(zip_codes)})")
     if bbox:
         clauses.append(
-            f"({lat_field} >= {bbox['min_lat']} AND {lat_field} <= {bbox['max_lat']} "
-            f"AND {lng_field} >= {bbox['min_lng']} AND {lng_field} <= {bbox['max_lng']})"
+            f"({lat_field} >= {_quote_coord(bbox['min_lat'])} "
+            f"AND {lat_field} <= {_quote_coord(bbox['max_lat'])} "
+            f"AND {lng_field} >= {_quote_coord(bbox['min_lng'])} "
+            f"AND {lng_field} <= {_quote_coord(bbox['max_lng'])})"
         )
     if not clauses:
         raise ValueError("Dedupe query requires zip codes and/or a bounding box")

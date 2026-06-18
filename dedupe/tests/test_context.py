@@ -11,6 +11,18 @@ def test_extract_zip_codes_from_records():
     assert extract_zip_codes(records) == ["53202", "53203"]
 
 
+def test_extract_zip_ignores_street_number_prefix():
+    records = [
+        {
+            "address": "10001 W BLUE MOUND RD, MILWAUKEE, WI 53226",
+            "lat": 43.0,
+            "lng": -87.9,
+            "zip_code": "53226",
+        },
+    ]
+    assert extract_zip_codes(records) == ["53226"]
+
+
 def test_build_dataset_bounding_box_expands_by_buffer():
     records = [
         {"lat": 43.0, "lng": -88.0},

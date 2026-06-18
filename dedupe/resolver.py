@@ -33,11 +33,27 @@ from dedupe.urbanicity import UrbanicityProfile, urbanicity_for_record
 class SiteResolver:
     """Resolve incoming records against existing Salesforce sites."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, verbose: bool = False) -> None:
+        self.verbose = verbose
         username = os.environ["SF_USERNAME"]
         password = os.environ["SF_PASSWORD"]
         security_token = os.environ["SF_SECURITY_TOKEN"]
         domain = os.environ.get("SF_DOMAIN", "login")
+        login_host = "test.salesforce.com" if domain == "test" else (
+            "login.salesforce.com" if domain == "login" else f"{domain}.salesforce.com"
+        )
+
+        import logging
+        logger = logging.getLogger(__name__)
+        if verbose:
+            logger.info("=" * 72)
+            logger.info("SALESFORCE CONNECT")
+            logger.info("  login host : https://%s", login_host)
+            logger.info("  username   : %s", username)
+            logger.info("  domain env : %s", domain)
+            logger.info("  (.uat username → Salesforce routes to your UAT sandbox org)")
+            logger.info("=" * 72)
+
         self.sf = Salesforce(
             username=username,
             password=password,
@@ -46,6 +62,13 @@ class SiteResolver:
         )
         self._candidate_cache: list[dict[str, Any]] | None = None
         self._dataset_context: dict[str, Any] | None = None
+
+        if verbose:
+            logger.info(
+                "Salesforce authenticated — API instance: https://%s",
+                self.sf.sf_instance,
+            )
+            logger.info("All Site__c queries run against this org instance.")
 
     @staticmethod
     def build_bounding_box(
@@ -63,10 +86,52 @@ class SiteResolver:
 
     def prefetch(self, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Load Salesforce candidates for the full dataset zip codes + expanded bbox."""
+        import logging
+        logger = logging.getLogger(__name__)
+
         self._dataset_context = build_dataset_context(records)
         zip_codes = self._dataset_context["zip_codes"]
         bbox = self._dataset_context["bbox"]
+
+        if self.verbose:
+            logger.info("=" * 72)
+            logger.info("SALESFORCE PREFETCH (bulk candidate query)")
+            logger.info("  normalized records : %d", len(records))
+            logger.info("  unique zip codes   : %d", len(zip_codes))
+            if zip_codes:
+                preview = ", ".join(zip_codes[:15])
+                if len(zip_codes) > 15:
+                    preview += f", ... (+{len(zip_codes) - 15} more)"
+                logger.info("  zips               : %s", preview)
+            if bbox:
+                logger.info(
+                    "  dataset bbox (+250m buffer): lat [%.5f, %.5f] lng [%.5f, %.5f]",
+                    bbox["min_lat"],
+                    bbox["max_lat"],
+                    bbox["min_lng"],
+                    bbox["max_lng"],
+                )
+
+        soql = build_dedupe_query(zip_codes or [], bbox)
+        if self.verbose:
+            logger.info("  SOQL: %s", soql)
+            logger.info("  executing query...")
+
         self._candidate_cache = self.query_salesforce(zip_codes=zip_codes, bbox=bbox)
+
+        if self.verbose:
+            with_coords = sum(
+                1
+                for row in self._candidate_cache
+                if row.get(SF_LAT_FIELD) is not None and row.get(SF_LNG_FIELD) is not None
+            )
+            logger.info(
+                "  returned %d Site__c rows (%d with lat/lng for spatial matching)",
+                len(self._candidate_cache),
+                with_coords,
+            )
+            logger.info("=" * 72)
+
         return self._candidate_cache
 
     def query_salesforce(
@@ -74,15 +139,24 @@ class SiteResolver:
         *,
         zip_codes: list[str] | None = None,
         bbox: dict[str, float] | None = None,
+        soql: str | None = None,
     ) -> list[dict[str, Any]]:
         """Return Salesforce site records for zip codes and/or a bounding box."""
-        if zip_codes or bbox:
-            soql = build_dedupe_query(zip_codes or [], bbox)
-        else:
-            raise ValueError("query_salesforce requires zip codes and/or a bounding box")
+        if soql is None:
+            if zip_codes or bbox:
+                soql = build_dedupe_query(zip_codes or [], bbox)
+            else:
+                raise ValueError("query_salesforce requires zip codes and/or a bounding box")
 
-        result = self.sf.query(soql)
-        return list(result.get("records") or [])
+        try:
+            result = self.sf.query(soql)
+            return list(result.get("records") or [])
+        except Exception as exc:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.error("Salesforce SOQL query failed: %s", exc)
+            logger.error("SOQL was: %s", soql)
+            raise
 
     @staticmethod
     def fuzzy_match(
@@ -255,6 +329,43 @@ class SiteResolver:
             status=status,
             used_outside_radius_match=used_outside_radius_match,
         )
+
+        if self.verbose:
+            import logging
+            logger = logging.getLogger(__name__)
+            matched = matched_record or {}
+            matched_addr = matched.get(SF_ADDRESS_FIELD) or matched.get("Name") or "—"
+            logger.info(
+                "    urbanicity : %s (zip=%s pop=%s radius=%sm)",
+                urbanicity.tier,
+                urbanicity.zip_code or "—",
+                f"{urbanicity.population:,}" if urbanicity.population else "unknown",
+                int(urbanicity.search_radius_m),
+            )
+            logger.info(
+                "    candidates : %d total in prefetch pool, %d within radius",
+                len(pool),
+                spatial_candidate_count,
+            )
+            if match:
+                dist = (
+                    f"{match['distance_m']:.0f}m"
+                    if match.get("distance_m") is not None
+                    else "no_sf_coordinates"
+                )
+                logger.info(
+                    "    best match : %s | %s",
+                    matched.get("Id", "—"),
+                    matched_addr[:80],
+                )
+                logger.info(
+                    "    scores     : address=%s proximity=%s combined=%s distance=%s",
+                    match["address_score"],
+                    match["proximity_score"],
+                    match["combined_score"],
+                    dist,
+                )
+            logger.info("    result     : %s — %s", status.upper(), resolution_detail)
 
         return {
             "status": status,

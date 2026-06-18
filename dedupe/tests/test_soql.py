@@ -11,7 +11,7 @@ def test_build_dedupe_query_uses_site_lat_lng_fields():
     assert "Site_Latitude__c" in query
     assert "Site_Longitude__c" in query
     assert "Site_Zip_Code__c IN ('53202', '53203')" in query
-    assert "Site_Latitude__c >= 43.0" in query
+    assert "Site_Latitude__c >= '43.0'" in query
     assert " OR " in query
 
 
