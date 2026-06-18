@@ -12,7 +12,11 @@ from typing import Any
 from dotenv import load_dotenv
 
 from classifier.asset_classifier import classify_record
-from dedupe.batch_postprocess import apply_batch_postprocess
+from dedupe.batch_postprocess import (
+    apply_batch_postprocess,
+    build_prescore_duplicate_row,
+    prescore_duplicate_indices,
+)
 from dedupe.constants import (
     SF_ADDRESS_FIELD,
     SF_CITY_FIELD,
@@ -101,6 +105,7 @@ DEDUPE_RESULT_FIELDS = [
     "top_candidates",
     "zip_mismatch",
     "threshold_version",
+    "distance_override_applied",
     "resolution_detail",
 ]
 
@@ -273,6 +278,7 @@ def _format_dedupe_export_row(row: dict[str, Any]) -> dict[str, Any]:
     formatted["suffix_mismatch"] = bool(row.get("suffix_mismatch"))
     formatted["city_mismatch"] = bool(row.get("city_mismatch"))
     formatted["tie_breaker_close"] = bool(row.get("tie_breaker_close"))
+    formatted["distance_override_applied"] = bool(row.get("distance_override_applied"))
     formatted["house_number_delta"] = _format_export_number(
         row.get("house_number_delta"), precision=0
     )
@@ -417,6 +423,7 @@ def _process_dedupe_record(
             "top_candidates": "",
             "_gated_candidates": [],
             "threshold_version": THRESHOLD_VERSION,
+            "distance_override_applied": False,
             "resolution_detail": "status=net_new; routing_reason=unparseable_input",
         }
         summary_delta["net_new"] = 1
@@ -469,6 +476,7 @@ def _process_dedupe_record(
         "top_candidates": resolution.get("top_candidates"),
         "_gated_candidates": resolution.get("_gated_candidates") or [],
         "threshold_version": resolution.get("threshold_version"),
+        "distance_override_applied": resolution.get("distance_override_applied"),
         "resolution_detail": resolution.get("resolution_detail"),
     }
 
@@ -554,6 +562,7 @@ def run_dedupe_pipeline(
         logger.exception("Failed to normalize record: %s", exc)
 
     dedupe_total = len(canonical_records)
+    prescore_dupes = prescore_duplicate_indices(canonical_records)
     if verbose and dedupe_total:
         logger.info("=" * 72)
         logger.info("DEDUPE RESOLUTION (%d records)", dedupe_total)
@@ -562,6 +571,18 @@ def run_dedupe_pipeline(
 
     for index, canonical in enumerate(canonical_records, start=1):
         try:
+            if (index - 1) in prescore_dupes:
+                result_row = build_prescore_duplicate_row(canonical)
+                result_rows.append(result_row)
+                summary["duplicates"] += 1
+                if verbose:
+                    prefix = f"[{index}/{dedupe_total}] " if dedupe_total else ""
+                    logger.info(
+                        "%sInput duplicate (pre-score): %s",
+                        prefix,
+                        canonical.get("address", "")[:100],
+                    )
+                continue
             result_row, delta = _process_dedupe_record(
                 canonical,
                 resolver,

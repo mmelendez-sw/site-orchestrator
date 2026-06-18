@@ -9,12 +9,16 @@ from __future__ import annotations
 
 import csv
 import os
+import re
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 from dedupe.constants import (
+    DC_DENSE_RADIUS_M,
+    DC_STATE_TOKENS,
+    DC_ZIP_PREFIXES,
     SUBURBAN_POPULATION_MIN,
     SUBURBAN_RADIUS_M,
     URBAN_POPULATION_MIN,
@@ -77,6 +81,35 @@ def _load_population_table() -> dict[str, int]:
     return populations
 
 
+def is_dc_zip(zip_code: str | None) -> bool:
+    normalized = _normalize_zip(zip_code)
+    if not normalized:
+        return False
+    return normalized.startswith(DC_ZIP_PREFIXES)
+
+
+def _record_state(record: dict[str, Any]) -> str | None:
+    for key in ("state", "State", "Site_State__c"):
+        value = record.get(key)
+        if value is None:
+            continue
+        text = str(value).strip().upper()
+        if text:
+            return text
+    address = str(record.get("address") or "")
+    match = re.search(r",\s*([A-Z]{2})\s+\d{5}", address.upper())
+    if match:
+        return match.group(1)
+    return None
+
+
+def is_dc_record(record: dict[str, Any]) -> bool:
+    state = _record_state(record)
+    if state in DC_STATE_TOKENS:
+        return True
+    return is_dc_zip(extract_zip_code(record))
+
+
 def classify_population(population: int) -> str:
     """Map a ZCTA population count to urban, suburban, or rural."""
     if population >= URBAN_POPULATION_MIN:
@@ -111,8 +144,17 @@ def urbanicity_for_record(record: dict[str, Any]) -> UrbanicityProfile:
     """Derive urbanicity tier and per-asset search radius from the record zip."""
     zip_code = extract_zip_code(record)
     population, source = lookup_zip_population(zip_code)
+    dc = is_dc_record(record)
 
     if population is None:
+        if dc:
+            return UrbanicityProfile(
+                zip_code=zip_code,
+                population=None,
+                tier="urban",
+                search_radius_m=float(DC_DENSE_RADIUS_M),
+                population_source="dc_urban_fallback",
+            )
         tier = URBANICITY_DEFAULT_TIER
         return UrbanicityProfile(
             zip_code=zip_code,
@@ -123,11 +165,18 @@ def urbanicity_for_record(record: dict[str, Any]) -> UrbanicityProfile:
         )
 
     tier = classify_population(population)
+    search_radius_m = radius_for_tier(tier)
+    if dc:
+        tier = "urban"
+        search_radius_m = float(DC_DENSE_RADIUS_M)
+        if population == 0:
+            source = f"{source}_dc_dense"
+
     return UrbanicityProfile(
         zip_code=zip_code,
         population=population,
         tier=tier,
-        search_radius_m=radius_for_tier(tier),
+        search_radius_m=search_radius_m,
         population_source=source,
     )
 

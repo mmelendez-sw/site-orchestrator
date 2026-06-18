@@ -168,13 +168,22 @@ def test_resolve_match_status_letter_suffix_duplicate():
     assert rule == "high_address_exact"
 
 
-def test_is_potential_duplicate_flags_close_net_new():
+def test_is_potential_duplicate_flags_borderline_band():
     match = {
         "within_radius": True,
-        "combined_score": 55,
-        "distance_m": 62.0,
+        "combined_score": 40,
+        "distance_m": 30.0,
     }
     assert SiteResolver.is_potential_duplicate(status="net_new", match=match) is True
+
+
+def test_is_potential_duplicate_below_borderline():
+    match = {
+        "within_radius": True,
+        "combined_score": 25,
+        "distance_m": 30.0,
+    }
+    assert SiteResolver.is_potential_duplicate(status="net_new", match=match) is False
 
 
 def test_score_candidate_nulls_proximity_for_geocoded_sf_fallback():

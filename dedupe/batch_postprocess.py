@@ -14,7 +14,9 @@ from dedupe.constants import (
     INPUT_DEDUPE_COORD_PRECISION,
     INPUT_NEAR_DEDUPE_HOUSE_MAX_DELTA,
     INPUT_NEAR_DEDUPE_MAX_M,
+    THRESHOLD_VERSION,
 )
+from dedupe.urbanicity import urbanicity_for_record
 from dedupe.match_snapshot import (
     apply_candidate_snapshot,
     clear_match_fields,
@@ -33,6 +35,84 @@ def _street_stems_match(left_address: str | None, right_address: str | None) -> 
     left = strip_house_number(extract_street_line(left_address or ""))
     right = strip_house_number(extract_street_line(right_address or ""))
     return bool(left and right and left == right)
+
+
+def prescore_duplicate_indices(records: list[dict[str, Any]]) -> set[int]:
+    """Return indices of input rows that duplicate an earlier row (pre-SF resolve)."""
+    primary_index: dict[tuple[str, float, float], int] = {}
+    duplicates: set[int] = set()
+    for index, record in enumerate(records):
+        key = input_dedupe_key(record)
+        if key[0] == "":
+            continue
+        if key not in primary_index:
+            primary_index[key] = index
+            continue
+        duplicates.add(index)
+    return duplicates
+
+
+def build_prescore_duplicate_row(
+    canonical: dict[str, Any],
+    *,
+    reason: str = "duplicate_of_input_prescore",
+) -> dict[str, Any]:
+    """Build a result row for a pre-score input duplicate without SF matching."""
+    urbanicity = urbanicity_for_record(canonical)
+    urbanicity_data = urbanicity.as_dict()
+    pop_text = (
+        f"{urbanicity.population:,}"
+        if urbanicity.population is not None
+        else "unknown"
+    )
+    return {
+        "address": canonical.get("address"),
+        "lat": canonical.get("lat"),
+        "lng": canonical.get("lng"),
+        "zip_code": canonical.get("zip_code"),
+        "urbanicity_tier": urbanicity_data.get("urbanicity_tier"),
+        "zip_population": urbanicity_data.get("zip_population"),
+        "urbanicity_prefilter_radius_m": urbanicity_data.get("search_radius_m"),
+        "status": "duplicate",
+        "status_resolver": "duplicate",
+        "status_recommended": "duplicate",
+        "address_score": 100,
+        "proximity_score": 100,
+        "combined_score": 100,
+        "matched_distance_m": 0.0,
+        "matched_coordinate_source": "input_dedupe",
+        "spatial_candidate_count": 0,
+        "prefilter_candidate_count": 0,
+        "potential_duplicate": False,
+        "candidate_count": 0,
+        "matched_id": None,
+        "matched_address": None,
+        "matched_city": None,
+        "matched_state": None,
+        "matched_zip": None,
+        "house_number_delta": 0,
+        "suffix_mismatch": False,
+        "city_mismatch": False,
+        "runner_up_id": None,
+        "runner_up_score": None,
+        "tie_breaker_close": False,
+        "routing_reason": reason,
+        "proximity_rule": reason,
+        "override_reason": reason,
+        "status_source": "input_dedupe_prescore",
+        "zip_mismatch": False,
+        "scoring_mode": "",
+        "top_candidates": "",
+        "_gated_candidates": [],
+        "threshold_version": THRESHOLD_VERSION,
+        "distance_override_applied": False,
+        "resolution_detail": (
+            f"{urbanicity.tier} zip population={pop_text} "
+            f"radius={int(urbanicity.search_radius_m)}m; "
+            f"routing_reason={reason}; status=duplicate; "
+            f"threshold_version={THRESHOLD_VERSION}"
+        ),
+    }
 
 
 def mark_input_duplicates(rows: list[dict[str, Any]]) -> int:
@@ -217,9 +297,17 @@ def escalate_address_exact_distance_outliers(rows: list[dict[str, Any]]) -> int:
 
 def promote_potential_duplicates(rows: list[dict[str, Any]]) -> int:
     """potential_duplicate must not coexist with net_new status."""
+    protected_routing = {
+        "house_number_neighbor",
+        "house_number_far",
+        "intersection",
+    }
     changed = 0
     for row in rows:
         if not row.get("potential_duplicate"):
+            continue
+        if row.get("routing_reason") in protected_routing:
+            row["potential_duplicate"] = False
             continue
         if row.get("status_recommended") != "net_new":
             row["potential_duplicate"] = False

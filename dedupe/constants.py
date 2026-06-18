@@ -4,7 +4,7 @@ DUPLICATE_THRESHOLD = 85
 REVIEW_THRESHOLD = 60
 AUTO_REJECT_ADDRESS_SCORE = 50
 DEFAULT_RADIUS_METERS = 250
-THRESHOLD_VERSION = "2026-06-18"
+THRESHOLD_VERSION = "2026-06-18-dc"
 
 # Urbanicity tiers from ZCTA population (nationwide CSV — see ZIP_POPULATION_CSV).
 URBAN_POPULATION_MIN = 25_000
@@ -13,6 +13,11 @@ URBAN_RADIUS_M = 100
 SUBURBAN_RADIUS_M = 100
 RURAL_RADIUS_M = 250
 URBANICITY_DEFAULT_TIER = "suburban"
+
+# DC dense urban search radius (40–80m band; demographics-us.com zips).
+DC_ZIP_PREFIXES = ("200", "202", "203", "204", "205")
+DC_STATE_TOKENS = ("DC", "DISTRICT OF COLUMBIA")
+DC_DENSE_RADIUS_M = 60
 
 # Combined dedupe score weights (address fuzzy match + in-radius proximity).
 ADDRESS_SCORE_WEIGHT = 0.65
@@ -54,7 +59,15 @@ CITY_MISMATCH_REVIEW_MIN_COMBINED = 60
 PROXIMITY_DOWNWEIGHT_ADDRESS_MAX = 50
 
 # Runner-up tie detection (R10).
-TIE_BREAKER_CLOSE_MAX_DELTA = 5
+TIE_BREAKER_CLOSE_MAX_DELTA = 15
+
+# House-number delta + distance → net-new (DC rule 6).
+HOUSE_NUMBER_FAR_DELTA_MIN = 10
+HOUSE_NUMBER_FAR_DISTANCE_M = 50
+
+# Borderline potential-duplicate band (DC rule 9).
+POTENTIAL_DUPLICATE_BORDERLINE_MIN = 30
+POTENTIAL_DUPLICATE_BORDERLINE_MAX = 65
 
 # Outside-radius fuzzy matches never promote to review/duplicate (in-radius only).
 OUTSIDE_RADIUS_REVIEW_MAX_M = 0

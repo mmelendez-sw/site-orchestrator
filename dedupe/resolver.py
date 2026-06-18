@@ -14,6 +14,8 @@ from dedupe.address_match import (
     evaluate_match_features,
     extract_city_from_address,
     house_number_neighbor_auto_net_new,
+    is_intersection_address,
+    normalize_for_scoring,
     normalize_sf_address,
     street_token_jaccard,
 )
@@ -33,6 +35,10 @@ from dedupe.constants import (
     HIGH_ADDRESS_RADIUS_MULTIPLIER,
     HIGH_ADDRESS_STRONG_MIN,
     HOUSE_NUMBER_DELTA_PENALTY_START,
+    HOUSE_NUMBER_FAR_DELTA_MIN,
+    HOUSE_NUMBER_FAR_DISTANCE_M,
+    POTENTIAL_DUPLICATE_BORDERLINE_MAX,
+    POTENTIAL_DUPLICATE_BORDERLINE_MIN,
     POTENTIAL_DUPLICATE_MAX_DISTANCE_M,
     POTENTIAL_DUPLICATE_MIN_COMBINED,
     PROX_DUPLICATE_MAX_M,
@@ -426,6 +432,30 @@ class SiteResolver:
         if house_number_neighbor_auto_net_new(incoming_address, candidate_address):
             return "net_new", combined, "house_number_neighbor", zip_mismatch
 
+        delta = features.get("house_number_delta")
+        if (
+            delta is not None
+            and delta >= HOUSE_NUMBER_FAR_DELTA_MIN
+            and distance_m is not None
+            and distance_m > HOUSE_NUMBER_FAR_DISTANCE_M
+        ):
+            return "net_new", combined, "house_number_far", zip_mismatch
+
+        if address_score >= 100 and delta == 0:
+            if city_mismatch and combined > CITY_MISMATCH_REVIEW_MIN_COMBINED:
+                return (
+                    "review",
+                    max(combined, address_score),
+                    "city_mismatch_high_confidence",
+                    zip_mismatch,
+                )
+            return (
+                "duplicate",
+                max(combined, address_score),
+                "address_exact_distance_override",
+                zip_mismatch,
+            )
+
         if distance_m is not None and distance_m < GEOCODER_COLLISION_MAX_M:
             jaccard = street_token_jaccard(incoming_address, candidate_address)
             if jaccard < GEOCODER_COLLISION_JACCARD_MIN:
@@ -539,7 +569,10 @@ class SiteResolver:
         distance_m = match.get("distance_m")
         if distance_m is None or distance_m > POTENTIAL_DUPLICATE_MAX_DISTANCE_M:
             return False
-        return match["combined_score"] >= POTENTIAL_DUPLICATE_MIN_COMBINED
+        combined = match["combined_score"]
+        if POTENTIAL_DUPLICATE_BORDERLINE_MIN <= combined <= POTENTIAL_DUPLICATE_BORDERLINE_MAX:
+            return True
+        return combined >= POTENTIAL_DUPLICATE_MIN_COMBINED
 
     @staticmethod
     def _build_resolution_detail(
@@ -642,11 +675,60 @@ class SiteResolver:
     ) -> dict[str, Any]:
         """Run urbanicity-radius spatial gate + fuzzy dedupe and return status."""
         address = record["address"]
+        scoring_address = normalize_for_scoring(address)
         incoming_lat = float(record["lat"])
         incoming_lng = float(record["lng"])
         incoming_zip = self._normalize_zip(record.get("zip_code"))
-        incoming_city = extract_city_from_address(address)
+        incoming_city = extract_city_from_address(scoring_address)
         urbanicity = urbanicity_for_record(record)
+
+        if is_intersection_address(address):
+            pop_text = (
+                f"{urbanicity.population:,}"
+                if urbanicity.population is not None
+                else "unknown"
+            )
+            resolution_detail = (
+                f"{urbanicity.tier} zip population={pop_text} "
+                f"radius={int(urbanicity.search_radius_m)}m; "
+                f"routing_reason=intersection; status=net_new; "
+                f"threshold_version={THRESHOLD_VERSION}"
+            )
+            return {
+                "status": "net_new",
+                "status_resolver": "net_new",
+                "status_recommended": "net_new",
+                "score": 0,
+                "address_score": 0,
+                "combined_score": 0,
+                "proximity_score": None,
+                "matched_distance_m": None,
+                "matched_coordinate_source": None,
+                "matched_record": None,
+                "runner_up_record": None,
+                "runner_up_score": None,
+                "tie_breaker_close": False,
+                "house_number_delta": None,
+                "suffix_mismatch": False,
+                "city_mismatch": False,
+                "scoring_mode": SCORING_MODE_WEIGHTED,
+                "top_candidates": "",
+                "_gated_candidates": [],
+                "candidate_count": 0,
+                "spatial_candidate_count": 0,
+                "prefilter_candidate_count": 0,
+                "urbanicity": urbanicity.as_dict(),
+                "resolution_detail": resolution_detail,
+                "potential_duplicate": False,
+                "routing_reason": "intersection",
+                "proximity_rule": "intersection",
+                "override_reason": None,
+                "status_source": "resolver",
+                "zip_mismatch": False,
+                "threshold_version": THRESHOLD_VERSION,
+                "distance_override_applied": False,
+                "dataset_context": self._dataset_context,
+            }
 
         pool = candidates if candidates is not None else self._candidate_cache
         if pool is None:
@@ -667,7 +749,7 @@ class SiteResolver:
 
         scored = [
             self._score_candidate(
-                address,
+                scoring_address,
                 incoming_lat,
                 incoming_lng,
                 sf_record,
@@ -685,7 +767,7 @@ class SiteResolver:
         gated = self._gate_passing_candidates(eligible)
         gated_snapshots = self._build_gated_snapshots(
             gated,
-            incoming_address=address,
+            incoming_address=scoring_address,
             incoming_zip=incoming_zip,
             search_radius_m=urbanicity.search_radius_m,
         )
@@ -696,7 +778,7 @@ class SiteResolver:
         city_mismatch = city_mismatch_for_review(
             incoming_city=incoming_city,
             matched_city=matched_record.get(SF_CITY_FIELD) if matched_record else None,
-            incoming_address=address,
+            incoming_address=scoring_address,
         )
         matched_zip = (
             self._normalize_zip(match["record"].get(SF_ZIP_FIELD)) if match else None
@@ -715,16 +797,19 @@ class SiteResolver:
                 search_radius_m=urbanicity.search_radius_m,
                 incoming_zip=incoming_zip,
                 matched_zip=matched_zip,
-                incoming_address=address,
+                incoming_address=scoring_address,
                 candidate_address=candidate_address,
                 match_features=match_features,
             )
+            status_resolver = status
         else:
             score = 0
             status = "net_new"
+            status_resolver = "net_new"
             routing_reason = None
             zip_mismatch = False
 
+        distance_override_applied = routing_reason == "address_exact_distance_override"
         potential_duplicate = self.is_potential_duplicate(status=status, match=match)
         runner_up_record = runner_up["record"] if runner_up else None
         top_candidates = self._build_top_candidates(
@@ -737,6 +822,11 @@ class SiteResolver:
             tie_breaker_close = abs(
                 match["combined_score"] - runner_up["combined_score"]
             ) <= TIE_BREAKER_CLOSE_MAX_DELTA
+        if tie_breaker_close and status == "duplicate":
+            status = "review"
+            routing_reason = "tie_breaker_close"
+
+        status_recommended = status
 
         resolution_detail = self._build_resolution_detail(
             urbanicity=urbanicity,
@@ -792,8 +882,8 @@ class SiteResolver:
 
         return {
             "status": status,
-            "status_resolver": status,
-            "status_recommended": status,
+            "status_resolver": status_resolver,
+            "status_recommended": status_recommended,
             "score": score,
             "address_score": match["address_score"] if match else 0,
             "combined_score": match["combined_score"] if match else 0,
@@ -822,5 +912,6 @@ class SiteResolver:
             "status_source": "resolver",
             "zip_mismatch": zip_mismatch,
             "threshold_version": THRESHOLD_VERSION,
+            "distance_override_applied": distance_override_applied,
             "dataset_context": self._dataset_context,
         }

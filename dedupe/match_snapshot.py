@@ -137,6 +137,7 @@ def status_from_routing(routing_reason: str | None, combined_score: int) -> str:
         "high_address_exact",
         "high_address_match",
         "proximity_duplicate",
+        "address_exact_distance_override",
     }:
         return "duplicate"
     if routing_reason in {
@@ -149,8 +150,15 @@ def status_from_routing(routing_reason: str | None, combined_score: int) -> str:
         "proximity_review_extended",
         "city_mismatch_high_confidence",
         "address_exact_distance_outlier",
+        "tie_breaker_close",
     }:
         return "review"
+    if routing_reason in {
+        "house_number_neighbor",
+        "house_number_far",
+        "intersection",
+    }:
+        return "net_new"
     if combined_score >= 85:
         return "duplicate"
     if combined_score >= 60:

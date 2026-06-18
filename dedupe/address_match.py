@@ -83,6 +83,11 @@ _STATE_ZIP_TAIL_RE = re.compile(
     r",\s*([^,]+),\s*([A-Z]{2})\s+(\d{5})(?:-\d{4})?\s*$",
     re.IGNORECASE,
 )
+_WARD_DC_RE = re.compile(r"\bWARD\s+\d+\b", re.IGNORECASE)
+_DC_TRAILING_RE = re.compile(
+    r",\s*(?:WASHINGTON|DISTRICT OF COLUMBIA)\s*,?\s*(?:DC|DISTRICT OF COLUMBIA)\s*,?\s*\d{5}(?:-\d{4})?\s*$",
+    re.IGNORECASE,
+)
 
 # Mismatch cap when house numbers disagree (same pin, different building is unlikely).
 _HOUSE_NUMBER_MISMATCH_CAP = 45
@@ -181,6 +186,44 @@ def collapse_osm_address(address: str) -> str:
     return street or text
 
 
+def strip_dc_noise(address: str) -> str:
+    """Strip Ward labels and redundant Washington/DC city tails before scoring."""
+    text = normalize_sf_address(address)
+    text = _WARD_DC_RE.sub("", text)
+    text = _DC_TRAILING_RE.sub("", text)
+    text = re.sub(r",\s*DC\s*,?\s*\d{5}(?:-\d{4})?\s*$", "", text, flags=re.IGNORECASE)
+    text = re.sub(r",\s*WASHINGTON\s*,?\s*DC\s*,?\s*\d{5}(?:-\d{4})?\s*$", "", text, flags=re.IGNORECASE)
+    return _WS_RE.sub(" ", text).strip(" ,")
+
+
+def is_intersection_address(address: str) -> bool:
+    """Detect cross-street / intersection addresses (e.g. 14TH & U, 7TH AND H)."""
+    line = extract_street_line_raw(address).upper()
+    if not line:
+        return False
+    body = _HOUSE_NUMBER_COMPONENT_RE.sub("", line, count=1).strip()
+    if "&" in body:
+        return True
+    return bool(re.search(r"\bAND\b", body))
+
+
+def extract_street_line_raw(address: str | None) -> str:
+    """Return the street portion without POI/OSM/DC normalization."""
+    text = normalize_sf_address(address)
+    if not text:
+        return ""
+
+    if "," in text:
+        head, tail = text.split(",", 1)
+        tail_upper = tail.upper()
+        if re.search(r"\b[A-Z]{2}\b", tail_upper) or re.search(r"\b\d{5}\b", tail_upper):
+            text = head
+
+    text = re.sub(r",?\s*[A-Z]{2}\s+\d{5}(?:-\d{4})?\s*$", "", text, flags=re.IGNORECASE)
+    text = re.sub(r",?\s*\d{5}(?:-\d{4})?\s*$", "", text)
+    return _WS_RE.sub(" ", text).strip()
+
+
 def normalize_for_scoring(address: str) -> str:
     """Apply pre-score normalization while preserving raw strings elsewhere (R01/R02)."""
     text = normalize_sf_address(address)
@@ -188,6 +231,7 @@ def normalize_for_scoring(address: str) -> str:
         text = collapse_osm_address(text)
     else:
         text = strip_leading_poi(text)
+    text = strip_dc_noise(text)
     return text
 
 
@@ -407,9 +451,18 @@ def street_names_match(left_address: str, right_address: str) -> bool:
 
 
 def suffix_mismatch(left_address: str, right_address: str) -> bool:
-    """Return True when both suffixes are known and differ (R08)."""
-    left_suffix = extract_street_suffix(strip_house_number(extract_street_line(left_address)))
-    right_suffix = extract_street_suffix(strip_house_number(extract_street_line(right_address)))
+    """Return True when both suffixes are known and differ (raw input first, R08)."""
+    left_raw = strip_house_number(extract_street_line_raw(left_address))
+    right_raw = strip_house_number(extract_street_line_raw(right_address))
+    left_suffix = extract_street_suffix(left_raw)
+    right_suffix = extract_street_suffix(right_raw)
+    if left_suffix and right_suffix and left_suffix != right_suffix:
+        return True
+
+    left_norm = strip_house_number(extract_street_line(left_address))
+    right_norm = strip_house_number(extract_street_line(right_address))
+    left_suffix = extract_street_suffix(left_norm)
+    right_suffix = extract_street_suffix(right_norm)
     if not left_suffix or not right_suffix:
         return False
     return left_suffix != right_suffix
