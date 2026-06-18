@@ -39,7 +39,7 @@ Key environment variables:
 | Variable | Used by | Purpose |
 |----------|---------|---------|
 | `SF_USERNAME`, `SF_PASSWORD`, `SF_SECURITY_TOKEN` | dedupe, salesforce | Salesforce API auth |
-| `GEOCODE_API_KEY` | ingest | Google Maps geocoding |
+| `GEOCODER`, `GEOCODER_USER_AGENT` | ingest, classifier | US Census + Nominatim geocoding (free, no API key) |
 | `ANTHROPIC_API_KEY` | classifier | Claude vision classification |
 | `NEARMAP_API_KEY` | classifier | Optional high-res oblique imagery |
 
@@ -69,7 +69,7 @@ python -m source.runner file --input data/candidates.json --output-json data/can
 
 ### 2. Ingest — normalize records
 
-Each raw record is geocoded (if needed), reverse-geocoded (if needed), or validated for address/coordinate alignment. Output is a canonical dict: `lat`, `lng`, `address`, `zip_code`, `permit_metadata`.
+Each raw record is geocoded (if needed) via US Census with Nominatim fallback, reverse-geocoded (if needed), or validated for address/coordinate alignment. Output is a canonical dict: `lat`, `lng`, `address`, `zip_code`, `permit_metadata`.
 
 ### 3. Dedupe — match against Salesforce
 
@@ -78,7 +78,15 @@ Before matching, the orchestrator **prefetches** Salesforce candidates for the e
 1. All **zip codes** found in the dataset
 2. One bounding box from the dataset **min/max lat/lng**, expanded by **±250m** (dataset-wide, not per site)
 
-SOQL uses `Site_Latitude__c`, `Site_Longitude__c`, `Site_Address__c`, and `Site_Zip_Code__c`. Fuzzy address matching (`rapidfuzz`) assigns each record a status:
+SOQL uses `Site_Latitude__c`, `Site_Longitude__c`, `Site_Address__c`, and `Site_Zip_Code__c`. Before fuzzy matching, each incoming record gets an **urbanicity search radius** from its zip population (`data/zip_populations.csv`):
+
+| Tier | ZCTA population | Search radius |
+|------|-----------------|-----------------|
+| Urban | ≥ 25,000 | 50 m |
+| Suburban | 2,500 – 24,999 | 150 m |
+| Rural | < 2,500 | 250 m |
+
+Salesforce candidates inside that radius are scored with a combined metric: **65% address fuzzy match + 35% proximity** (100 at the same point, 0 at the radius edge). Status thresholds apply to the combined score when a spatial match exists. Strong address matches **outside** the radius are flagged as `review` with `address_match_outside_radius`.
 
 | Status | Meaning |
 |--------|---------|

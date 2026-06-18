@@ -4,6 +4,18 @@ DUPLICATE_THRESHOLD = 85
 REVIEW_THRESHOLD = 60
 DEFAULT_RADIUS_METERS = 250
 
+# Urbanicity tiers from ZCTA population (see data/zip_populations.csv).
+URBAN_POPULATION_MIN = 25_000
+SUBURBAN_POPULATION_MIN = 2_500
+URBAN_RADIUS_M = 50
+SUBURBAN_RADIUS_M = 150
+RURAL_RADIUS_M = 250
+URBANICITY_DEFAULT_TIER = "suburban"
+
+# Combined dedupe score weights (address fuzzy match + in-radius proximity).
+ADDRESS_SCORE_WEIGHT = 0.65
+PROXIMITY_SCORE_WEIGHT = 0.35
+
 SF_OBJECT_NAME = "Site__c"
 SF_LAT_FIELD = "Site_Latitude__c"
 SF_LNG_FIELD = "Site_Longitude__c"

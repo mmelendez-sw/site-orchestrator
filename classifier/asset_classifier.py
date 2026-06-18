@@ -100,17 +100,8 @@ CHIP_DIR = Path("chips")
 RUNS_DIR = Path("runs")
 RUN_DIR = Path(".")
 
-# Geocoding: free US Census API first (good for CONUS rooftop addresses), then
-# OpenStreetMap Nominatim. Set GEOCODER=nominatim to skip Census.
-GEOCODER = os.environ.get("GEOCODER", "auto").strip().lower()  # auto | census | nominatim
-GEOCODER_USER_AGENT = os.environ.get(
-    "GEOCODER_USER_AGENT", "site-classifier/1.0 (cell-site imagery pipeline)")
-CENSUS_GEOCODE_URL = (
-    "https://geocoding.geo.census.gov/geocoder/locations/onelineaddress")
-CENSUS_BENCHMARK = "Public_AR_Current"
-NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
-GEOCODE_DELAY_S = 1.1      # Nominatim usage policy: max 1 request/second
-
+# Geocoding: shared with orchestrator ingest via ingest/geocoder.py
+# (US Census first, Nominatim fallback). Configure with GEOCODER=auto in .env.
 # Optional Nearmap integration (Tile API).
 # When NEARMAP_API_KEY is set, each asset also gets a high-res top-down view
 # plus 45-degree oblique panoramas from the four compass directions - obliques
@@ -460,7 +451,7 @@ def maybe_recheck_equipment(provider: str, clients: dict, res: dict, views: list
 
 # ----------------------------- geocoding ------------------------------------
 
-_last_geocode_at = 0.0
+from ingest.geocoder import geocode_address
 
 
 def _has_coordinates(row) -> bool:
@@ -484,88 +475,6 @@ def _clean_address(row) -> str | None:
     return text or None
 
 
-def _throttle_nominatim():
-    global _last_geocode_at
-    elapsed = time.time() - _last_geocode_at
-    if elapsed < GEOCODE_DELAY_S:
-        time.sleep(GEOCODE_DELAY_S - elapsed)
-    _last_geocode_at = time.time()
-
-
-def geocode_census(address: str) -> dict | None:
-    """US Census Bureau oneline geocoder - free, no API key, CONUS-focused."""
-    resp = requests.get(
-        CENSUS_GEOCODE_URL,
-        params={
-            "address": address,
-            "benchmark": CENSUS_BENCHMARK,
-            "format": "json",
-        },
-        timeout=30,
-    )
-    resp.raise_for_status()
-    matches = resp.json().get("result", {}).get("addressMatches", [])
-    if not matches:
-        return None
-    match = matches[0]
-    coords = match["coordinates"]
-    return {
-        "lat": float(coords["y"]),
-        "lon": float(coords["x"]),
-        "geocode_source": "census",
-        "geocode_matched_address": match.get("matchedAddress"),
-        "geocode_quality": "census_match",
-    }
-
-
-def geocode_nominatim(address: str) -> dict | None:
-    """OpenStreetMap Nominatim - free, worldwide, 1 req/sec usage policy."""
-    _throttle_nominatim()
-    resp = requests.get(
-        NOMINATIM_URL,
-        params={"q": address, "format": "json", "limit": 1},
-        headers={"User-Agent": GEOCODER_USER_AGENT},
-        timeout=30,
-    )
-    resp.raise_for_status()
-    results = resp.json()
-    if not results:
-        return None
-    hit = results[0]
-    return {
-        "lat": float(hit["lat"]),
-        "lon": float(hit["lon"]),
-        "geocode_source": "nominatim",
-        "geocode_matched_address": hit.get("display_name"),
-        "geocode_quality": hit.get("type") or hit.get("class"),
-    }
-
-
-def geocode_address(address: str) -> dict:
-    """Resolve a street address to lat/lon. Raises ValueError if no match."""
-    errors = []
-    if GEOCODER in ("auto", "census"):
-        try:
-            result = geocode_census(address)
-            if result:
-                return result
-            errors.append("census: no match")
-        except Exception as e:
-            errors.append(f"census: {e}")
-
-    if GEOCODER in ("auto", "nominatim"):
-        try:
-            result = geocode_nominatim(address)
-            if result:
-                return result
-            errors.append("nominatim: no match")
-        except Exception as e:
-            errors.append(f"nominatim: {e}")
-
-    raise ValueError(
-        f"could not geocode address ({'; '.join(errors)}): {address}")
-
-
 def resolve_row_coordinates(row) -> tuple[float, float, dict]:
     """Return (lat, lon, geocode_metadata). metadata is empty when coords given."""
     if _has_coordinates(row):
@@ -576,10 +485,15 @@ def resolve_row_coordinates(row) -> tuple[float, float, dict]:
         raise ValueError(
             "each row needs lat+lon or a non-empty address column")
 
-    geo = geocode_address(address)
-    meta = {k: v for k, v in geo.items() if k not in ("lat", "lon")}
+    try:
+        geo = geocode_address(address)
+    except RuntimeError as exc:
+        raise ValueError(str(exc)) from exc
+
+    meta = {k: v for k, v in geo.items() if k not in ("lat", "lng", "lon")}
     meta["input_address"] = address
-    return geo["lat"], geo["lon"], meta
+    lon = geo.get("lon", geo["lng"])
+    return geo["lat"], lon, meta
 
 
 def validate_input_csv(df: pd.DataFrame):

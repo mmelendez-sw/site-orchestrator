@@ -46,8 +46,14 @@ def _ensure_review_log_header() -> None:
                 "lat",
                 "lng",
                 "score",
+                "address_score",
+                "combined_score",
+                "matched_distance_m",
+                "search_radius_m",
+                "urbanicity_tier",
                 "matched_id",
                 "matched_address",
+                "resolution_detail",
             ],
         )
         writer.writeheader()
@@ -65,8 +71,14 @@ def _log_review(record: dict[str, Any], resolution: dict[str, Any]) -> None:
                 "lat",
                 "lng",
                 "score",
+                "address_score",
+                "combined_score",
+                "matched_distance_m",
+                "search_radius_m",
+                "urbanicity_tier",
                 "matched_id",
                 "matched_address",
+                "resolution_detail",
             ],
         )
         writer.writerow({
@@ -75,8 +87,14 @@ def _log_review(record: dict[str, Any], resolution: dict[str, Any]) -> None:
             "lat": record.get("lat"),
             "lng": record.get("lng"),
             "score": resolution.get("score"),
+            "address_score": resolution.get("address_score"),
+            "combined_score": resolution.get("combined_score"),
+            "matched_distance_m": resolution.get("matched_distance_m"),
+            "search_radius_m": (resolution.get("urbanicity") or {}).get("search_radius_m"),
+            "urbanicity_tier": (resolution.get("urbanicity") or {}).get("urbanicity_tier"),
             "matched_id": matched.get("Id"),
             "matched_address": matched.get(SF_ADDRESS_FIELD) or matched.get("Name"),
+            "resolution_detail": resolution.get("resolution_detail"),
         })
 
 
@@ -118,14 +136,23 @@ def _write_dedupe_results(
         "lat",
         "lng",
         "zip_code",
+        "urbanicity_tier",
+        "zip_population",
+        "search_radius_m",
         "status",
         "score",
+        "address_score",
+        "proximity_score",
+        "combined_score",
+        "matched_distance_m",
+        "spatial_candidate_count",
+        "candidate_count",
         "matched_id",
         "matched_address",
         "matched_city",
         "matched_state",
         "matched_zip",
-        "candidate_count",
+        "resolution_detail",
     ]
     with output.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -146,20 +173,30 @@ def _process_dedupe_record(
     resolution = resolver.resolve(canonical)
     status = resolution["status"]
     matched = resolution.get("matched_record") or {}
+    urbanicity = resolution.get("urbanicity") or {}
 
     result_row = {
         "address": canonical.get("address"),
         "lat": canonical.get("lat"),
         "lng": canonical.get("lng"),
         "zip_code": canonical.get("zip_code"),
+        "urbanicity_tier": urbanicity.get("urbanicity_tier"),
+        "zip_population": urbanicity.get("zip_population"),
+        "search_radius_m": urbanicity.get("search_radius_m"),
         "status": status,
         "score": resolution.get("score"),
+        "address_score": resolution.get("address_score"),
+        "proximity_score": resolution.get("proximity_score"),
+        "combined_score": resolution.get("combined_score"),
+        "matched_distance_m": resolution.get("matched_distance_m"),
+        "spatial_candidate_count": resolution.get("spatial_candidate_count"),
+        "candidate_count": resolution.get("candidate_count"),
         "matched_id": matched.get("Id"),
         "matched_address": matched.get(SF_ADDRESS_FIELD) or matched.get("Name"),
         "matched_city": matched.get(SF_CITY_FIELD),
         "matched_state": matched.get(SF_STATE_FIELD),
         "matched_zip": matched.get(SF_ZIP_FIELD),
-        "candidate_count": resolution.get("candidate_count"),
+        "resolution_detail": resolution.get("resolution_detail"),
     }
 
     if status == "duplicate":
@@ -167,10 +204,15 @@ def _process_dedupe_record(
             sf_client.log_duplicate(canonical, matched.get("Id", ""))
         summary_delta["duplicates"] = 1
         logger.info(
-            "Duplicate%s: %s (score=%s)",
+            "Duplicate%s: %s (combined=%s address=%s distance=%sm radius=%sm)",
             " (dry-run)" if dry_run else " skipped",
             canonical["address"],
-            resolution["score"],
+            resolution.get("combined_score"),
+            resolution.get("address_score"),
+            f"{resolution.get('matched_distance_m'):.0f}"
+            if resolution.get("matched_distance_m") is not None
+            else "n/a",
+            urbanicity.get("search_radius_m"),
         )
         return result_row, summary_delta
 
@@ -178,9 +220,10 @@ def _process_dedupe_record(
         _log_review(canonical, resolution)
         summary_delta["review"] = 1
         logger.info(
-            "Review queued: %s (score=%s)",
+            "Review queued: %s (combined=%s %s)",
             canonical["address"],
-            resolution["score"],
+            resolution.get("combined_score"),
+            resolution.get("resolution_detail"),
         )
         return result_row, summary_delta
 
