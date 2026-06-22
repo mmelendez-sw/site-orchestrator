@@ -134,6 +134,20 @@ ZOOM_MIN_FRAC = 0.10       # minimum crop side as fraction of source image
 ZOOM_PAD_FRAC = 0.15       # padding around each candidate box
 EXECUTIVE_SUMMARY_MD = "EXECUTIVE_SUMMARY.md"
 
+TOWER_SUBTYPE_SCHEMA_VALUES = [
+    "monopole",
+    "guyed",
+    "self_support",
+    "stealth",
+    "steeple",
+    "water_tower",
+    "silo",
+    "flagpole",
+    "smokestack",
+    "other_tower",
+    "unclear",
+]
+
 CLASSIFICATION_PROMPT = """\
 You are analyzing aerial imagery of one location where a cellular-infrastructure \
 asset is expected. One or more views are provided, each preceded by a text label:
@@ -174,6 +188,19 @@ large building is more prominent than a thin mast.
 hosts) the equipment.
 - "other": neither applies (water tank, silo, bare field, etc.) - describe it.
 - "unclear": image quality or ambiguity prevents a confident call.
+When site_type is "tower", also set tower_subtype to the best match:
+- "monopole": single thin pole, minimal footprint, no lattice faces
+- "guyed": guy wires or anchor pads visible from above or oblique
+- "self_support": lattice or solid self-supporting tower legs
+- "stealth": church steeple, clock tower, faux-building tower cap, or \
+faux-building monopole disguised as architecture
+- "water_tower": elevated tank on legs
+- "silo": agricultural/industrial silo hosting antennas
+- "flagpole": flagpole-style slim mast
+- "smokestack": industrial stack
+- "other_tower": tower present but subtype unclear
+- "unclear": tower confirmed but subtype not discernible
+When site_type is not "tower", set tower_subtype to null.
 Set site_confidence to at most 0.6 unless two or more independent cues or \
 views corroborate the call.
 
@@ -242,6 +269,10 @@ RESPONSE_SCHEMA = {
             "type": "string",
             "enum": ["tower", "rooftop", "other", "unclear"],
         },
+        "tower_subtype": {
+            "type": "string",
+            "enum": list(TOWER_SUBTYPE_SCHEMA_VALUES),
+        },
         "site_confidence": {"type": "number"},
         "site_evidence": {"type": "string"},
         "asset_box_2d": {
@@ -263,6 +294,11 @@ GEMINI_RESPONSE_SCHEMA = {
         "site_type": {
             "type": "STRING",
             "enum": ["tower", "rooftop", "other", "unclear"],
+        },
+        "tower_subtype": {
+            "type": "STRING",
+            "enum": TOWER_SUBTYPE_SCHEMA_VALUES,
+            "nullable": True,
         },
         "site_confidence": {"type": "NUMBER"},
         "site_evidence": {"type": "STRING"},
@@ -359,8 +395,10 @@ panel antennas, sector frames, or dishes on a building roof.
 
 Perform the same three tasks as the primary classifier:
 1. site_type: tower | rooftop | other | unclear
-2. asset_box_2d + asset_view on the view where the asset is clearest
-3. cell_equipment: true | false | null
+2. When site_type is tower, tower_subtype: monopole | guyed | self_support | \
+stealth | steeple | water_tower | silo | flagpole | smokestack | other_tower | unclear
+3. asset_box_2d + asset_view on the view where the asset is clearest
+4. cell_equipment: true | false | null
 
 Set site_confidence to at most 0.7 unless zoom crops show unambiguous equipment.
 """
@@ -402,6 +440,10 @@ def normalize_model_result(res: dict) -> dict:
         norm = normalize_confidence(res.get("cell_equipment_confidence"))
         if norm is not None:
             res["cell_equipment_confidence"] = norm
+    if res.get("site_type") != "tower":
+        res["tower_subtype"] = None
+    elif res.get("tower_subtype") in ("", "null"):
+        res["tower_subtype"] = None
     return res
 
 
@@ -1911,6 +1953,7 @@ def main():
                 "chip_path": str(chip_path) if chip_path else None,
                 "view_count": len(views),
                 "site_type": res.get("site_type"),
+                "tower_subtype": res.get("tower_subtype"),
                 "site_confidence": res.get("site_confidence"),
                 "site_evidence": res.get("site_evidence"),
                 "asset_lat": asset_lat,
