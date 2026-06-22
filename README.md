@@ -104,7 +104,18 @@ python classifier/asset_classifier.py -i data/WI_assets.csv
 
 ### 5. Salesforce — load net-new sites
 
-Classified net-new records are created in Salesforce via `Site__c` field mappings in `salesforce/field_map.py`.
+Classified net-new records are mapped to the same column layout as the manual Data Loader template and written to `runs/<run>/sf_upload.csv` (plus `sf_upload_picklists.txt` for valid picklist values). Live upload uses `Site__c` field mappings in `salesforce/field_map.py`.
+
+```powershell
+# Dedupe only → export upload CSV for net-new rows
+python orchestrator.py --source file --input data/all_DC_assets.csv --state DC --dry-run
+
+# Full pipeline → classify, export sf_upload.csv, then API create (when not dry-run)
+python orchestrator.py --source file --input data/WI_assets.csv --state WI --classify
+
+# Build upload CSV from an existing dedupe run
+python scripts/export_sf_upload.py --input runs/dedupe_2026-06-18_155235/dedupe_results.csv
+```
 
 ## Run the full orchestrator
 

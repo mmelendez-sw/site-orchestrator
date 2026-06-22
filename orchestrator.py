@@ -31,6 +31,7 @@ from dedupe.urbanicity import urbanicity_for_record
 from ingest.normalizer import normalize
 from ingest.scraper import IngestRecord
 from salesforce.sf_client import SalesforceClient
+from salesforce.upload_template import build_upload_record, write_upload_csv
 from source.record import SourceRecord
 from source.runner import list_sources, run_source
 from source.scope import parse_scope
@@ -108,6 +109,35 @@ DEDUPE_RESULT_FIELDS = [
     "distance_override_applied",
     "resolution_detail",
 ]
+
+
+def _write_sf_upload_csv(
+    result_rows: list[dict[str, Any]],
+    canonical_records: list[dict[str, Any]],
+    run_dir: Path,
+    *,
+    classified_by_index: dict[int, dict[str, Any]] | None = None,
+) -> Path | None:
+    """Write sf_upload.csv for final net-new rows using the Salesforce template."""
+    upload_records: list[dict[str, Any]] = []
+    for index, row in enumerate(result_rows):
+        if row.get("status") != "net_new":
+            continue
+        canonical = canonical_records[index] if index < len(canonical_records) else {}
+        classified = (classified_by_index or {}).get(index)
+        upload_records.append(
+            build_upload_record(
+                canonical,
+                classified=classified,
+                dedupe_row=row,
+            )
+        )
+    if not upload_records:
+        return None
+    output = run_dir / "sf_upload.csv"
+    write_upload_csv(upload_records, output)
+    logger.info("Wrote Salesforce upload template to %s", output.resolve())
+    return output
 
 
 def _review_log_path(run_dir: Path) -> Path:
@@ -617,6 +647,7 @@ def run_dedupe_pipeline(
         summary["net_new"] = status_counts["net_new"]
         output = _write_dedupe_results(run_dir, result_rows)
         _write_review_log_from_rows(run_dir, result_rows)
+        _write_sf_upload_csv(result_rows, canonical_records, run_dir)
         logger.info("Wrote dedupe results to %s", output.resolve())
         if summary["review"]:
             logger.info("Wrote review log to %s", review_log.resolve())
@@ -685,6 +716,7 @@ def main(
         logger.info("Prefetched %s Salesforce candidates for dedupe", len(candidates))
 
     dedupe_total = len(canonical_records)
+    classified_by_index: dict[int, dict[str, Any]] = {}
     for index, canonical in enumerate(canonical_records, start=1):
         try:
             result_row, delta = _process_dedupe_record(
@@ -705,16 +737,8 @@ def main(
                 continue
 
             classified = classify_record(canonical, run_dir=run_dir)
-            if sf_client and not dry_run:
-                sf_client.create_site(classified)
-                summary["loaded"] += 1
-                logger.info("Loaded net-new site: %s", canonical["address"])
-            else:
-                logger.info(
-                    "Classified net-new site%s: %s",
-                    " (dry-run, not uploaded)" if dry_run else "",
-                    canonical["address"],
-                )
+            classified_by_index[len(result_rows) - 1] = classified
+            logger.info("Classified net-new site: %s", canonical["address"])
 
         except Exception as exc:
             summary["errors"] += 1
@@ -728,7 +752,35 @@ def main(
         summary["net_new"] = status_counts["net_new"]
         output = _write_dedupe_results(run_dir, result_rows)
         _write_review_log_from_rows(run_dir, result_rows)
+        _write_sf_upload_csv(
+            result_rows,
+            canonical_records,
+            run_dir,
+            classified_by_index=classified_by_index,
+        )
         logger.info("Wrote dedupe results to %s", output)
+
+        if sf_client and not dry_run:
+            for index, row in enumerate(result_rows):
+                if row.get("status") != "net_new":
+                    continue
+                classified = classified_by_index.get(index)
+                if classified is None:
+                    continue
+                upload_record = build_upload_record(
+                    canonical_records[index],
+                    classified=classified,
+                    dedupe_row=row,
+                )
+                sf_client.create_site(upload_record)
+                summary["loaded"] += 1
+                logger.info("Loaded net-new site: %s", canonical_records[index]["address"])
+        elif dry_run and summary["net_new"]:
+            logger.info(
+                "Dry-run: %s net-new rows exported to sf_upload.csv (no Salesforce writes)",
+                summary["net_new"],
+            )
+
         if summary["review"]:
             logger.info("Wrote review log to %s", _review_log_path(run_dir))
 
