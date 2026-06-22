@@ -1,0 +1,35 @@
+---
+description: Never run shell, API, or long jobs without explicit user authorization
+alwaysApply: true
+---
+
+# No unauthorized execution
+
+Do **not** run commands, scripts, or background jobs unless the user **explicitly** requested that exact action in their latest message.
+
+## Requires explicit authorization
+
+- `python orchestrator.py` (especially with `--classify`)
+- `python classifier/asset_classifier.py`
+- `python scripts/upload_sf_csv.py` (live upload, not dry-run)
+- Any Salesforce write (create/update records)
+- Any command that calls paid APIs: Gemini, Claude, Nearmap, Salesforce
+- Background or long-running shell tasks (>30s expected)
+- `git push`, force operations, or destructive git commands
+
+## Allowed without extra confirmation
+
+- Read-only inspection: `git status`, `git diff`, `git log`, reading files, grep, search
+- `--dry-run` only when the user asked for a dry-run or validation preview
+- Tests only when the user asked to run tests
+
+## Before running anything else
+
+1. State the **exact command** you intend to run.
+2. Confirm the user asked for it (or ask first).
+3. Never run in background unless the user explicitly requested background execution.
+4. Prefer preparing files/commands for the user to run themselves when scope is ambiguous.
+
+## If the user corrects scope
+
+Stop immediately. Do not continue prior pipelines (classify, upload, orchestrator) unless they re-authorize.
