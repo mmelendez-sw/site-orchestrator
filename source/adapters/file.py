@@ -50,7 +50,11 @@ class FileSource(BaseSourceAdapter):
         county_col = _find_column(df, ("county", "County"))
         country_col = _find_column(df, ("country", "Country"))
         address_col = _find_column(df, ("address", "Address")) or "Address"
+        city_col = _find_column(df, ("city", "City"))
+        state_col = _find_column(df, ("state", "State"))
         id_col = _find_column(df, ("id", "site_id"))
+        lat_col = _find_column(df, ("lat", "latitude"))
+        lng_col = _find_column(df, ("lng", "lon", "longitude"))
         input_confidence_col = _find_column(df, ("input_confidence",))
 
         records = source_records_from_dataframe(
@@ -60,7 +64,11 @@ class FileSource(BaseSourceAdapter):
             id_prefix=id_prefix,
             source_url=str(path),
             address_col=address_col,
+            city_col=city_col or "City",
+            state_col=state_col or "State",
             id_col=id_col,
+            lat_col=lat_col,
+            lng_col=lng_col,
             input_confidence_col=input_confidence_col,
             zip_col=zip_col,
             county_col=county_col,

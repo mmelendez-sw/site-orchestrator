@@ -21,6 +21,8 @@ def source_records_from_dataframe(
     county_col: str | None = None,
     country_col: str | None = None,
     id_col: str | None = None,
+    lat_col: str | None = None,
+    lng_col: str | None = None,
     input_confidence_col: str | None = None,
     label: str | None = None,
     id_prefix: str | None = None,
@@ -38,6 +40,8 @@ def source_records_from_dataframe(
         county_col,
         country_col,
         id_col,
+        lat_col,
+        lng_col,
         input_confidence_col,
     }
     reserved = {col for col in reserved if col}
@@ -52,6 +56,8 @@ def source_records_from_dataframe(
         input_confidence = (
             _optional_str(row.get(input_confidence_col)) if input_confidence_col else None
         )
+        lat = _optional_float(row.get(lat_col)) if lat_col else None
+        lng = _optional_float(row.get(lng_col)) if lng_col else None
         records.append(SourceRecord(
             site_id=site_id or f"{prefix}_{site_num:03d}",
             address=address,
@@ -60,6 +66,8 @@ def source_records_from_dataframe(
             county=_optional_str(row.get(county_col)) if county_col else None,
             country=_optional_str(row.get(country_col)) if country_col else None,
             zip_code=_optional_str(row.get(zip_col)) if zip_col else None,
+            lat=lat,
+            lng=lng,
             label=label or _optional_str(row.get("label")) or _optional_str(row.get(state_col)),
             input_confidence=input_confidence or "high",
             permit_metadata={
@@ -122,6 +130,15 @@ def export_source_json(records: list[SourceRecord], path: str | Path) -> Path:
     ]
     pd.DataFrame(payload).to_json(output, orient="records", indent=2)
     return output
+
+
+def _optional_float(value: Any) -> float | None:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _optional_str(value: Any) -> str | None:
