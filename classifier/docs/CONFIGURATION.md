@@ -39,6 +39,7 @@ Boolean flags: set to `1`, `true`, or `yes` to enable. Default is `0` (off).
 | `BIFURCATED_AI` | `0` | Gemini first pass; escalate to Claude for `other`, `unclear`, or low confidence. |
 | `GEMINI_ONLY` | `0` | Gemini only — no Claude calls or escalation. Requires `GEMINI_API_KEY`. |
 | `TOWER_ONLY` | `0` | Tower detection mode: rooftop hosts classify as `other`; prompts/schemas focus on ground-based towers. |
+| `ZOOM_STAGE` | `1` | Two-stage zoom scout + re-classify on `other`/`unclear`. Set `0` to skip (saves API calls). |
 | `NAIP_ONLY` | `0` | Debug/breakpoint mode: skip all Nearmap fetching. Overrides `NEARMAP_TIERED`. |
 
 **Combinations**
@@ -61,7 +62,7 @@ Boolean flags: set to `1`, `true`, or `yes` to enable. Default is `0` (off).
 | `CLAUDE_MODELS` | `claude-sonnet-4-6,claude-haiku-4-5-20251001` | Comma-separated Claude models. First is primary; hops to next on rate limits or 404. Used when `BIFURCATED_AI=0`, or for Claude escalation / wide-AOI / zoom when bifurcated. |
 | `CLAUDE_ESCALATION_MODEL` | `claude-sonnet-4-6` | Fixed Claude model for bifurcated escalation (does not use fallback chain). |
 | `GEMINI_MODEL` | `gemini-2.5-flash` | Gemini model for first pass when `BIFURCATED_AI=1` or `GEMINI_ONLY=1`. |
-| `GEMINI_DELAY_S` | `15` | Seconds between assets when Gemini is the primary provider. |
+| `GEMINI_DELAY_S` | `30` | Seconds between assets when Gemini is the primary provider. |
 | `GEMINI_RETRIES` | `6` | Retries per Gemini call on transient `429` / `503` errors. |
 | `GEMINI_RETRY_BASE_S` | `20` | Base backoff seconds for Gemini retries (doubles each attempt, cap 120s). |
 | `CLAUDE_DELAY_S` | `12` | Seconds to pause between assets when Claude is the primary provider. |

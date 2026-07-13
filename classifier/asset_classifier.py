@@ -79,6 +79,7 @@ BIFURCATED_AI = _env_flag("BIFURCATED_AI", default="1")
 GEMINI_ONLY = _env_flag("GEMINI_ONLY")
 TOWER_ONLY = _env_flag("TOWER_ONLY")
 NAIP_ONLY = _env_flag("NAIP_ONLY")
+ZOOM_STAGE = _env_flag("ZOOM_STAGE", default="1")
 TIER_CONF_HIGH = float(os.environ.get("TIER_CONF_HIGH", "0.75"))
 TIER_CONF_MEDIUM = float(os.environ.get("TIER_CONF_MEDIUM", "0.6"))
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
@@ -101,7 +102,7 @@ MODELS = [
 ]
 _model_idx = 0
 API_DELAY_S = float(os.environ.get("CLAUDE_DELAY_S", "12"))
-GEMINI_DELAY_S = float(os.environ.get("GEMINI_DELAY_S", "15"))
+GEMINI_DELAY_S = float(os.environ.get("GEMINI_DELAY_S", "30"))
 GEMINI_RETRIES = int(os.environ.get("GEMINI_RETRIES", "6"))
 GEMINI_RETRY_BASE_S = float(os.environ.get("GEMINI_RETRY_BASE_S", "20"))
 INPUT_CSV = "data/assets.csv"    # columns: id; lat+lon OR address; optional: label, input_confidence
@@ -1934,6 +1935,9 @@ def main():
     if TOWER_ONLY:
         print("TOWER_ONLY=1 — tower detection mode (rooftop hosts -> other).",
               flush=True)
+    if not ZOOM_STAGE:
+        print("ZOOM_STAGE=0 — two-stage zoom disabled (single-pass classification).",
+              flush=True)
     if GEMINI_ONLY:
         print(f"GEMINI_ONLY=1 — Gemini only ({GEMINI_MODEL}), no Claude escalation.",
               flush=True)
@@ -2098,10 +2102,8 @@ def main():
                     stage_provider = _effective_provider(primary_model, escalation_model)
 
             # Two-stage zoom: scout suspicious regions, magnify, re-classify.
-            # Stealth-tagged sites always get a zoom pass - wide imagery often
-            # misreads building-integrated towers as generic rooftops.
             force_zoom = label_hint == "stealth"
-            if force_zoom or res.get("site_type") in ("other", "unclear"):
+            if ZOOM_STAGE and (force_zoom or res.get("site_type") in ("other", "unclear")):
                 source_label, source_img = None, None
                 if nearmap_views.get("Vert"):
                     source_label, source_img = "Nearmap top-down", nearmap_views["Vert"]
