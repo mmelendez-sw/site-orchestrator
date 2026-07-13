@@ -35,10 +35,15 @@ import io
 import json
 import math
 import os
+import sys
 import time
 import argparse
 import shutil
 from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 import numpy as np
 import pandas as pd
@@ -70,6 +75,8 @@ def _env_flag(name: str, default: str = "0") -> bool:
 
 NEARMAP_TIERED = _env_flag("NEARMAP_TIERED", default="1")
 BIFURCATED_AI = _env_flag("BIFURCATED_AI", default="1")
+GEMINI_ONLY = _env_flag("GEMINI_ONLY")
+TOWER_ONLY = _env_flag("TOWER_ONLY")
 NAIP_ONLY = _env_flag("NAIP_ONLY")
 TIER_CONF_HIGH = float(os.environ.get("TIER_CONF_HIGH", "0.75"))
 TIER_CONF_MEDIUM = float(os.environ.get("TIER_CONF_MEDIUM", "0.6"))
@@ -226,6 +233,77 @@ Field meanings: site_evidence and cell_equipment_evidence are one short \
 sentence each, citing the specific views and cues used.
 """
 
+TOWER_ONLY_CLASSIFICATION_PROMPT = """\
+You are analyzing NAIP top-down aerial imagery of one location where a \
+ground-based cellular TOWER may exist. Detection mode is TOWER ONLY.
+
+The recorded coordinates can be off by tens of meters, so a tower may appear \
+ANYWHERE in the chip, not just at the center.
+
+Definitions:
+- TOWER: a ground-based, purpose-built vertical structure carrying antennas - \
+monopole, lattice/self-support tower, guyed mast, stealth steeple/clock tower, \
+water tower on legs, silo, flagpole, or smokestack with telecom gear. Top-down \
+cues: tiny footprint, long thin shadow, lattice cross-pattern, guy wires, small \
+fenced compound with equipment cabinets.
+- NOT A TOWER: rooftop cellular hosts, bare fields, unrelated buildings, parking \
+lots, or structures with no vertical tower mast. Classify those as "other".
+
+Perform three tasks:
+
+TASK 1 - site_type. Search the ENTIRE chip - edges and corners included:
+- "tower": a tower (as defined above) is visible anywhere in the imagery
+- "other": no tower visible (including rooftop sites and non-telecom structures)
+- "unclear": image quality or ambiguity prevents a confident call
+When site_type is "tower", also set tower_subtype to the best match:
+monopole | guyed | self_support | stealth | steeple | water_tower | silo | \
+flagpole | smokestack | other_tower | unclear
+When site_type is not "tower", set tower_subtype to null.
+Set site_confidence to at most 0.6 unless two or more independent cues \
+corroborate a tower.
+
+TASK 2 - locate the tower. If site_type is tower, report asset_box_2d \
+[ymin, xmin, ymax, xmax] in 0-1000 normalized coordinates on the clearest view, \
+plus asset_view. Otherwise set both to null.
+
+TASK 3 - cell_equipment: is cellular equipment visible on the located tower?
+true | false | null
+
+Field meanings: site_evidence and cell_equipment_evidence are one short \
+sentence each, citing the specific cues used.
+"""
+
+TOWER_ONLY_SCAN_PROMPT = """\
+You are reviewing a NAIP top-down image where a ground-based cellular tower \
+may exist, but a first pass could not identify it. Search the ENTIRE image for \
+tower cues: tiny footprints with long shadows, lattice cross-patterns, guy \
+wires, fenced compounds, monopoles, or stealth tower blocks on a building corner.
+
+Return ONLY JSON with a "candidates" array (up to four entries). Each entry needs:
+- box_2d: [ymin, xmin, ymax, xmax] in 0-1000 normalized coordinates
+- reason: one short phrase citing the visual cue
+
+Ignore rooftop-only hosts. If nothing looks like a tower, return an empty array.
+"""
+
+TOWER_ONLY_ZOOM_CLASSIFICATION_PROMPT = """\
+You are performing a SECOND-PASS tower review on magnified NAIP zoom crops from \
+a site that was not identified in wide imagery. A ground-based cellular tower \
+may still be present.
+
+Use the zoom crops as primary evidence. Look for lattice masts, monopoles, guyed \
+structures, fenced compounds, stealth tower sections, or long thin tower shadows.
+
+Detection mode is TOWER ONLY:
+1. site_type: tower | other | unclear (rooftop hosts are "other")
+2. When site_type is tower, tower_subtype: monopole | guyed | self_support | \
+stealth | steeple | water_tower | silo | flagpole | smokestack | other_tower | unclear
+3. asset_box_2d + asset_view on the clearest view when tower is found
+4. cell_equipment: true | false | null
+
+Set site_confidence to at most 0.7 unless zoom crops show an unambiguous tower.
+"""
+
 INPUT_CONFIDENCE_PROMPTS = {
     "high": (
         "\n\nSOURCE TRUST: HIGH. The coordinate comes from a trusted source that "
@@ -287,6 +365,7 @@ RESPONSE_SCHEMA = {
     "required": ["site_type", "site_confidence", "site_evidence"],
 }
 
+
 # Gemini SDK uses a distinct schema dialect; kept in sync with RESPONSE_SCHEMA.
 GEMINI_RESPONSE_SCHEMA = {
     "type": "OBJECT",
@@ -314,6 +393,47 @@ GEMINI_RESPONSE_SCHEMA = {
     },
     "required": ["site_type", "site_confidence", "site_evidence"],
 }
+
+
+def _site_type_values() -> list[str]:
+    if TOWER_ONLY:
+        return ["tower", "other", "unclear"]
+    return ["tower", "rooftop", "other", "unclear"]
+
+
+def _positive_site_types() -> tuple[str, ...]:
+    if TOWER_ONLY:
+        return ("tower",)
+    return ("tower", "rooftop")
+
+
+def _classification_response_schemas() -> tuple[dict, dict]:
+    site_types = _site_type_values()
+    claude_schema = {
+        **RESPONSE_SCHEMA,
+        "properties": {
+            **RESPONSE_SCHEMA["properties"],
+            "site_type": {"type": "string", "enum": site_types},
+        },
+    }
+    gemini_schema = {
+        **GEMINI_RESPONSE_SCHEMA,
+        "properties": {
+            **GEMINI_RESPONSE_SCHEMA["properties"],
+            "site_type": {"type": "STRING", "enum": site_types},
+        },
+    }
+    return claude_schema, gemini_schema
+
+
+def resolve_ai_mode() -> tuple[str, bool]:
+    """Return (primary_provider, allow_claude_escalation)."""
+    if GEMINI_ONLY:
+        return "gemini", False
+    if BIFURCATED_AI:
+        return "gemini", True
+    return "claude", False
+
 
 SCAN_PROMPT = """\
 You are reviewing a single top-down aerial image where a cellular tower or \
@@ -404,6 +524,14 @@ Set site_confidence to at most 0.7 unless zoom crops show unambiguous equipment.
 """
 
 
+def _active_scan_prompt() -> str:
+    return TOWER_ONLY_SCAN_PROMPT if TOWER_ONLY else SCAN_PROMPT
+
+
+def _active_zoom_prompt() -> str:
+    return TOWER_ONLY_ZOOM_CLASSIFICATION_PROMPT if TOWER_ONLY else ZOOM_CLASSIFICATION_PROMPT
+
+
 def normalize_input_confidence(value) -> str:
     """Return high | medium | low. Missing or invalid values default to medium."""
     if value is None or (isinstance(value, float) and pd.isna(value)):
@@ -449,7 +577,7 @@ def normalize_model_result(res: dict) -> dict:
 
 def build_classification_prompt(row) -> str:
     """Assemble the full classification prompt from base + label + source trust."""
-    prompt = CLASSIFICATION_PROMPT
+    prompt = TOWER_ONLY_CLASSIFICATION_PROMPT if TOWER_ONLY else CLASSIFICATION_PROMPT
     label_hint = str(row.get("label", "")).strip().lower()
     if label_hint == "stealth":
         prompt += (
@@ -482,7 +610,7 @@ def maybe_recheck_equipment(provider: str, clients: dict, res: dict, views: list
             "cell_equipment_confidence", res.get("cell_equipment_confidence"))
         res["cell_equipment_evidence"] = recheck.get(
             "cell_equipment_evidence", res.get("cell_equipment_evidence"))
-        if recheck.get("site_type") in ("tower", "rooftop"):
+        if recheck.get("site_type") in _positive_site_types():
             res["site_type"] = recheck["site_type"]
             res["site_confidence"] = recheck.get(
                 "site_confidence", res.get("site_confidence"))
@@ -916,9 +1044,9 @@ def classify_site(provider: str, clients: dict,
     if scan:
         claude_schema, gemini_schema = SCAN_SCHEMA, GEMINI_SCAN_SCHEMA
         tool_name = "scan_candidates"
-        classify_prompt = SCAN_PROMPT
+        classify_prompt = _active_scan_prompt()
     else:
-        claude_schema, gemini_schema = RESPONSE_SCHEMA, GEMINI_RESPONSE_SCHEMA
+        claude_schema, gemini_schema = _classification_response_schemas()
         tool_name = "classify_site"
         classify_prompt = prompt
     if provider == "gemini":
@@ -944,7 +1072,7 @@ def site_confidence_band(res: dict) -> str:
 
 def tier_confident_stop(res: dict) -> bool:
     """True when tiered fetch can stop without pulling the next Nearmap tier."""
-    if res.get("site_type") not in ("tower", "rooftop"):
+    if res.get("site_type") not in _positive_site_types():
         return False
     if site_confidence_band(res) == "low":
         return False
@@ -1119,7 +1247,7 @@ def run_zoom_stage(provider: str, clients: dict, asset_id: str,
 
     context = context_views[:1] if context_views else []
     res = classify_site(
-        provider, clients, context + zoom_views, prompt=ZOOM_CLASSIFICATION_PROMPT)
+        provider, clients, context + zoom_views, prompt=_active_zoom_prompt())
     res["classification_stage"] = "zoom"
     return res, len(zoom_views)
 
@@ -1613,7 +1741,7 @@ def classify_with_routing(provider: str, clients: dict, views: list,
 
     escalation_model = None
     escalation_reason_str = None
-    if BIFURCATED_AI and provider == "gemini":
+    if BIFURCATED_AI and not GEMINI_ONLY and provider == "gemini":
         reason = escalation_reason(res)
         if reason:
             escalation_reason_str = reason
@@ -1727,34 +1855,45 @@ def main():
             EXECUTIVE_SUMMARY_MD, INPUT_CSV)
         return
 
-    if not os.environ.get("ANTHROPIC_API_KEY"):
+    primary_provider, allow_claude_escalation = resolve_ai_mode()
+
+    if primary_provider == "gemini" and not os.environ.get("GEMINI_API_KEY"):
+        raise SystemExit(
+            "GEMINI_API_KEY is not set. Get a key at "
+            "https://aistudio.google.com/apikey"
+        )
+    if (primary_provider == "claude" or allow_claude_escalation) and not os.environ.get(
+        "ANTHROPIC_API_KEY"
+    ):
         raise SystemExit(
             "ANTHROPIC_API_KEY is not set. Get a key at https://console.anthropic.com/\n"
             '  PowerShell: $env:ANTHROPIC_API_KEY="sk-ant-..."\n'
             "  bash/zsh:   export ANTHROPIC_API_KEY=sk-ant-..."
         )
-    if BIFURCATED_AI and not os.environ.get("GEMINI_API_KEY"):
-        raise SystemExit(
-            "BIFURCATED_AI=1 requires GEMINI_API_KEY. Get a key at "
-            "https://aistudio.google.com/apikey"
-        )
 
-    clients = {
-        "claude": Anthropic(),
-        "gemini": genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
-        if BIFURCATED_AI else None,
-    }
-    primary_provider = "gemini" if BIFURCATED_AI else "claude"
+    clients: dict[str, object] = {}
+    if primary_provider == "gemini" or allow_claude_escalation:
+        clients["gemini"] = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+    if primary_provider == "claude" or allow_claude_escalation:
+        clients["claude"] = Anthropic()
 
     if NAIP_ONLY:
         print("[BREAKPOINT] NAIP_ONLY=1 — Nearmap fetch disabled. "
               "Running on NAIP imagery only.", flush=True)
+    if TOWER_ONLY:
+        print("TOWER_ONLY=1 — tower detection mode (rooftop hosts -> other).",
+              flush=True)
+    if GEMINI_ONLY:
+        print(f"GEMINI_ONLY=1 — Gemini only ({GEMINI_MODEL}), no Claude escalation.",
+              flush=True)
+    elif allow_claude_escalation:
+        print(f"BIFURCATED_AI=1 — Gemini first ({GEMINI_MODEL}), "
+              f"Claude escalation ({CLAUDE_ESCALATION_MODEL})", flush=True)
+    elif primary_provider == "claude":
+        print(f"Claude only ({MODELS[0]})", flush=True)
     if NEARMAP_TIERED and not NAIP_ONLY:
         print("NEARMAP_TIERED=1 — tiered Nearmap fetch enabled "
               "(NAIP -> Vert -> obliques)", flush=True)
-    if BIFURCATED_AI:
-        print(f"BIFURCATED_AI=1 — Gemini first ({GEMINI_MODEL}), "
-              f"Claude escalation ({CLAUDE_ESCALATION_MODEL})", flush=True)
 
     print(f"Input:  {INPUT_CSV}")
     print(f"Output: {OUTPUT_CSV} (detail/resume)")
@@ -1856,7 +1995,7 @@ def main():
                     classify_with_tiers(
                         lat, lon, img, primary_provider, clients, prompt,
                         input_confidence, build_views))
-                if BIFURCATED_AI:
+                if allow_claude_escalation:
                     reason = escalation_reason(res)
                     if reason:
                         escalation_reason_str = reason
@@ -1926,7 +2065,7 @@ def main():
                     prior_conf = res.get("site_confidence") or 0
                     zoom_conf = zoom_res.get("site_confidence") or 0
                     zoom_wins = (
-                        zoom_res.get("site_type") in ("tower", "rooftop")
+                        zoom_res.get("site_type") in _positive_site_types()
                         or zoom_conf > prior_conf
                         or (force_zoom and zoom_res.get("cell_equipment") is True)
                         or force_zoom

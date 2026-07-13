@@ -37,17 +37,20 @@ Boolean flags: set to `1`, `true`, or `yes` to enable. Default is `0` (off).
 |---|---|---|
 | `NEARMAP_TIERED` | `0` | Tiered Nearmap fetch: NAIP → Vert → obliques. Stops early when classification is confident. |
 | `BIFURCATED_AI` | `0` | Gemini first pass; escalate to Claude for `other`, `unclear`, or low confidence. |
+| `GEMINI_ONLY` | `0` | Gemini only — no Claude calls or escalation. Requires `GEMINI_API_KEY`. |
+| `TOWER_ONLY` | `0` | Tower detection mode: rooftop hosts classify as `other`; prompts/schemas focus on ground-based towers. |
 | `NAIP_ONLY` | `0` | Debug/breakpoint mode: skip all Nearmap fetching. Overrides `NEARMAP_TIERED`. |
 
 **Combinations**
 
-| `NAIP_ONLY` | `NEARMAP_TIERED` | `BIFURCATED_AI` | Behavior |
-|---|---|---|---|
-| `0` | `0` | `0` | Legacy: all 5 Nearmap views upfront, Claude only |
-| `0` | `1` | `0` | Tiered Nearmap, Claude only |
-| `0` | `0` | `1` | Full Nearmap upfront, Gemini → Claude escalation |
-| `0` | `1` | `1` | Tiered Nearmap on Gemini; Claude gets imagery already fetched if escalated |
-| `1` | * | * | NAIP imagery only; AI routing still applies if `BIFURCATED_AI=1` |
+| `NAIP_ONLY` | `NEARMAP_TIERED` | `BIFURCATED_AI` | `GEMINI_ONLY` | `TOWER_ONLY` | Behavior |
+|---|---|---|---|---|---|
+| `0` | `0` | `0` | `0` | `0` | Legacy: all 5 Nearmap views upfront, Claude only |
+| `0` | `1` | `0` | `0` | `0` | Tiered Nearmap, Claude only |
+| `0` | `0` | `1` | `0` | `0` | Full Nearmap upfront, Gemini → Claude escalation |
+| `0` | `1` | `1` | `0` | `0` | Tiered Nearmap on Gemini; Claude gets imagery already fetched if escalated |
+| `1` | * | * | `1` | * | NAIP imagery only, Gemini only (no Claude) |
+| `1` | * | * | * | `1` | NAIP + tower-only prompts (typical low-cost screening pilot) |
 
 ---
 
@@ -146,6 +149,8 @@ GEMINI_API_KEY=your-gemini-key
 # Pipeline modes (all default to 0 if omitted)
 # NEARMAP_TIERED=1
 # BIFURCATED_AI=1
+# GEMINI_ONLY=1
+# TOWER_ONLY=1
 # NAIP_ONLY=1
 
 # Tuning (optional)
@@ -161,8 +166,8 @@ GEMINI_API_KEY=your-gemini-key
 ## Example PowerShell one-liners
 
 ```powershell
-# Fast local debug — NAIP only, no Nearmap quota
-$env:NAIP_ONLY="1"; python asset_classifier.py -i dc_001-010_assets.csv
+# Fast local debug — NAIP only, Gemini tower screening, no Nearmap/Claude quota
+$env:NAIP_ONLY="1"; $env:GEMINI_ONLY="1"; $env:TOWER_ONLY="1"; python classifier/asset_classifier.py -i data/no_match_naip_150.csv
 
 # Production-style tiered + bifurcated (set keys in .env first)
 $env:NEARMAP_TIERED="1"; $env:BIFURCATED_AI="1"; python asset_classifier.py -i dc-assets.csv
