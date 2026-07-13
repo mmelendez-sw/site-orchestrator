@@ -60,8 +60,11 @@ Boolean flags: set to `1`, `true`, or `yes` to enable. Default is `0` (off).
 |---|---|---|
 | `CLAUDE_MODELS` | `claude-sonnet-4-6,claude-haiku-4-5-20251001` | Comma-separated Claude models. First is primary; hops to next on rate limits or 404. Used when `BIFURCATED_AI=0`, or for Claude escalation / wide-AOI / zoom when bifurcated. |
 | `CLAUDE_ESCALATION_MODEL` | `claude-sonnet-4-6` | Fixed Claude model for bifurcated escalation (does not use fallback chain). |
-| `GEMINI_MODEL` | `gemini-2.5-flash` | Gemini model for first pass when `BIFURCATED_AI=1`. No fallback chain on first pass. |
-| `CLAUDE_DELAY_S` | `12` | Seconds to pause between assets (rate-limit pacing). |
+| `GEMINI_MODEL` | `gemini-2.5-flash` | Gemini model for first pass when `BIFURCATED_AI=1` or `GEMINI_ONLY=1`. |
+| `GEMINI_DELAY_S` | `15` | Seconds between assets when Gemini is the primary provider. |
+| `GEMINI_RETRIES` | `6` | Retries per Gemini call on transient `429` / `503` errors. |
+| `GEMINI_RETRY_BASE_S` | `20` | Base backoff seconds for Gemini retries (doubles each attempt, cap 120s). |
+| `CLAUDE_DELAY_S` | `12` | Seconds to pause between assets when Claude is the primary provider. |
 
 ---
 

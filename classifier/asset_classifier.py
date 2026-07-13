@@ -35,6 +35,7 @@ import io
 import json
 import math
 import os
+import random
 import sys
 import time
 import argparse
@@ -100,6 +101,9 @@ MODELS = [
 ]
 _model_idx = 0
 API_DELAY_S = float(os.environ.get("CLAUDE_DELAY_S", "12"))
+GEMINI_DELAY_S = float(os.environ.get("GEMINI_DELAY_S", "15"))
+GEMINI_RETRIES = int(os.environ.get("GEMINI_RETRIES", "6"))
+GEMINI_RETRY_BASE_S = float(os.environ.get("GEMINI_RETRY_BASE_S", "20"))
 INPUT_CSV = "data/assets.csv"    # columns: id; lat+lon OR address; optional: label, input_confidence
 INPUT_CONFIDENCE_LEVELS = ("high", "medium", "low")
 OUTPUT_CSV = "results.csv"
@@ -977,9 +981,54 @@ def _gemini_image_part(img: Image.Image) -> genai_types.Part:
     return genai_types.Part.from_bytes(data=buf.getvalue(), mime_type="image/jpeg")
 
 
+def _gemini_http_status(exc: Exception) -> int | None:
+    """Extract an HTTP status from a Gemini SDK or transport error."""
+    for attr in ("code", "status_code"):
+        value = getattr(exc, attr, None)
+        if isinstance(value, int):
+            return value
+    response = getattr(exc, "response", None)
+    if response is not None:
+        value = getattr(response, "status_code", None)
+        if isinstance(value, int):
+            return value
+    message = str(exc)
+    if " 429 " in message or "429" in message[:8]:
+        return 429
+    if " 503 " in message:
+        return 503
+    return None
+
+
+def _gemini_retry_after_s(exc: Exception) -> float | None:
+    response = getattr(exc, "response", None)
+    if response is None:
+        return None
+    headers = getattr(response, "headers", None)
+    if not headers:
+        return None
+    raw = headers.get("retry-after") or headers.get("Retry-After")
+    if raw is None:
+        return None
+    try:
+        return max(1.0, float(raw))
+    except (TypeError, ValueError):
+        return None
+
+
+def _gemini_retry_wait_s(attempt: int, exc: Exception) -> float:
+    """Backoff for transient Gemini rate limits (429) and outages (503)."""
+    retry_after = _gemini_retry_after_s(exc)
+    if retry_after is not None:
+        return retry_after + random.uniform(0.0, 2.0)
+    wait = GEMINI_RETRY_BASE_S * (2 ** max(0, attempt - 1))
+    return min(wait, 120.0) + random.uniform(0.0, 3.0)
+
+
 def _call_gemini_json(client: genai.Client, contents: list, schema: dict,
-                      retries: int = 3) -> dict:
+                      retries: int | None = None) -> dict:
     """Gemini vision call with structured JSON output (single model)."""
+    max_retries = GEMINI_RETRIES if retries is None else retries
     attempt = 0
     while True:
         try:
@@ -995,12 +1044,14 @@ def _call_gemini_json(client: genai.Client, contents: list, schema: dict,
                 ),
             )
             break
-        except genai.errors.APIError as e:
-            if e.code in (429, 503) and attempt < retries:
+        except Exception as exc:
+            status = _gemini_http_status(exc)
+            if status in (429, 503) and attempt < max_retries:
                 attempt += 1
-                wait = 15 * attempt
-                print(f"  transient Gemini {e.code}, retrying in {wait}s "
-                      f"({attempt}/{retries})...")
+                wait = _gemini_retry_wait_s(attempt, exc)
+                label = "rate limit" if status == 429 else "service unavailable"
+                print(f"  transient Gemini {status} ({label}), retrying in "
+                      f"{wait:.0f}s ({attempt}/{max_retries})...")
                 time.sleep(wait)
                 continue
             raise
@@ -1954,7 +2005,7 @@ def main():
                 results.append(record)
                 _print_asset_result(record)
                 pd.DataFrame(results).to_csv(OUTPUT_CSV, index=False)
-                time.sleep(API_DELAY_S)
+                time.sleep(GEMINI_DELAY_S if primary_provider == "gemini" else API_DELAY_S)
                 continue
 
             def build_views(nm_views):
@@ -2134,7 +2185,8 @@ def main():
         results.append(record)
         # Rewrite after every row so a mid-run crash never loses completed work
         pd.DataFrame(results).to_csv(OUTPUT_CSV, index=False)
-        time.sleep(API_DELAY_S)
+        inter_asset_delay = GEMINI_DELAY_S if primary_provider == "gemini" else API_DELAY_S
+        time.sleep(inter_asset_delay)
 
     write_executive_summary(results, df)
     if report_csv and report_xlsx:
