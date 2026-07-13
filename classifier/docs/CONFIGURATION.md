@@ -67,6 +67,7 @@ Boolean flags: set to `1`, `true`, or `yes` to enable. Default is `0` (off).
 | `GEMINI_RETRIES` | `6` | Retries per Gemini call on transient `429` / `503` errors. |
 | `GEMINI_RETRY_BASE_S` | `20` | Base backoff seconds for Gemini retries (doubles each attempt, cap 120s). |
 | `NAIP_WIDE_CHIP_M` | `500` | Wide NAIP chip side length (meters) when `WIDE_AOI_STAGE=1`. |
+| `CHIP_SIZE_M` | `250` | Primary NAIP chip side length. Set `500` to start wide (skip a prior 250 m pass). |
 | `CLAUDE_DELAY_S` | `12` | Seconds to pause between assets when Claude is the primary provider. |
 
 ---

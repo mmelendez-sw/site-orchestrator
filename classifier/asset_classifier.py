@@ -95,8 +95,11 @@ OBLIQUE_VIEWS = ["North", "East", "South", "West"]
 
 STAC_URL = "https://planetarycomputer.microsoft.com/api/stac/v1"
 COLLECTION = "naip"
-CHIP_SIZE_M = 250          # side length of the extracted chip, in meters
+# Primary NAIP chip side length (meters). Set to 500 to skip a prior 250 m pass
+# and go straight to wide-frame classify (then ZOOM_STAGE if still other/unclear).
+CHIP_SIZE_M = float(os.environ.get("CHIP_SIZE_M", "250"))
 # Wide-AOI (zoom-out) retry size when primary NAIP pass finds no tower.
+# Only runs when NAIP_WIDE_CHIP_M > CHIP_SIZE_M.
 NAIP_WIDE_CHIP_M = float(os.environ.get("NAIP_WIDE_CHIP_M", "500"))
 # Primary model first; hops to the next on persistent rate limits or 404.
 # claude-sonnet-4-20250514 was retired 2026-06-15; use current IDs from:
@@ -1976,6 +1979,7 @@ def main():
     if NAIP_ONLY:
         print("[BREAKPOINT] NAIP_ONLY=1 — Nearmap fetch disabled. "
               "Running on NAIP imagery only.", flush=True)
+        print(f"  primary NAIP chip: {int(CHIP_SIZE_M)}m", flush=True)
     if TOWER_ONLY:
         print("TOWER_ONLY=1 — tower detection mode (rooftop hosts -> other).",
               flush=True)
