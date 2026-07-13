@@ -51,7 +51,7 @@ Boolean flags: set to `1`, `true`, or `yes` to enable. Default is `0` (off).
 | `0` | `0` | `1` | `0` | `0` | Full Nearmap upfront, Gemini → Claude escalation |
 | `0` | `1` | `1` | `0` | `0` | Tiered Nearmap on Gemini; Claude gets imagery already fetched if escalated |
 | `1` | * | * | `1` | * | NAIP imagery only, Gemini only (no Claude) |
-| `1` | * | * | * | `1` | NAIP + tower-only prompts (typical low-cost screening pilot) |
+| `1` | * | * | `1` | `1` | NAIP + tower-only + Gemini only (typical 150-site pilot) |
 
 ---
 
@@ -171,7 +171,7 @@ GEMINI_API_KEY=your-gemini-key
 
 ```powershell
 # Fast local debug — NAIP only, Gemini tower screening, no Nearmap/Claude quota
-$env:NAIP_ONLY="1"; $env:GEMINI_ONLY="1"; $env:TOWER_ONLY="1"; python classifier/asset_classifier.py -i data/no_match_naip_150.csv
+$env:NAIP_ONLY="1"; $env:GEMINI_ONLY="1"; $env:TOWER_ONLY="1"; $env:ZOOM_STAGE="0"; $env:GEMINI_MODEL="gemini-3.1-flash-lite"; $env:GEMINI_DELAY_S="30"; python classifier/asset_classifier.py -i data/no_match_naip_150.csv
 
 # Production-style tiered + bifurcated (set keys in .env first)
 $env:NEARMAP_TIERED="1"; $env:BIFURCATED_AI="1"; python asset_classifier.py -i dc-assets.csv
