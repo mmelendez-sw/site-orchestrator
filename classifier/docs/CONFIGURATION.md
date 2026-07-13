@@ -40,6 +40,7 @@ Boolean flags: set to `1`, `true`, or `yes` to enable. Default is `0` (off).
 | `GEMINI_ONLY` | `0` | Gemini only — no Claude calls or escalation. Requires `GEMINI_API_KEY`. |
 | `TOWER_ONLY` | `0` | Tower detection mode: rooftop hosts classify as `other`; prompts/schemas focus on ground-based towers. |
 | `ZOOM_STAGE` | `1` | Two-stage zoom scout + re-classify on `other`/`unclear`. Set `0` to skip (saves API calls). |
+| `WIDE_AOI_STAGE` | `1` | On `other`/`unclear`, refetch a wider NAIP chip (`NAIP_WIDE_CHIP_M`) and re-classify (zoom-out). One extra Gemini call. |
 | `NAIP_ONLY` | `0` | Debug/breakpoint mode: skip all Nearmap fetching. Overrides `NEARMAP_TIERED`. |
 
 **Combinations**
@@ -65,6 +66,7 @@ Boolean flags: set to `1`, `true`, or `yes` to enable. Default is `0` (off).
 | `GEMINI_DELAY_S` | `30` | Seconds between assets when Gemini is the primary provider. |
 | `GEMINI_RETRIES` | `6` | Retries per Gemini call on transient `429` / `503` errors. |
 | `GEMINI_RETRY_BASE_S` | `20` | Base backoff seconds for Gemini retries (doubles each attempt, cap 120s). |
+| `NAIP_WIDE_CHIP_M` | `500` | Wide NAIP chip side length (meters) when `WIDE_AOI_STAGE=1`. |
 | `CLAUDE_DELAY_S` | `12` | Seconds to pause between assets when Claude is the primary provider. |
 
 ---
@@ -131,7 +133,11 @@ These are not environment variables; change them in code if needed.
 
 | Column | When populated |
 |---|---|
-| `nearmap_tier` | Always (when run completes): `naip_only`, `vert_only`, `full`, `wide_aoi`, `zoom` |
+| `image_date` | Always when NAIP found: acquisition date from STAC (`datetime`) |
+| `naip_year` / `naip_state` / `naip_gsd_m` | NAIP STAC photo metadata |
+| `image_age_years` | Years since `image_date` (how stale the photo is) |
+| `naip_chip_m` | Chip side length used for the winning classification (250 or wide) |
+| `nearmap_tier` | Always (when run completes): `naip_only`, `naip_wide`, `vert_only`, `full`, `wide_aoi`, `zoom` |
 | `primary_model` | Always: `gemini` or `claude` |
 | `escalation_model` | When `BIFURCATED_AI=1` and escalation occurred |
 | `escalation_reason` | `low_confidence`, `unclear_type`, or `other_type` |

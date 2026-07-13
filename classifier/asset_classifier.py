@@ -40,6 +40,7 @@ import sys
 import time
 import argparse
 import shutil
+from datetime import date
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -80,6 +81,9 @@ GEMINI_ONLY = _env_flag("GEMINI_ONLY")
 TOWER_ONLY = _env_flag("TOWER_ONLY")
 NAIP_ONLY = _env_flag("NAIP_ONLY")
 ZOOM_STAGE = _env_flag("ZOOM_STAGE", default="1")
+# Widen NAIP AOI and re-classify when primary pass is other/unclear
+# (towers just outside the 250 m frame). One extra Gemini call — cheaper than zoom.
+WIDE_AOI_STAGE = _env_flag("WIDE_AOI_STAGE", default="1")
 TIER_CONF_HIGH = float(os.environ.get("TIER_CONF_HIGH", "0.75"))
 TIER_CONF_MEDIUM = float(os.environ.get("TIER_CONF_MEDIUM", "0.6"))
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
@@ -92,6 +96,8 @@ OBLIQUE_VIEWS = ["North", "East", "South", "West"]
 STAC_URL = "https://planetarycomputer.microsoft.com/api/stac/v1"
 COLLECTION = "naip"
 CHIP_SIZE_M = 250          # side length of the extracted chip, in meters
+# Wide-AOI (zoom-out) retry size when primary NAIP pass finds no tower.
+NAIP_WIDE_CHIP_M = float(os.environ.get("NAIP_WIDE_CHIP_M", "500"))
 # Primary model first; hops to the next on persistent rate limits or 404.
 # claude-sonnet-4-20250514 was retired 2026-06-15; use current IDs from:
 # https://docs.anthropic.com/en/docs/about-claude/models/overview
@@ -704,11 +710,31 @@ def get_catalog():
     return _catalog
 
 
+def _naip_image_meta(item) -> dict:
+    """Pull acquisition/refresh fields from NAIP STAC item properties."""
+    acquired = item.datetime.date() if item.datetime else None
+    props = item.properties or {}
+    age_years = None
+    if acquired is not None:
+        age_years = round((date.today() - acquired).days / 365.25, 1)
+    return {
+        "image_date": acquired.isoformat() if acquired else None,
+        "naip_year": props.get("naip:year"),
+        "naip_state": props.get("naip:state"),
+        "naip_gsd_m": props.get("gsd"),
+        "image_age_years": age_years,
+        "naip_chip_m": None,
+    }
+
+
 def fetch_chip(lat: float, lon: float, chip_m: float = CHIP_SIZE_M):
-    """Return (PIL.Image, acquisition_date, geo) for the newest NAIP scene at a
-    point, or (None, None, None) if no imagery covers the location. `geo` holds
-    the chip's CRS and projected bounds so a detection box drawn on the image
-    can be converted back to real-world coordinates."""
+    """Return (PIL.Image, meta, geo) for the newest NAIP scene at a point, or
+    (None, None, None) if no imagery covers the location.
+
+    `meta` includes acquisition date / NAIP year / GSD from STAC photo metadata.
+    `geo` holds the chip's CRS and projected bounds so a detection box drawn on
+    the image can be converted back to real-world coordinates.
+    """
     search = get_catalog().search(
         collections=[COLLECTION],
         intersects={"type": "Point", "coordinates": [lon, lat]},
@@ -730,10 +756,24 @@ def fetch_chip(lat: float, lon: float, chip_m: float = CHIP_SIZE_M):
         data = src.read([1, 2, 3], window=window, boundless=True, fill_value=0)
         geo = {"crs": str(src.crs),
                "x_min": x - half, "x_max": x + half,
-               "y_min": y - half, "y_max": y + half}
+               "y_min": y - half, "y_max": y + half,
+               "chip_m": chip_m}
 
     img = Image.fromarray(np.transpose(data, (1, 2, 0)).astype(np.uint8))
-    return img, item.datetime.date().isoformat(), geo
+    meta = _naip_image_meta(item)
+    meta["naip_chip_m"] = chip_m
+    return img, meta, geo
+
+
+def _naip_view_label(chip_m: float | None = None) -> str:
+    """Label used in the view list and for matching asset_view to geo."""
+    if chip_m is not None and chip_m > CHIP_SIZE_M:
+        return f"NAIP top-down (wide {int(chip_m)}m)"
+    return "NAIP top-down"
+
+
+def _is_naip_view(asset_view: str | None) -> bool:
+    return bool(asset_view) and str(asset_view).startswith("NAIP top-down")
 
 
 def box_to_latlon(geo: dict, box) -> tuple[float, float, float] | None:
@@ -1380,7 +1420,11 @@ def pick_review_image_path(asset_id: str, record: dict) -> Path | None:
         if path.exists():
             return path
 
-    for name in (f"{asset_id}_nearmap_vert.jpg", f"{asset_id}_NAIP.jpg"):
+    for name in (
+        f"{asset_id}_nearmap_vert.jpg",
+        f"{asset_id}_NAIP_wide.jpg",
+        f"{asset_id}_NAIP.jpg",
+    ):
         path = chip / name
         if path.exists():
             return path
@@ -1938,6 +1982,11 @@ def main():
     if not ZOOM_STAGE:
         print("ZOOM_STAGE=0 — two-stage zoom disabled (single-pass classification).",
               flush=True)
+    if WIDE_AOI_STAGE:
+        print(f"WIDE_AOI_STAGE=1 — widen NAIP to {int(NAIP_WIDE_CHIP_M)}m "
+              f"and re-classify on other/unclear.", flush=True)
+    else:
+        print("WIDE_AOI_STAGE=0 — no NAIP zoom-out retry.", flush=True)
     if GEMINI_ONLY:
         print(f"GEMINI_ONLY=1 — Gemini only ({GEMINI_MODEL}), no Claude escalation.",
               flush=True)
@@ -1994,7 +2043,9 @@ def main():
                 print(f"    geocoded ({geocode_meta.get('geocode_source')}): "
                       f"{lat:.6f}, {lon:.6f}", flush=True)
 
-            img, img_date, naip_geo = fetch_chip(lat, lon)
+            img, naip_meta, naip_geo = fetch_chip(lat, lon)
+            img_date = (naip_meta or {}).get("image_date")
+            naip_chip_m = (naip_meta or {}).get("naip_chip_m") or CHIP_SIZE_M
 
             nearmap_views, nearmap_date = {}, None
             if not NAIP_ONLY:
@@ -2006,18 +2057,22 @@ def main():
 
             if img is None and not nearmap_views:
                 record["site_type"] = "no_imagery"
+                if naip_meta:
+                    record.update({k: v for k, v in naip_meta.items() if k != "naip_chip_m"})
                 results.append(record)
                 _print_asset_result(record)
                 pd.DataFrame(results).to_csv(OUTPUT_CSV, index=False)
                 time.sleep(GEMINI_DELAY_S if primary_provider == "gemini" else API_DELAY_S)
                 continue
 
-            def build_views(nm_views):
+            def build_views(nm_views, naip_img=None, chip_m=None):
                 """Save Nearmap chips (overwriting any narrow-AOI versions)
                 and assemble the labeled view list for the model."""
                 v = []
-                if img is not None:
-                    v.append(("NAIP top-down", img))
+                source_img = img if naip_img is None else naip_img
+                side_m = naip_chip_m if chip_m is None else chip_m
+                if source_img is not None:
+                    v.append((_naip_view_label(side_m), source_img))
                 for name, vimg in nm_views.items():
                     vpath = CHIP_DIR / f"{row['id']}_nearmap_{name.lower()}.jpg"
                     vimg.save(vpath, quality=90)
@@ -2030,6 +2085,11 @@ def main():
             if img is not None:
                 chip_path = CHIP_DIR / f"{row['id']}_NAIP.jpg"
                 img.save(chip_path, quality=90)
+                if img_date:
+                    print(f"    NAIP acquired {img_date}"
+                          f" (age {naip_meta.get('image_age_years')}y,"
+                          f" gsd={naip_meta.get('naip_gsd_m')}m,"
+                          f" chip={int(naip_chip_m)}m)", flush=True)
 
             label_hint = str(row.get("label", "")).strip().lower()
             input_confidence = normalize_input_confidence(row.get("input_confidence"))
@@ -2101,6 +2161,51 @@ def main():
                     nearmap_tier = "wide_aoi"
                     stage_provider = _effective_provider(primary_model, escalation_model)
 
+            # NAIP zoom-out: tower may sit just outside the 250 m frame (coords off).
+            # One extra Gemini call — cheap catch for "tower exists but out of picture".
+            if (WIDE_AOI_STAGE and img is not None
+                    and res.get("site_type") in ("other", "unclear")
+                    and NAIP_WIDE_CHIP_M > CHIP_SIZE_M):
+                print(f"  [{row['id']}] no tower in {int(naip_chip_m)}m chip -> "
+                      f"widening NAIP to {int(NAIP_WIDE_CHIP_M)}m", flush=True)
+                try:
+                    wide_img, wide_meta, wide_geo = fetch_chip(
+                        lat, lon, chip_m=NAIP_WIDE_CHIP_M)
+                except Exception as e:
+                    wide_img, wide_meta, wide_geo = None, None, None
+                    print(f"  [{row['id']}] wide NAIP fetch failed: {e}", flush=True)
+                if wide_img is not None:
+                    wide_path = CHIP_DIR / f"{row['id']}_NAIP_wide.jpg"
+                    wide_img.save(wide_path, quality=90)
+                    views = build_views(
+                        nearmap_views, naip_img=wide_img, chip_m=NAIP_WIDE_CHIP_M)
+                    wide_res, _, esc_m, esc_r = classify_with_routing(
+                        stage_provider, clients, views, prompt, input_confidence)
+                    if esc_m:
+                        escalation_model = esc_m
+                        escalation_reason_str = esc_r or escalation_reason_str
+                    prior_conf = res.get("site_confidence") or 0
+                    wide_conf = wide_res.get("site_confidence") or 0
+                    wide_wins = (
+                        wide_res.get("site_type") in _positive_site_types()
+                        or wide_conf > prior_conf
+                    )
+                    if wide_wins:
+                        res = wide_res
+                        img = wide_img
+                        naip_geo = wide_geo
+                        naip_chip_m = NAIP_WIDE_CHIP_M
+                        if wide_meta:
+                            naip_meta = {**(naip_meta or {}), **wide_meta}
+                            img_date = wide_meta.get("image_date") or img_date
+                        chip_path = wide_path
+                        classification_stage = "wide_aoi"
+                        nearmap_tier = "naip_wide"
+                        stage_provider = _effective_provider(
+                            primary_model, escalation_model)
+                        print(f"    wide AOI => {res.get('site_type')} "
+                              f"({res.get('site_confidence')})", flush=True)
+
             # Two-stage zoom: scout suspicious regions, magnify, re-classify.
             force_zoom = label_hint == "stealth"
             if ZOOM_STAGE and (force_zoom or res.get("site_type") in ("other", "unclear")):
@@ -2132,13 +2237,18 @@ def main():
             # when the box was drawn on the georeferenced NAIP chip
             asset_lat = asset_lon = asset_offset_m = None
             box, box_view = res.get("asset_box_2d"), res.get("asset_view")
-            if box and box_view == "NAIP top-down" and naip_geo:
+            if box and _is_naip_view(box_view) and naip_geo:
                 located = box_to_latlon(naip_geo, box)
                 if located:
                     asset_lat, asset_lon, asset_offset_m = located
 
             record.update({
                 "image_date": img_date,
+                "naip_year": (naip_meta or {}).get("naip_year"),
+                "naip_state": (naip_meta or {}).get("naip_state"),
+                "naip_gsd_m": (naip_meta or {}).get("naip_gsd_m"),
+                "image_age_years": (naip_meta or {}).get("image_age_years"),
+                "naip_chip_m": naip_chip_m,
                 "nearmap_date": nearmap_date,
                 "nearmap_views": ",".join(nearmap_views) or None,
                 "nearmap_aoi_m": nearmap_aoi_m,
