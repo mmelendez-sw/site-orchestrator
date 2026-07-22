@@ -795,11 +795,28 @@ def main(
                         csv_row.get("Morphology") or "—",
                         csv_row.get("Carrier Leasing Source") or "—",
                     )
-                sf_client.create_site(upload_record, verbose=verbose)
-                summary["loaded"] += 1
-                logger.info("Loaded net-new site: %s", canonical["address"])
+                try:
+                    result = sf_client.create_site(upload_record, verbose=verbose)
+                    summary["loaded"] += 1
+                    sf_id = result.get("id") or "—"
+                    logger.info(
+                        "Loaded net-new site: %s (Id=%s)",
+                        canonical["address"],
+                        sf_id,
+                    )
+                except Exception as exc:
+                    summary["errors"] += 1
+                    logger.exception(
+                        "Upload failed for %s — continuing with remaining sites: %s",
+                        canonical["address"],
+                        exc,
+                    )
             if verbose and upload_total:
-                logger.info("Salesforce upload complete — loaded=%d", summary["loaded"])
+                logger.info(
+                    "Salesforce upload complete — loaded=%d errors=%d",
+                    summary["loaded"],
+                    summary["errors"],
+                )
                 logger.info("=" * 72)
         elif dry_run and summary["net_new"]:
             logger.info(
