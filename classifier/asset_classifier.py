@@ -1831,16 +1831,22 @@ def regenerate_reports_from_detail(run_root: Path, output_csv: str,
     print(f"  Summary: {summary_md}", flush=True)
 
 def classify_with_routing(provider: str, clients: dict, views: list,
-                          prompt: str, input_confidence: str
+                          prompt: str, input_confidence: str,
+                          *, escalate: bool = True
                           ) -> tuple[dict, str, str | None, str | None]:
-    """Run primary classification; optionally escalate Gemini -> Claude."""
+    """Run primary classification; optionally escalate Gemini -> Claude.
+
+    Pass escalate=False for intermediate imagery stages so Gemini is fully
+    exhausted (NAIP/Nearmap/zoom) before a single final Claude call.
+    """
     primary_model = provider
     res = classify_site(provider, clients, views, prompt=prompt)
     res = maybe_recheck_equipment(provider, clients, res, views, input_confidence)
 
     escalation_model = None
     escalation_reason_str = None
-    if BIFURCATED_AI and not GEMINI_ONLY and provider == "gemini":
+    if (escalate and BIFURCATED_AI and not GEMINI_ONLY
+            and provider == "gemini"):
         reason = escalation_reason(res)
         if reason:
             escalation_reason_str = reason
@@ -1852,6 +1858,26 @@ def classify_with_routing(provider: str, clients: dict, views: list,
             res = maybe_recheck_equipment(
                 "claude", clients, res, views, input_confidence)
     return res, primary_model, escalation_model, escalation_reason_str
+
+
+def maybe_escalate_to_claude(res: dict, clients: dict, views: list, prompt: str,
+                             input_confidence: str,
+                             *, allow: bool
+                             ) -> tuple[dict, str | None, str | None]:
+    """Single late Claude escalation after all Gemini imagery stages."""
+    if not allow:
+        return res, None, None
+    reason = escalation_reason(res)
+    if not reason:
+        return res, None, None
+    print(f"  escalating to Claude after Gemini stages "
+          f"({reason.replace('_', ' ')})")
+    escalated = classify_site(
+        "claude", clients, views, prompt=prompt,
+        claude_model=CLAUDE_ESCALATION_MODEL)
+    escalated = maybe_recheck_equipment(
+        "claude", clients, escalated, views, input_confidence)
+    return escalated, "claude", reason
 
 
 def _effective_provider(primary_model: str, escalation_model: str | None) -> str:
@@ -2108,34 +2134,28 @@ def main():
                 nearmap_tier = "naip_only"
                 res, primary_model, escalation_model, escalation_reason_str = (
                     classify_with_routing(
-                        primary_provider, clients, views, prompt, input_confidence))
+                        primary_provider, clients, views, prompt,
+                        input_confidence, escalate=False))
             elif NEARMAP_TIERED:
+                # Gemini exhausts NAIP -> Vert -> obliques before any Claude.
                 res, nearmap_views, nearmap_date, nearmap_tier, views = (
                     classify_with_tiers(
                         lat, lon, img, primary_provider, clients, prompt,
                         input_confidence, build_views))
-                if allow_claude_escalation:
-                    reason = escalation_reason(res)
-                    if reason:
-                        escalation_reason_str = reason
-                        escalation_model = "claude"
-                        print(f"  escalating to Claude ({reason.replace('_', ' ')})")
-                        res = classify_site(
-                            "claude", clients, views, prompt=prompt,
-                            claude_model=CLAUDE_ESCALATION_MODEL)
-                        res = maybe_recheck_equipment(
-                            "claude", clients, res, views, input_confidence)
+                primary_model = primary_provider
             else:
                 nearmap_tier = "full" if nearmap_views else "naip_only"
                 views = build_views(nearmap_views)
                 res, primary_model, escalation_model, escalation_reason_str = (
                     classify_with_routing(
-                        primary_provider, clients, views, prompt, input_confidence))
+                        primary_provider, clients, views, prompt,
+                        input_confidence, escalate=False))
 
             nearmap_aoi_m = NEARMAP_CHIP_M if nearmap_views else None
             classification_stage = "primary"
             zoom_count = 0
-            stage_provider = _effective_provider(primary_model, escalation_model)
+            # Keep Gemini through wide/zoom retries; Claude only at the end.
+            stage_provider = primary_provider
 
             # Wide-AOI fallback: rural sites often have vert-only Nearmap
             # coverage, and the asset may sit outside the narrow AOI entirely
@@ -2156,14 +2176,11 @@ def main():
                     nearmap_date = wide_date or nearmap_date
                     nearmap_aoi_m = NEARMAP_FALLBACK_CHIP_M
                     views = build_views(wide_views)
-                    res, _, esc_m, esc_r = classify_with_routing(
-                        stage_provider, clients, views, prompt, input_confidence)
-                    if esc_m:
-                        escalation_model = esc_m
-                        escalation_reason_str = esc_r or escalation_reason_str
+                    res, _, _, _ = classify_with_routing(
+                        stage_provider, clients, views, prompt,
+                        input_confidence, escalate=False)
                     classification_stage = "wide_aoi"
                     nearmap_tier = "wide_aoi"
-                    stage_provider = _effective_provider(primary_model, escalation_model)
 
             # NAIP zoom-out: tower may sit just outside the 250 m frame (coords off).
             # One extra Gemini call — cheap catch for "tower exists but out of picture".
@@ -2183,11 +2200,9 @@ def main():
                     wide_img.save(wide_path, quality=90)
                     views = build_views(
                         nearmap_views, naip_img=wide_img, chip_m=NAIP_WIDE_CHIP_M)
-                    wide_res, _, esc_m, esc_r = classify_with_routing(
-                        stage_provider, clients, views, prompt, input_confidence)
-                    if esc_m:
-                        escalation_model = esc_m
-                        escalation_reason_str = esc_r or escalation_reason_str
+                    wide_res, _, _, _ = classify_with_routing(
+                        stage_provider, clients, views, prompt,
+                        input_confidence, escalate=False)
                     prior_conf = res.get("site_confidence") or 0
                     wide_conf = wide_res.get("site_confidence") or 0
                     wide_wins = (
@@ -2205,8 +2220,6 @@ def main():
                         chip_path = wide_path
                         classification_stage = "wide_aoi"
                         nearmap_tier = "naip_wide"
-                        stage_provider = _effective_provider(
-                            primary_model, escalation_model)
                         print(f"    wide AOI => {res.get('site_type')} "
                               f"({res.get('site_confidence')})", flush=True)
 
@@ -2236,6 +2249,13 @@ def main():
                         res = zoom_res
                         classification_stage = "zoom"
                         nearmap_tier = "zoom"
+
+            # Claude only after Gemini has exhausted imagery stages.
+            if allow_claude_escalation:
+                res, escalation_model, escalation_reason_str = (
+                    maybe_escalate_to_claude(
+                        res, clients, views, prompt, input_confidence,
+                        allow=True))
 
             # Convert the detection box to real-world coordinates - only valid
             # when the box was drawn on the georeferenced NAIP chip
