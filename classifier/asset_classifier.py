@@ -1796,11 +1796,13 @@ def _print_run_banner(total: int, pending: int, skipped: int, input_csv: str,
 
 def _print_asset_start(idx: int, total: int, asset_id: str, row):
     """Mark the start of each asset in the terminal log."""
-    if QUIET:
-        return
     addr = _clean_address(row)
     coord = (f"{row['lat']}, {row['lon']}" if _has_coordinates(row)
              else (addr[:55] + "…" if addr and len(addr) > 55 else addr))
+    if QUIET:
+        label = addr[:64] if addr else (coord or asset_id)
+        _out(f"  [{idx}/{total}] {label}", important=True)
+        return
     print(f"\n>>> [{idx}/{total}] {asset_id} — {coord}", flush=True)
 
 
@@ -1937,31 +1939,61 @@ def _effective_provider(primary_model: str, escalation_model: str | None) -> str
     return escalation_model or primary_model
 
 
-def classify_record(
-    canonical: dict,
-    run_dir: Path | str | None = None,
-    *,
-    quiet: bool = True,
-) -> dict:
-    """Run the full classifier pipeline for one orchestrator canonical record.
-
-    When quiet=True (default for orchestrator), suppress banners/tqdm/API retry
-    chatter but still emit short per-step "— done" lines. Pass quiet=False to debug.
-    """
-    import sys
-
-    run_path = Path(run_dir) if run_dir else (RUNS_DIR / "orchestrator")
-    run_path.mkdir(parents=True, exist_ok=True)
-
-    site_id = canonical.get("id") or f"site_{abs(hash(canonical.get('address', ''))) % 10**8:08d}"
+def _canonical_to_classify_row(canonical: dict) -> dict:
+    """Build one classifier input row from an orchestrator canonical record."""
+    site_id = canonical.get("id") or (
+        f"site_{abs(hash(canonical.get('address', ''))) % 10**8:08d}"
+    )
     lon = canonical.get("lng") if canonical.get("lng") is not None else canonical.get("lon")
-    input_csv = run_path / f"{site_id}.csv"
-    pd.DataFrame([{
+    meta = canonical.get("permit_metadata") or {}
+    return {
         "id": site_id,
         "lat": canonical.get("lat"),
         "lon": lon,
         "address": canonical.get("address", ""),
-    }]).to_csv(input_csv, index=False)
+        "label": canonical.get("label") or meta.get("label") or "",
+        "input_confidence": (
+            canonical.get("input_confidence")
+            or meta.get("input_confidence")
+            or ""
+        ),
+    }
+
+
+def _detail_row_to_result(row: dict, canonical: dict | None = None) -> dict:
+    """Normalize a results_detail row for orchestrator (no pandas NaN surprises)."""
+    result = {}
+    for key, value in row.items():
+        if isinstance(value, float) and value != value:  # NaN
+            result[key] = None
+        elif isinstance(value, str) and value.strip().lower() == "nan":
+            result[key] = None
+        else:
+            result[key] = value
+    canonical = canonical or {}
+    result["permit_metadata"] = canonical.get("permit_metadata", {})
+    if canonical.get("source_url"):
+        result["source_url"] = canonical["source_url"]
+    return result
+
+
+def classify_records(
+    canonicals: list[dict],
+    run_dir: Path | str | None = None,
+    *,
+    quiet: bool = True,
+) -> list[dict]:
+    """Classify many orchestrator records in one classifier run (one shared input CSV)."""
+    if not canonicals:
+        return []
+
+    run_path = Path(run_dir) if run_dir else (RUNS_DIR / "orchestrator")
+    run_path.mkdir(parents=True, exist_ok=True)
+    (run_path / "chips").mkdir(exist_ok=True)
+
+    input_rows = [_canonical_to_classify_row(c) for c in canonicals]
+    input_csv = run_path / "classify_input.csv"
+    pd.DataFrame(input_rows).to_csv(input_csv, index=False)
 
     argv = [
         "asset_classifier",
@@ -1982,15 +2014,26 @@ def classify_record(
         raise RuntimeError(f"Classifier did not produce detail output in {run_path}")
 
     detail = pd.read_csv(detail_path)
-    if "id" in detail.columns:
-        matched = detail[detail["id"].astype(str) == str(site_id)]
-        result = (matched.iloc[-1] if not matched.empty else detail.iloc[-1]).to_dict()
-    else:
-        result = detail.iloc[-1].to_dict()
-    result["permit_metadata"] = canonical.get("permit_metadata", {})
-    if canonical.get("source_url"):
-        result["source_url"] = canonical["source_url"]
-    return result
+    results: list[dict] = []
+    for input_row, canonical in zip(input_rows, canonicals):
+        site_id = str(input_row["id"])
+        if "id" in detail.columns:
+            matched = detail[detail["id"].astype(str) == site_id]
+            raw = (matched.iloc[-1] if not matched.empty else detail.iloc[-1]).to_dict()
+        else:
+            raw = detail.iloc[-1].to_dict()
+        results.append(_detail_row_to_result(raw, canonical))
+    return results
+
+
+def classify_record(
+    canonical: dict,
+    run_dir: Path | str | None = None,
+    *,
+    quiet: bool = True,
+) -> dict:
+    """Classify one orchestrator canonical record (thin wrapper over classify_records)."""
+    return classify_records([canonical], run_dir=run_dir, quiet=quiet)[0]
 
 
 def main():

@@ -11,7 +11,7 @@ from typing import Any
 
 from dotenv import load_dotenv
 
-from classifier.asset_classifier import classify_record
+from classifier.asset_classifier import classify_records
 from dedupe.batch_postprocess import (
     apply_batch_postprocess,
     build_prescore_duplicate_row,
@@ -815,28 +815,45 @@ def main(
     classify_ok = 0
     if classify_total:
         logger.info("CLASSIFY — %d net-new sites", classify_total)
-    for classify_index, (index, canonical) in enumerate(classify_targets, start=1):
         try:
-            logger.info(
-                "[%d/%d] %s",
-                classify_index,
-                classify_total,
-                (canonical.get("address") or "")[:72],
-            )
-            classified = classify_record(
-                canonical,
+            classified_list = classify_records(
+                [canonical for _, canonical in classify_targets],
                 run_dir=run_dir,
                 quiet=not verbose,
             )
-            classified_by_index[index] = classified
-            logger.info("         done — %s", _format_classify_progress(classified))
-            classify_ok += 1
+            for classify_index, ((index, canonical), classified) in enumerate(
+                zip(classify_targets, classified_list),
+                start=1,
+            ):
+                classified_by_index[index] = classified
+                err = classified.get("error")
+                err_text = "" if err is None else str(err).strip()
+                if isinstance(err, float) and err != err:
+                    err_text = ""
+                if err_text and err_text.lower() != "nan":
+                    summary["errors"] += 1
+                    logger.error(
+                        "[%d/%d] failed — %s: %s",
+                        classify_index,
+                        classify_total,
+                        (canonical.get("address") or "")[:72],
+                        err_text,
+                    )
+                    continue
+                classify_ok += 1
+                logger.info(
+                    "[%d/%d] %s",
+                    classify_index,
+                    classify_total,
+                    (canonical.get("address") or "")[:72],
+                )
+                logger.info("         done — %s", _format_classify_progress(classified))
         except Exception as exc:
-            summary["errors"] += 1
+            summary["errors"] += classify_total
             if verbose:
-                logger.exception("Failed to classify record: %s", exc)
+                logger.exception("Classification batch failed: %s", exc)
             else:
-                logger.error("Failed to classify %s: %s", canonical.get("address"), exc)
+                logger.error("Classification batch failed: %s", exc)
 
     if classify_total:
         logger.info(
