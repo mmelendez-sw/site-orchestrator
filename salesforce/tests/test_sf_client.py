@@ -18,6 +18,5 @@ def test_create_site_maps_payload():
     assert client is not None
 
 
-def test_log_duplicate_maps_audit_fields():
-    # TODO: mock Salesforce create on duplicate log object
+def test_field_map_includes_permit_metadata():
     assert "permit_metadata" in FIELD_MAP

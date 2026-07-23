@@ -25,7 +25,6 @@ FIELD_MAP: dict[str, str] = {
 }
 
 OBJECT_NAME = "Site__c"
-DUPLICATE_LOG_OBJECT = "Site_Duplicate_Log__c"
 
 
 def _apply_env_overrides() -> None:

@@ -9,7 +9,7 @@ from typing import Any
 
 from simple_salesforce import Salesforce
 
-from salesforce.field_map import DUPLICATE_LOG_OBJECT, FIELD_MAP, OBJECT_NAME
+from salesforce.field_map import FIELD_MAP, OBJECT_NAME
 from salesforce.upload_template import validate_upload_record
 
 logger = logging.getLogger(__name__)
@@ -61,18 +61,6 @@ class SalesforceClient:
         for record in records:
             results.append(self.create_site(record))
         return results
-
-    def log_duplicate(self, record: dict[str, Any], matched_id: str) -> dict[str, Any]:
-        """Log a duplicate match for audit purposes."""
-        payload = {
-            "Matched_Site__c": matched_id,
-            "Incoming_Address__c": record.get("address"),
-            "Incoming_Latitude__c": record.get("lat"),
-            "Incoming_Longitude__c": record.get("lng"),
-            "Permit_Metadata__c": json.dumps(record.get("permit_metadata") or {}),
-        }
-        result = getattr(self.sf, DUPLICATE_LOG_OBJECT).create(payload)
-        return dict(result)
 
 
 def map_upload_record_to_payload(record: dict[str, Any]) -> dict[str, Any]:

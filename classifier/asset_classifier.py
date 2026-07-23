@@ -70,6 +70,17 @@ except ImportError:
 
 load_dotenv()  # picks up ANTHROPIC_API_KEY / GEMINI_API_KEY from .env if present
 
+# When True (orchestrator default), suppress banners/tqdm/API retry chatter but still
+# emit short imagery-stage lines for operator progress.
+QUIET = False
+
+
+def _out(msg: str = "", *, important: bool = False) -> None:
+    """Print unless QUIET; important=True always prints (stage/result progress)."""
+    if QUIET and not important:
+        return
+    print(msg, flush=True)
+
 
 def _env_flag(name: str, default: str = "0") -> bool:
     return os.environ.get(name, default).strip().lower() in ("1", "true", "yes")
@@ -615,7 +626,7 @@ def maybe_recheck_equipment(provider: str, clients: dict, res: dict, views: list
         return res
     if len(views) < 2:
         return res
-    print("  equipment recheck (trusted source, obliques/shadow pass)")
+    _out("  equipment recheck (trusted source, obliques/shadow pass)")
     recheck = classify_site(
         provider, clients, views, prompt=EQUIPMENT_RECHECK_PROMPT)
     if recheck.get("cell_equipment") is True:
@@ -978,12 +989,12 @@ def _call_claude_json(client: Anthropic, content: list, schema: dict,
             if attempt < retries:
                 attempt += 1
                 wait = 15 * attempt
-                print(f"  rate limit on {use_model}, retrying in {wait}s "
+                _out(f"  rate limit on {use_model}, retrying in {wait}s "
                       f"({attempt}/{retries})...")
                 time.sleep(wait)
                 continue
             if _model_idx + 1 < len(MODELS):
-                print(f"  {use_model} rate limited -> hopping to {MODELS[_model_idx + 1]}")
+                _out(f"  {use_model} rate limited -> hopping to {MODELS[_model_idx + 1]}")
                 _model_idx += 1
                 attempt = 0
                 continue
@@ -992,7 +1003,7 @@ def _call_claude_json(client: Anthropic, content: list, schema: dict,
             if model:
                 raise
             if e.status_code == 404 and _model_idx + 1 < len(MODELS):
-                print(f"  {use_model} not found (404) -> hopping to {MODELS[_model_idx + 1]}")
+                _out(f"  {use_model} not found (404) -> hopping to {MODELS[_model_idx + 1]}")
                 _model_idx += 1
                 attempt = 0
                 continue
@@ -1007,12 +1018,12 @@ def _call_claude_json(client: Anthropic, content: list, schema: dict,
             if e.status_code in (429, 529, 503, 500) and attempt < retries:
                 attempt += 1
                 wait = 15 * attempt
-                print(f"  transient {e.status_code}, retrying in {wait}s "
+                _out(f"  transient {e.status_code}, retrying in {wait}s "
                       f"({attempt}/{retries})...")
                 time.sleep(wait)
                 continue
             if e.status_code in (429, 529) and _model_idx + 1 < len(MODELS):
-                print(f"  {use_model} overloaded -> hopping to {MODELS[_model_idx + 1]}")
+                _out(f"  {use_model} overloaded -> hopping to {MODELS[_model_idx + 1]}")
                 _model_idx += 1
                 attempt = 0
                 continue
@@ -1094,7 +1105,7 @@ def _call_gemini_json(client: genai.Client, contents: list, schema: dict,
                 attempt += 1
                 wait = _gemini_retry_wait_s(attempt, exc)
                 label = "rate limit" if status == 429 else "service unavailable"
-                print(f"  transient Gemini {status} ({label}), retrying in "
+                _out(f"  transient Gemini {status} ({label}), retrying in "
                       f"{wait:.0f}s ({attempt}/{max_retries})...")
                 time.sleep(wait)
                 continue
@@ -1196,6 +1207,7 @@ def classify_with_tiers(lat: float, lon: float, img: Image.Image | None,
     nearmap_views: dict = {}
     nearmap_date = None
 
+    _out("         imagery: NAIP", important=True)
     views = build_views({})
     res = classify_site(provider, clients, views, prompt=prompt)
     res = maybe_recheck_equipment(provider, clients, res, views, input_confidence)
@@ -1205,6 +1217,7 @@ def classify_with_tiers(lat: float, lon: float, img: Image.Image | None,
     if not NEARMAP_API_KEY:
         return res, nearmap_views, nearmap_date, "naip_only", views
 
+    _out("         imagery: + Nearmap vert", important=True)
     vert_views, vert_date = fetch_nearmap_views(lat, lon, views=["Vert"])
     nearmap_views.update(vert_views)
     nearmap_date = vert_date or nearmap_date
@@ -1219,9 +1232,12 @@ def classify_with_tiers(lat: float, lon: float, img: Image.Image | None,
 
     missing = [v for v in OBLIQUE_VIEWS if v not in nearmap_views]
     if missing:
+        _out("         imagery: + Nearmap obliques", important=True)
         oblique_views, ob_date = fetch_nearmap_views(lat, lon, views=missing)
         nearmap_views.update(oblique_views)
         nearmap_date = ob_date or nearmap_date
+    else:
+        _out("         imagery: + Nearmap obliques", important=True)
 
     views = build_views(nearmap_views)
     res = classify_site(provider, clients, views, prompt=prompt)
@@ -1717,12 +1733,12 @@ def setup_run_directory(prefix: str, run_dir: str | None) -> Path:
         run_root = Path(run_dir)
         if not run_root.is_dir():
             raise SystemExit(f"Run directory not found: {run_root}")
-        print(f"Resuming run folder: {run_root}", flush=True)
+        _out(f"Resuming run folder: {run_root}")
     else:
         stamp = time.strftime("%Y-%m-%d_%H%M%S")
         run_root = RUNS_DIR / f"{stamp}_{prefix}"
         run_root.mkdir(parents=True, exist_ok=True)
-        print(f"Created run folder: {run_root}", flush=True)
+        _out(f"Created run folder: {run_root}")
     (run_root / "chips").mkdir(exist_ok=True)
     return run_root
 
@@ -1730,6 +1746,8 @@ def setup_run_directory(prefix: str, run_dir: str | None) -> Path:
 def _print_run_banner(total: int, pending: int, skipped: int, input_csv: str,
                       run_dir: Path, output_csv: str, report_csv: str | None):
     """Startup summary so the operator can monitor the run in the terminal."""
+    if QUIET:
+        return
     est_min = max(1, round(pending * 0.35))  # ~12s pacing + API work per site
     print("\n" + "=" * 60, flush=True)
     print("  SITE CLASSIFIER RUN", flush=True)
@@ -1748,6 +1766,8 @@ def _print_run_banner(total: int, pending: int, skipped: int, input_csv: str,
 
 def _print_asset_start(idx: int, total: int, asset_id: str, row):
     """Mark the start of each asset in the terminal log."""
+    if QUIET:
+        return
     addr = _clean_address(row)
     coord = (f"{row['lat']}, {row['lon']}" if _has_coordinates(row)
              else (addr[:55] + "…" if addr and len(addr) > 55 else addr))
@@ -1756,6 +1776,8 @@ def _print_asset_start(idx: int, total: int, asset_id: str, row):
 
 def _print_asset_result(record: dict):
     """One-line success/failure summary after each asset."""
+    if QUIET:
+        return
     err = _row_error(record)
     if err:
         print(f"    RESULT: ERROR — {err[:100]}", flush=True)
@@ -1776,6 +1798,8 @@ def _print_run_complete(results: list[dict], run_dir: Path, output_csv: str,
                         report_csv: str | None, report_xlsx: str | None,
                         summary_md: str):
     """Final terminal summary when the batch finishes."""
+    if QUIET:
+        return
     errors = sum(1 for r in results if _row_error(r))
     ok = len(results) - errors
     towers = sum(1 for r in results if r.get("site_type") == "tower")
@@ -1851,7 +1875,7 @@ def classify_with_routing(provider: str, clients: dict, views: list,
         if reason:
             escalation_reason_str = reason
             escalation_model = "claude"
-            print(f"  escalating to Claude ({reason.replace('_', ' ')})")
+            _out(f"  escalating to Claude ({reason.replace('_', ' ')})")
             res = classify_site(
                 "claude", clients, views, prompt=prompt,
                 claude_model=CLAUDE_ESCALATION_MODEL)
@@ -1870,7 +1894,7 @@ def maybe_escalate_to_claude(res: dict, clients: dict, views: list, prompt: str,
     reason = escalation_reason(res)
     if not reason:
         return res, None, None
-    print(f"  escalating to Claude after Gemini stages "
+    _out(f"  escalating to Claude after Gemini stages "
           f"({reason.replace('_', ' ')})")
     escalated = classify_site(
         "claude", clients, views, prompt=prompt,
@@ -1892,11 +1916,9 @@ def classify_record(
 ) -> dict:
     """Run the full classifier pipeline for one orchestrator canonical record.
 
-    When quiet=True (default for orchestrator), classifier stdout (Gemini retries,
-    banners, per-view chatter) is suppressed. Pass quiet=False to debug a site.
+    When quiet=True (default for orchestrator), suppress banners/tqdm/API retry
+    chatter but still emit short imagery-stage lines. Pass quiet=False to debug.
     """
-    import contextlib
-    import os
     import sys
 
     run_path = Path(run_dir) if run_dir else (RUNS_DIR / "orchestrator")
@@ -1917,15 +1939,12 @@ def classify_record(
         "--input", str(input_csv),
         "--run-dir", str(run_path),
     ]
+    if quiet:
+        argv.append("--quiet")
     prior_argv = sys.argv
     try:
         sys.argv = argv
-        if quiet:
-            with open(os.devnull, "w", encoding="utf-8") as devnull:
-                with contextlib.redirect_stdout(devnull):
-                    main()
-        else:
-            main()
+        main()
     finally:
         sys.argv = prior_argv
 
@@ -1946,7 +1965,7 @@ def classify_record(
 
 
 def main():
-    global INPUT_CSV, OUTPUT_CSV, EXECUTIVE_SUMMARY_MD, CHIP_DIR, RUN_DIR
+    global INPUT_CSV, OUTPUT_CSV, EXECUTIVE_SUMMARY_MD, CHIP_DIR, RUN_DIR, QUIET
 
     parser = argparse.ArgumentParser(description="Classify cell sites from aerial imagery")
     parser.add_argument("--input", "-i", default=INPUT_CSV,
@@ -1961,7 +1980,13 @@ def main():
                         help="Stakeholder Excel with photos inside the run folder")
     parser.add_argument("--regenerate-report", action="store_true",
                         help="Fix confidence values and rebuild reports from detail CSV")
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Suppress banners/tqdm/API chatter; keep short imagery stage lines",
+    )
     args = parser.parse_args()
+    QUIET = bool(args.quiet)
 
     if args.regenerate_report and not args.run_dir:
         raise SystemExit("--regenerate-report requires --run-dir pointing at an "
@@ -2024,36 +2049,33 @@ def main():
         clients["claude"] = Anthropic()
 
     if NAIP_ONLY:
-        print("[BREAKPOINT] NAIP_ONLY=1 — Nearmap fetch disabled. "
-              "Running on NAIP imagery only.", flush=True)
-        print(f"  primary NAIP chip: {int(CHIP_SIZE_M)}m", flush=True)
+        _out("[BREAKPOINT] NAIP_ONLY=1 — Nearmap fetch disabled. "
+              "Running on NAIP imagery only.")
+        _out(f"  primary NAIP chip: {int(CHIP_SIZE_M)}m")
     if TOWER_ONLY:
-        print("TOWER_ONLY=1 — tower detection mode (rooftop hosts -> other).",
-              flush=True)
+        _out("TOWER_ONLY=1 — tower detection mode (rooftop hosts -> other).")
     if not ZOOM_STAGE:
-        print("ZOOM_STAGE=0 — two-stage zoom disabled (single-pass classification).",
-              flush=True)
+        _out("ZOOM_STAGE=0 — two-stage zoom disabled (single-pass classification).")
     if WIDE_AOI_STAGE:
-        print(f"WIDE_AOI_STAGE=1 — widen NAIP to {int(NAIP_WIDE_CHIP_M)}m "
-              f"and re-classify on other/unclear.", flush=True)
+        _out(f"WIDE_AOI_STAGE=1 — widen NAIP to {int(NAIP_WIDE_CHIP_M)}m "
+              "and re-classify on other/unclear.")
     else:
-        print("WIDE_AOI_STAGE=0 — no NAIP zoom-out retry.", flush=True)
+        _out("WIDE_AOI_STAGE=0 — no NAIP zoom-out retry.")
     if GEMINI_ONLY:
-        print(f"GEMINI_ONLY=1 — Gemini only ({GEMINI_MODEL}), no Claude escalation.",
-              flush=True)
+        _out(f"GEMINI_ONLY=1 — Gemini only ({GEMINI_MODEL}), no Claude escalation.")
     elif allow_claude_escalation:
-        print(f"BIFURCATED_AI=1 — Gemini first ({GEMINI_MODEL}), "
-              f"Claude escalation ({CLAUDE_ESCALATION_MODEL})", flush=True)
+        _out(f"BIFURCATED_AI=1 — Gemini first ({GEMINI_MODEL}), "
+              f"Claude escalation ({CLAUDE_ESCALATION_MODEL})")
     elif primary_provider == "claude":
-        print(f"Claude only ({MODELS[0]})", flush=True)
+        _out(f"Claude only ({MODELS[0]})")
     if NEARMAP_TIERED and not NAIP_ONLY:
-        print("NEARMAP_TIERED=1 — tiered Nearmap fetch enabled "
-              "(NAIP -> Vert -> obliques)", flush=True)
+        _out("NEARMAP_TIERED=1 — tiered Nearmap fetch enabled "
+              "(NAIP -> Vert -> obliques)")
 
-    print(f"Input:  {INPUT_CSV}")
-    print(f"Output: {OUTPUT_CSV} (detail/resume)")
+    _out(f"Input:  {INPUT_CSV}")
+    _out(f"Output: {OUTPUT_CSV} (detail/resume)")
     if report_csv:
-        print(f"Report: {report_csv} + {report_xlsx}")
+        _out(f"Report: {report_csv} + {report_xlsx}")
 
     df = pd.read_csv(INPUT_CSV)
     validate_input_csv(df)
@@ -2072,14 +2094,20 @@ def main():
             results = kept.to_dict("records")
             done_ids = set(kept["id"])
             if done_ids:
-                print(f"Resuming: {len(done_ids)} assets already done, "
+                _out(f"Resuming: {len(done_ids)} assets already done, "
                       f"{len(df) - len(done_ids)} remaining")
 
     pending_rows = [row for _, row in df.iterrows() if row["id"] not in done_ids]
     _print_run_banner(len(df), len(pending_rows), len(done_ids),
                       INPUT_CSV, run_root, OUTPUT_CSV, report_csv)
 
-    progress = tqdm(pending_rows, desc="Progress", unit="site", dynamic_ncols=True)
+    progress = tqdm(
+        pending_rows,
+        desc="Progress",
+        unit="site",
+        dynamic_ncols=True,
+        disable=QUIET,
+    )
     for row in progress:
         progress.set_postfix_str(str(row["id"]), refresh=False)
         _print_asset_start(len(done_ids) + progress.n + 1, len(df), row["id"], row)
@@ -2091,8 +2119,8 @@ def main():
             record["lon"] = lon
             record.update(geocode_meta)
             if geocode_meta:
-                print(f"    geocoded ({geocode_meta.get('geocode_source')}): "
-                      f"{lat:.6f}, {lon:.6f}", flush=True)
+                _out(f"    geocoded ({geocode_meta.get('geocode_source')}): "
+                      f"{lat:.6f}, {lon:.6f}")
 
             img, naip_meta, naip_geo = fetch_chip(lat, lon)
             img_date = (naip_meta or {}).get("image_date")
@@ -2104,7 +2132,7 @@ def main():
                     if not NEARMAP_TIERED:
                         nearmap_views, nearmap_date = fetch_nearmap_views(lat, lon)
                 except Exception as e:
-                    print(f"  [{row['id']}] nearmap fetch failed: {e}")
+                    _out(f"  [{row['id']}] nearmap fetch failed: {e}", important=True)
 
             if img is None and not nearmap_views:
                 record["site_type"] = "no_imagery"
@@ -2137,10 +2165,10 @@ def main():
                 chip_path = CHIP_DIR / f"{row['id']}_NAIP.jpg"
                 img.save(chip_path, quality=90)
                 if img_date:
-                    print(f"    NAIP acquired {img_date}"
+                    _out(f"    NAIP acquired {img_date}"
                           f" (age {naip_meta.get('image_age_years')}y,"
                           f" gsd={naip_meta.get('naip_gsd_m')}m,"
-                          f" chip={int(naip_chip_m)}m)", flush=True)
+                          f" chip={int(naip_chip_m)}m)")
 
             label_hint = str(row.get("label", "")).strip().lower()
             input_confidence = normalize_input_confidence(row.get("input_confidence"))
@@ -2151,6 +2179,7 @@ def main():
             escalation_reason_str = None
 
             if NAIP_ONLY:
+                _out("         imagery: NAIP", important=True)
                 views = build_views({})
                 nearmap_tier = "naip_only"
                 res, primary_model, escalation_model, escalation_reason_str = (
@@ -2184,14 +2213,16 @@ def main():
             if (not NAIP_ONLY and NEARMAP_API_KEY
                     and res.get("site_type") in ("other", "unclear")
                     and not has_obliques):
-                print(f"  [{row['id']}] unidentified with narrow AOI -> "
-                      f"retrying Nearmap at {NEARMAP_FALLBACK_CHIP_M}m")
+                _out(
+                    f"         imagery: + Nearmap wide AOI ({NEARMAP_FALLBACK_CHIP_M}m)",
+                    important=True,
+                )
                 try:
                     wide_views, wide_date = fetch_nearmap_views(
                         lat, lon, NEARMAP_FALLBACK_CHIP_M)
                 except Exception as e:
                     wide_views, wide_date = {}, None
-                    print(f"  [{row['id']}] wide nearmap fetch failed: {e}")
+                    _out(f"  [{row['id']}] wide nearmap fetch failed: {e}", important=True)
                 if wide_views:
                     nearmap_views = wide_views
                     nearmap_date = wide_date or nearmap_date
@@ -2208,14 +2239,16 @@ def main():
             if (WIDE_AOI_STAGE and img is not None
                     and res.get("site_type") in ("other", "unclear")
                     and NAIP_WIDE_CHIP_M > CHIP_SIZE_M):
-                print(f"  [{row['id']}] no tower in {int(naip_chip_m)}m chip -> "
-                      f"widening NAIP to {int(NAIP_WIDE_CHIP_M)}m", flush=True)
+                _out(
+                    f"         imagery: + NAIP wide ({int(NAIP_WIDE_CHIP_M)}m)",
+                    important=True,
+                )
                 try:
                     wide_img, wide_meta, wide_geo = fetch_chip(
                         lat, lon, chip_m=NAIP_WIDE_CHIP_M)
                 except Exception as e:
                     wide_img, wide_meta, wide_geo = None, None, None
-                    print(f"  [{row['id']}] wide NAIP fetch failed: {e}", flush=True)
+                    _out(f"  [{row['id']}] wide NAIP fetch failed: {e}", important=True)
                 if wide_img is not None:
                     wide_path = CHIP_DIR / f"{row['id']}_NAIP_wide.jpg"
                     wide_img.save(wide_path, quality=90)
@@ -2253,7 +2286,7 @@ def main():
                 elif img is not None:
                     source_label, source_img = "NAIP top-down", img
                 if source_img is not None:
-                    print(f"  [{row['id']}] running two-stage zoom on {source_label}")
+                    _out("         imagery: + zoom crops", important=True)
                     zoom_res, zoom_count = run_zoom_stage(
                         stage_provider, clients, row["id"], views,
                         source_label, source_img,

@@ -263,6 +263,47 @@ def _normalize_batch(
     return canonical_records, failures
 
 
+def _format_classify_progress(classified: dict[str, Any]) -> str:
+    """One-line classify outcome for quiet orchestrator progress."""
+    tier_labels = {
+        "naip_only": "NAIP",
+        "naip_wide": "NAIP wide",
+        "vert_only": "Nearmap vert",
+        "full": "Nearmap obliques",
+        "zoom": "zoom",
+        "wide_aoi": "Nearmap wide AOI",
+    }
+    raw_tier = str(classified.get("nearmap_tier") or "").strip().lower()
+    tier = tier_labels.get(raw_tier, raw_tier or "—")
+
+    site = str(classified.get("site_type") or "—").strip() or "—"
+    subtype = classified.get("tower_subtype")
+    if site == "tower" and subtype not in (None, "", "nan"):
+        site = f"{site}/{subtype}"
+
+    conf = classified.get("site_confidence")
+    try:
+        conf_s = f"{float(conf):.2f}"
+    except (TypeError, ValueError):
+        conf_s = "—"
+
+    cell = classified.get("cell_equipment")
+    if cell is True or str(cell).strip().lower() in {"true", "1", "yes"}:
+        cell_s = "yes"
+    elif cell is False or str(cell).strip().lower() in {"false", "0", "no"}:
+        cell_s = "no"
+    else:
+        cell_s = "?"
+
+    views = classified.get("view_count")
+    try:
+        views_s = str(int(float(views)))
+    except (TypeError, ValueError):
+        views_s = "—"
+
+    return f"type={site}  cell={cell_s}  conf={conf_s}  views={views_s}  final={tier}"
+
+
 def _source_address(raw: dict[str, Any] | IngestRecord | SourceRecord) -> str:
     if isinstance(raw, SourceRecord):
         return raw.full_address
@@ -516,8 +557,6 @@ def _process_dedupe_record(
     }
 
     if status == "duplicate":
-        if sf_client and not dry_run:
-            sf_client.log_duplicate(canonical, matched.get("Id", ""))
         summary_delta["duplicates"] = 1
         if verbose:
             logger.info(
@@ -709,12 +748,24 @@ def main(
     for _, exc in failures:
         logger.error("Failed to normalize record: %s", exc)
 
+    logger.info(
+        "GEOCODE — ok=%d  failed=%d  input=%d",
+        len(canonical_records),
+        len(failures),
+        len(raw_records),
+    )
+
     if canonical_records:
         candidates = resolver.prefetch(canonical_records)
+        logger.info(
+            "DEDUPE — Salesforce candidates prefetched=%d",
+            len(candidates),
+        )
         if verbose:
             logger.info("Prefetched %s Salesforce candidates for dedupe", len(candidates))
 
     dedupe_total = len(canonical_records)
+    dedupe_errors = 0
     classified_by_index: dict[int, dict[str, Any]] = {}
     for index, canonical in enumerate(canonical_records, start=1):
         try:
@@ -733,6 +784,7 @@ def main(
                 summary[key] += value
         except Exception as exc:
             summary["errors"] += 1
+            dedupe_errors += 1
             if verbose:
                 logger.exception("Failed to dedupe record: %s", exc)
             else:
@@ -745,36 +797,53 @@ def main(
         summary["review"] = status_counts["review"]
         summary["net_new"] = status_counts["net_new"]
 
+    logger.info(
+        "DEDUPE — duplicates=%d  review=%d  net_new=%d  errors=%d  "
+        "(duplicates stay in Salesforce / skipped; net_new continue)",
+        summary["duplicates"],
+        summary["review"],
+        summary["net_new"],
+        dedupe_errors,
+    )
+
     classify_targets = [
         (index, canonical_records[index])
         for index, row in enumerate(result_rows)
         if row.get("status") == "net_new" and index < len(canonical_records)
     ]
     classify_total = len(classify_targets)
-    if classify_total and not verbose:
-        logger.info("Classifying %d net-new sites", classify_total)
+    classify_ok = 0
+    if classify_total:
+        logger.info("CLASSIFY — %d net-new sites", classify_total)
     for classify_index, (index, canonical) in enumerate(classify_targets, start=1):
         try:
-            if not verbose:
-                logger.info(
-                    "[%d/%d] %s",
-                    classify_index,
-                    classify_total,
-                    (canonical.get("address") or "")[:72],
-                )
-            classified_by_index[index] = classify_record(
+            logger.info(
+                "[%d/%d] %s",
+                classify_index,
+                classify_total,
+                (canonical.get("address") or "")[:72],
+            )
+            classified = classify_record(
                 canonical,
                 run_dir=run_dir,
                 quiet=not verbose,
             )
-            if verbose:
-                logger.info("Classified net-new site: %s", canonical["address"])
+            classified_by_index[index] = classified
+            logger.info("         %s", _format_classify_progress(classified))
+            classify_ok += 1
         except Exception as exc:
             summary["errors"] += 1
             if verbose:
                 logger.exception("Failed to classify record: %s", exc)
             else:
                 logger.error("Failed to classify %s: %s", canonical.get("address"), exc)
+
+    if classify_total:
+        logger.info(
+            "CLASSIFY — done  ok=%d  failed=%d",
+            classify_ok,
+            classify_total - classify_ok,
+        )
 
     if result_rows:
         output = _write_dedupe_results(run_dir, result_rows)
@@ -795,8 +864,11 @@ def main(
                 if row.get("status") == "net_new" and classified_by_index.get(index) is not None
             ]
             upload_total = len(upload_targets)
-            if upload_total and not verbose:
-                logger.info("Uploading %d sites to Salesforce", upload_total)
+            if upload_total:
+                logger.info(
+                    "SALESFORCE UPLOAD — starting %d sites (results at end of run)",
+                    upload_total,
+                )
             if verbose and upload_total:
                 logger.info("=" * 72)
                 logger.info("SALESFORCE UPLOAD (%d net-new sites)", upload_total)
@@ -862,6 +934,12 @@ def main(
                             canonical.get("address"),
                             exc,
                         )
+            if upload_total:
+                logger.info(
+                    "SALESFORCE UPLOAD — complete  loaded=%d  failed=%d",
+                    len([o for o in upload_outcomes if o.get("status") == "loaded"]),
+                    len([o for o in upload_outcomes if o.get("status") == "failed"]),
+                )
         elif dry_run and summary["net_new"]:
             for index, row in enumerate(result_rows):
                 if row.get("status") != "net_new":
@@ -877,6 +955,10 @@ def main(
                         "status": "skipped",
                     }
                 )
+            logger.info(
+                "SALESFORCE UPLOAD — dry-run  %d net_new in sf_upload.csv (no writes)",
+                summary["net_new"],
+            )
 
     rollup = build_run_summary(
         processed=summary["processed"],
