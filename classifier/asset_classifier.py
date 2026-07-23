@@ -71,7 +71,7 @@ except ImportError:
 load_dotenv()  # picks up ANTHROPIC_API_KEY / GEMINI_API_KEY from .env if present
 
 # When True (orchestrator default), suppress banners/tqdm/API retry chatter but still
-# emit short imagery-stage lines for operator progress.
+# emit short per-step "— done" progress lines (NAIP, Nearmap, classify, zoom, etc.).
 QUIET = False
 
 
@@ -626,7 +626,6 @@ def maybe_recheck_equipment(provider: str, clients: dict, res: dict, views: list
         return res
     if len(views) < 2:
         return res
-    _out("  equipment recheck (trusted source, obliques/shadow pass)")
     recheck = classify_site(
         provider, clients, views, prompt=EQUIPMENT_RECHECK_PROMPT)
     if recheck.get("cell_equipment") is True:
@@ -642,6 +641,9 @@ def maybe_recheck_equipment(provider: str, clients: dict, res: dict, views: list
             res["site_evidence"] = recheck.get(
                 "site_evidence", res.get("site_evidence"))
         normalize_model_result(res)
+        _step_done("equipment recheck", _brief_pass_result(res))
+    else:
+        _step_done("equipment recheck", "still no cell gear")
     return res
 
 # ----------------------------- geocoding ------------------------------------
@@ -1198,6 +1200,28 @@ def escalation_reason(res: dict) -> str | None:
     return None
 
 
+def _brief_pass_result(res: dict) -> str:
+    """Compact site_type/confidence for step-done lines."""
+    site = str(res.get("site_type") or "—").strip() or "—"
+    subtype = res.get("tower_subtype")
+    if site == "tower" and subtype not in (None, "", "nan"):
+        site = f"{site}/{subtype}"
+    conf = res.get("site_confidence")
+    try:
+        conf_s = f"{float(conf):.2f}"
+    except (TypeError, ValueError):
+        conf_s = "—"
+    return f"{site} conf={conf_s}"
+
+
+def _step_done(step: str, detail: str | None = None) -> None:
+    """Operator progress: mark a per-site pipeline step complete."""
+    if detail:
+        _out(f"         {step} — done ({detail})", important=True)
+    else:
+        _out(f"         {step} — done", important=True)
+
+
 def classify_with_tiers(lat: float, lon: float, img: Image.Image | None,
                         provider: str, clients: dict, prompt: str,
                         input_confidence: str,
@@ -1207,41 +1231,47 @@ def classify_with_tiers(lat: float, lon: float, img: Image.Image | None,
     nearmap_views: dict = {}
     nearmap_date = None
 
-    _out("         imagery: NAIP", important=True)
     views = build_views({})
+    _step_done("NAIP")
     res = classify_site(provider, clients, views, prompt=prompt)
     res = maybe_recheck_equipment(provider, clients, res, views, input_confidence)
+    _step_done("classify (NAIP)", _brief_pass_result(res))
     if tier_confident_stop(res):
         return res, nearmap_views, nearmap_date, "naip_only", views
 
     if not NEARMAP_API_KEY:
         return res, nearmap_views, nearmap_date, "naip_only", views
 
-    _out("         imagery: + Nearmap vert", important=True)
     vert_views, vert_date = fetch_nearmap_views(lat, lon, views=["Vert"])
     nearmap_views.update(vert_views)
     nearmap_date = vert_date or nearmap_date
     if not nearmap_views:
+        _step_done("Nearmap vert", "no coverage")
         return res, nearmap_views, nearmap_date, "naip_only", views
 
+    _step_done("Nearmap vert")
     views = build_views(nearmap_views)
     res = classify_site(provider, clients, views, prompt=prompt)
     res = maybe_recheck_equipment(provider, clients, res, views, input_confidence)
+    _step_done("classify (Nearmap vert)", _brief_pass_result(res))
     if tier_confident_stop(res):
         return res, nearmap_views, nearmap_date, "vert_only", views
 
     missing = [v for v in OBLIQUE_VIEWS if v not in nearmap_views]
     if missing:
-        _out("         imagery: + Nearmap obliques", important=True)
         oblique_views, ob_date = fetch_nearmap_views(lat, lon, views=missing)
         nearmap_views.update(oblique_views)
         nearmap_date = ob_date or nearmap_date
+    has_obliques = any(v in nearmap_views for v in OBLIQUE_VIEWS)
+    if has_obliques:
+        _step_done("Nearmap obliques")
     else:
-        _out("         imagery: + Nearmap obliques", important=True)
+        _step_done("Nearmap obliques", "no coverage")
 
     views = build_views(nearmap_views)
     res = classify_site(provider, clients, views, prompt=prompt)
     res = maybe_recheck_equipment(provider, clients, res, views, input_confidence)
+    _step_done("classify (Nearmap obliques)", _brief_pass_result(res))
     return res, nearmap_views, nearmap_date, "full", views
 
 
@@ -1345,9 +1375,9 @@ def run_zoom_stage(provider: str, clients: dict, asset_id: str,
     scouted = scout_candidates(provider, clients, source_label, source_img)
     candidates = _anchor_candidates() + scouted
     if not scouted:
-        print(f"  [{asset_id}] scout found no extra candidates")
+        _out(f"  [{asset_id}] scout found no extra candidates")
     if not candidates:
-        print(f"  [{asset_id}] no candidates -> {ZOOM_GRID}x{ZOOM_GRID} grid")
+        _out(f"  [{asset_id}] no candidates -> {ZOOM_GRID}x{ZOOM_GRID} grid")
         candidates = [{"box_2d": b, "reason": "grid sweep"} for b in _grid_boxes()]
 
     zoom_views = build_zoom_views(asset_id, source_label, source_img,
@@ -1875,12 +1905,12 @@ def classify_with_routing(provider: str, clients: dict, views: list,
         if reason:
             escalation_reason_str = reason
             escalation_model = "claude"
-            _out(f"  escalating to Claude ({reason.replace('_', ' ')})")
             res = classify_site(
                 "claude", clients, views, prompt=prompt,
                 claude_model=CLAUDE_ESCALATION_MODEL)
             res = maybe_recheck_equipment(
                 "claude", clients, res, views, input_confidence)
+            _step_done("escalate (Claude)", _brief_pass_result(res))
     return res, primary_model, escalation_model, escalation_reason_str
 
 
@@ -1894,13 +1924,12 @@ def maybe_escalate_to_claude(res: dict, clients: dict, views: list, prompt: str,
     reason = escalation_reason(res)
     if not reason:
         return res, None, None
-    _out(f"  escalating to Claude after Gemini stages "
-          f"({reason.replace('_', ' ')})")
     escalated = classify_site(
         "claude", clients, views, prompt=prompt,
         claude_model=CLAUDE_ESCALATION_MODEL)
     escalated = maybe_recheck_equipment(
         "claude", clients, escalated, views, input_confidence)
+    _step_done("escalate (Claude)", _brief_pass_result(escalated))
     return escalated, "claude", reason
 
 
@@ -1917,7 +1946,7 @@ def classify_record(
     """Run the full classifier pipeline for one orchestrator canonical record.
 
     When quiet=True (default for orchestrator), suppress banners/tqdm/API retry
-    chatter but still emit short imagery-stage lines. Pass quiet=False to debug.
+    chatter but still emit short per-step "— done" lines. Pass quiet=False to debug.
     """
     import sys
 
@@ -1983,7 +2012,7 @@ def main():
     parser.add_argument(
         "--quiet",
         action="store_true",
-        help="Suppress banners/tqdm/API chatter; keep short imagery stage lines",
+        help="Suppress banners/tqdm/API chatter; keep per-step '— done' lines",
     )
     args = parser.parse_args()
     QUIET = bool(args.quiet)
@@ -2179,13 +2208,14 @@ def main():
             escalation_reason_str = None
 
             if NAIP_ONLY:
-                _out("         imagery: NAIP", important=True)
                 views = build_views({})
+                _step_done("NAIP")
                 nearmap_tier = "naip_only"
                 res, primary_model, escalation_model, escalation_reason_str = (
                     classify_with_routing(
                         primary_provider, clients, views, prompt,
                         input_confidence, escalate=False))
+                _step_done("classify (NAIP)", _brief_pass_result(res))
             elif NEARMAP_TIERED:
                 # Gemini exhausts NAIP -> Vert -> obliques before any Claude.
                 res, nearmap_views, nearmap_date, nearmap_tier, views = (
@@ -2196,10 +2226,12 @@ def main():
             else:
                 nearmap_tier = "full" if nearmap_views else "naip_only"
                 views = build_views(nearmap_views)
+                _step_done("imagery ready")
                 res, primary_model, escalation_model, escalation_reason_str = (
                     classify_with_routing(
                         primary_provider, clients, views, prompt,
                         input_confidence, escalate=False))
+                _step_done("classify", _brief_pass_result(res))
 
             nearmap_aoi_m = NEARMAP_CHIP_M if nearmap_views else None
             classification_stage = "primary"
@@ -2213,10 +2245,6 @@ def main():
             if (not NAIP_ONLY and NEARMAP_API_KEY
                     and res.get("site_type") in ("other", "unclear")
                     and not has_obliques):
-                _out(
-                    f"         imagery: + Nearmap wide AOI ({NEARMAP_FALLBACK_CHIP_M}m)",
-                    important=True,
-                )
                 try:
                     wide_views, wide_date = fetch_nearmap_views(
                         lat, lon, NEARMAP_FALLBACK_CHIP_M)
@@ -2224,6 +2252,7 @@ def main():
                     wide_views, wide_date = {}, None
                     _out(f"  [{row['id']}] wide nearmap fetch failed: {e}", important=True)
                 if wide_views:
+                    _step_done(f"Nearmap wide AOI ({NEARMAP_FALLBACK_CHIP_M}m)")
                     nearmap_views = wide_views
                     nearmap_date = wide_date or nearmap_date
                     nearmap_aoi_m = NEARMAP_FALLBACK_CHIP_M
@@ -2231,6 +2260,7 @@ def main():
                     res, _, _, _ = classify_with_routing(
                         stage_provider, clients, views, prompt,
                         input_confidence, escalate=False)
+                    _step_done("classify (wide AOI)", _brief_pass_result(res))
                     classification_stage = "wide_aoi"
                     nearmap_tier = "wide_aoi"
 
@@ -2239,10 +2269,6 @@ def main():
             if (WIDE_AOI_STAGE and img is not None
                     and res.get("site_type") in ("other", "unclear")
                     and NAIP_WIDE_CHIP_M > CHIP_SIZE_M):
-                _out(
-                    f"         imagery: + NAIP wide ({int(NAIP_WIDE_CHIP_M)}m)",
-                    important=True,
-                )
                 try:
                     wide_img, wide_meta, wide_geo = fetch_chip(
                         lat, lon, chip_m=NAIP_WIDE_CHIP_M)
@@ -2250,6 +2276,7 @@ def main():
                     wide_img, wide_meta, wide_geo = None, None, None
                     _out(f"  [{row['id']}] wide NAIP fetch failed: {e}", important=True)
                 if wide_img is not None:
+                    _step_done(f"NAIP wide ({int(NAIP_WIDE_CHIP_M)}m)")
                     wide_path = CHIP_DIR / f"{row['id']}_NAIP_wide.jpg"
                     wide_img.save(wide_path, quality=90)
                     views = build_views(
@@ -2257,6 +2284,7 @@ def main():
                     wide_res, _, _, _ = classify_with_routing(
                         stage_provider, clients, views, prompt,
                         input_confidence, escalate=False)
+                    _step_done("classify (NAIP wide)", _brief_pass_result(wide_res))
                     prior_conf = res.get("site_confidence") or 0
                     wide_conf = wide_res.get("site_confidence") or 0
                     wide_wins = (
@@ -2274,8 +2302,6 @@ def main():
                         chip_path = wide_path
                         classification_stage = "wide_aoi"
                         nearmap_tier = "naip_wide"
-                        print(f"    wide AOI => {res.get('site_type')} "
-                              f"({res.get('site_confidence')})", flush=True)
 
             # Two-stage zoom: scout suspicious regions, magnify, re-classify.
             force_zoom = label_hint == "stealth"
@@ -2286,11 +2312,11 @@ def main():
                 elif img is not None:
                     source_label, source_img = "NAIP top-down", img
                 if source_img is not None:
-                    _out("         imagery: + zoom crops", important=True)
                     zoom_res, zoom_count = run_zoom_stage(
                         stage_provider, clients, row["id"], views,
                         source_label, source_img,
                         max_crops=3 if force_zoom else ZOOM_MAX_CANDIDATES)
+                    _step_done("zoom crops", _brief_pass_result(zoom_res))
                     prior_conf = res.get("site_confidence") or 0
                     zoom_conf = zoom_res.get("site_confidence") or 0
                     zoom_wins = (
@@ -2310,6 +2336,7 @@ def main():
                     maybe_escalate_to_claude(
                         res, clients, views, prompt, input_confidence,
                         allow=True))
+
 
             # Convert the detection box to real-world coordinates - only valid
             # when the box was drawn on the georeferenced NAIP chip
@@ -2362,14 +2389,18 @@ def main():
                 record["review_image"] = str(review_path)
             loc = (f"({asset_lat:.6f},{asset_lon:.6f}, {asset_offset_m:.0f}m off)"
                    if asset_lat is not None else f"(box on: {box_view})")
-            print(f"    {record['site_type']} ({record['site_confidence']}) {loc} "
-                  f"| cell: {record['cell_equipment']} | stage: {classification_stage}",
-                  flush=True)
+            if not QUIET:
+                print(f"    {record['site_type']} ({record['site_confidence']}) {loc} "
+                      f"| cell: {record['cell_equipment']} | stage: {classification_stage}",
+                      flush=True)
             _print_asset_result(record)
 
         except Exception as e:
             record["error"] = str(e)
-            print(f"    ERROR: {e}", flush=True)
+            if not QUIET:
+                print(f"    ERROR: {e}", flush=True)
+            else:
+                _out(f"         ERROR — {e}", important=True)
             _print_asset_result(record)
 
         results.append(record)

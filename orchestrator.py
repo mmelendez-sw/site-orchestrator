@@ -829,7 +829,7 @@ def main(
                 quiet=not verbose,
             )
             classified_by_index[index] = classified
-            logger.info("         %s", _format_classify_progress(classified))
+            logger.info("         done — %s", _format_classify_progress(classified))
             classify_ok += 1
         except Exception as exc:
             summary["errors"] += 1
