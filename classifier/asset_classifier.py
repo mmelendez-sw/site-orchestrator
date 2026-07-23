@@ -1884,8 +1884,19 @@ def _effective_provider(primary_model: str, escalation_model: str | None) -> str
     return escalation_model or primary_model
 
 
-def classify_record(canonical: dict, run_dir: Path | str | None = None) -> dict:
-    """Run the full classifier pipeline for one orchestrator canonical record."""
+def classify_record(
+    canonical: dict,
+    run_dir: Path | str | None = None,
+    *,
+    quiet: bool = True,
+) -> dict:
+    """Run the full classifier pipeline for one orchestrator canonical record.
+
+    When quiet=True (default for orchestrator), classifier stdout (Gemini retries,
+    banners, per-view chatter) is suppressed. Pass quiet=False to debug a site.
+    """
+    import contextlib
+    import os
     import sys
 
     run_path = Path(run_dir) if run_dir else (RUNS_DIR / "orchestrator")
@@ -1909,7 +1920,12 @@ def classify_record(canonical: dict, run_dir: Path | str | None = None) -> dict:
     prior_argv = sys.argv
     try:
         sys.argv = argv
-        main()
+        if quiet:
+            with open(os.devnull, "w", encoding="utf-8") as devnull:
+                with contextlib.redirect_stdout(devnull):
+                    main()
+        else:
+            main()
     finally:
         sys.argv = prior_argv
 
@@ -1917,7 +1933,12 @@ def classify_record(canonical: dict, run_dir: Path | str | None = None) -> dict:
     if not detail_path.exists():
         raise RuntimeError(f"Classifier did not produce detail output in {run_path}")
 
-    result = pd.read_csv(detail_path).iloc[-1].to_dict()
+    detail = pd.read_csv(detail_path)
+    if "id" in detail.columns:
+        matched = detail[detail["id"].astype(str) == str(site_id)]
+        result = (matched.iloc[-1] if not matched.empty else detail.iloc[-1]).to_dict()
+    else:
+        result = detail.iloc[-1].to_dict()
     result["permit_metadata"] = canonical.get("permit_metadata", {})
     if canonical.get("source_url"):
         result["source_url"] = canonical["source_url"]

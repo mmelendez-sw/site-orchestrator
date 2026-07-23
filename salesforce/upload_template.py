@@ -8,7 +8,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from ingest.address_parts import format_address_for_upload, parse_address_components
+from ingest.address_parts import (
+    format_address_for_upload,
+    normalize_state_code,
+    parse_address_components,
+)
 
 # CSV headers match the manual Data Loader template (required fields marked * in docs).
 UPLOAD_CSV_COLUMNS: list[str] = [
@@ -20,6 +24,7 @@ UPLOAD_CSV_COLUMNS: list[str] = [
     "Site Latitude",
     "Site Longitude",
     "Carrier Leasing Source",
+    "OwnerId",
     "Site Type",
     "Verified Site",
     "Verified Site Source",
@@ -37,8 +42,11 @@ REQUIRED_UPLOAD_COLUMNS: frozenset[str] = frozenset(
         "Site Latitude",
         "Site Longitude",
         "Carrier Leasing Source",
+        "OwnerId",
     }
 )
+
+DEFAULT_OWNER_ID = "0056O00000EpUOgQAN"
 
 SITE_TYPE_VALUES: tuple[str, ...] = (
     "Billboard",
@@ -113,18 +121,25 @@ URBANICITY_MORPHOLOGY_MAP: dict[str, str] = {
 
 
 def permit_scraping_carrier_leasing_source(when: datetime | None = None) -> str:
-    """Return Carrier_Leasing_Source__c value: PermitScraping_{mon}{year} (e.g. jun2026)."""
+    """Return Carrier_Leasing_Source__c value: JF_PermitScraping_{mon}{yy} (e.g. jul26)."""
     configured = os.environ.get("SF_CARRIER_LEASING_SOURCE", "").strip()
     if configured:
         return configured
     moment = when or datetime.now()
     month_abbr = moment.strftime("%b").lower()
-    year = moment.strftime("%Y")
-    return f"MM_PermitScraping_{month_abbr}{year}"
+    year = moment.strftime("%y")
+    return f"JF_PermitScraping_{month_abbr}{year}"
 
 
 def default_carrier_leasing_source(when: datetime | None = None) -> str:
     return permit_scraping_carrier_leasing_source(when)
+
+
+def default_owner_id() -> str:
+    configured = os.environ.get("SF_OWNER_ID", "").strip()
+    if configured:
+        return configured
+    return DEFAULT_OWNER_ID
 
 
 def default_verified_site_source() -> str:
@@ -190,6 +205,7 @@ def build_upload_record(
     classified: dict[str, Any] | None = None,
     dedupe_row: dict[str, Any] | None = None,
     carrier_leasing_source: str | None = None,
+    owner_id: str | None = None,
     upload_when: datetime | None = None,
     verified_site: bool | None = None,
     verified_site_source: str | None = None,
@@ -200,10 +216,18 @@ def build_upload_record(
     """Build a canonical upload dict from pipeline records."""
     classified = classified or {}
     dedupe_row = dedupe_row or {}
+    meta = canonical.get("permit_metadata") or {}
     parts = parse_address_components(
         canonical.get("address"),
         zip_code=canonical.get("zip_code") or dedupe_row.get("zip_code"),
     )
+    if not parts.get("site_state"):
+        parts["site_state"] = normalize_state_code(
+            canonical.get("state")
+            or meta.get("scope_state")
+            or meta.get("state")
+            or dedupe_row.get("state")
+        )
 
     resolved_site_type = site_type
     if not resolved_site_type:
@@ -224,6 +248,7 @@ def build_upload_record(
     source = verified_site_source or default_verified_site_source()
     # prop_type = property_type or default_property_type()
     carrier = carrier_leasing_source or default_carrier_leasing_source(upload_when)
+    resolved_owner_id = owner_id or default_owner_id()
 
     lat = canonical.get("lat")
     lng = canonical.get("lng")
@@ -235,6 +260,7 @@ def build_upload_record(
         "lat": lat,
         "lng": lng,
         "carrier_leasing_source": carrier,
+        "owner_id": resolved_owner_id,
         "site_type": resolved_site_type,
         "verified_site": verified,
         "verified_site_source": source,
@@ -259,6 +285,7 @@ def upload_record_to_csv_row(record: dict[str, Any]) -> dict[str, str]:
         "Site Latitude": _csv_number(record.get("lat"), precision=5),
         "Site Longitude": _csv_number(record.get("lng"), precision=5),
         "Carrier Leasing Source": _csv_text(record.get("carrier_leasing_source")),
+        "OwnerId": _csv_text(record.get("owner_id") or default_owner_id()),
         "Site Type": _csv_text(record.get("site_type")),
         "Verified Site": _csv_text(record.get("verified_site") or "TRUE"),
         "Verified Site Source": _csv_text(record.get("verified_site_source")),
@@ -271,7 +298,7 @@ def csv_row_to_upload_record(row: dict[str, Any]) -> dict[str, Any]:
     """Map a Salesforce upload template CSV row back to a canonical upload dict."""
     street = format_address_for_upload(_csv_text(row.get("Site Street"))) or ""
     city = format_address_for_upload(_csv_text(row.get("Site City"))) or ""
-    state = _csv_text(row.get("Site State"))
+    state = normalize_state_code(_csv_text(row.get("Site State"))) or ""
     zip_code = _csv_text(row.get("Site Zip Code"))
     country = _csv_text(row.get("Site Country") or "US")
     lat = row.get("Site Latitude")
@@ -294,6 +321,7 @@ def csv_row_to_upload_record(row: dict[str, Any]) -> dict[str, Any]:
         "lat": float(lat) if lat not in (None, "") else None,
         "lng": float(lng) if lng not in (None, "") else None,
         "carrier_leasing_source": _csv_text(row.get("Carrier Leasing Source")),
+        "owner_id": _csv_text(row.get("OwnerId") or default_owner_id()),
         "site_type": _csv_text(row.get("Site Type")),
         "verified_site": _csv_text(row.get("Verified Site") or "TRUE"),
         "verified_site_source": _csv_text(row.get("Verified Site Source")),

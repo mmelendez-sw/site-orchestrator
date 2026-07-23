@@ -12,6 +12,7 @@ FIELD_MAP: dict[str, str] = {
     "site_state": "Site_State__c",
     "site_country": "Site_Country__c",
     "carrier_leasing_source": "Carrier_Leasing_Source__c",
+    "owner_id": "OwnerId",
     "permit_metadata": "Permit_Metadata__c",
     "site_type": "Site_Type__c",
     "site_confidence": "Site_Confidence__c",

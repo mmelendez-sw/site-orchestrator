@@ -70,19 +70,23 @@ def normalize(record: IngestRecord | dict[str, Any]) -> dict[str, Any]:
     if lat is None or lng is None or not address:
         raise ValueError("Record must resolve to lat, lng, and address")
 
+    metadata = dict(ingest.permit_metadata)
     canonical = {
         "lat": lat,
         "lng": lng,
         "address": address,
-        "permit_metadata": dict(ingest.permit_metadata),
+        "permit_metadata": metadata,
     }
     zip_code = (
-        ingest.permit_metadata.get("zip_code")
+        metadata.get("zip_code")
         or geo_zip
         or extract_zip_code({"address": address})
     )
     if zip_code:
         canonical["zip_code"] = zip_code
+    state = metadata.get("state") or metadata.get("scope_state")
+    if state:
+        canonical["state"] = str(state).strip()
     if ingest.source_url:
         canonical["source_url"] = ingest.source_url
     return canonical

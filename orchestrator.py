@@ -36,6 +36,7 @@ from salesforce.upload_template import build_upload_record, upload_record_to_csv
 from source.record import SourceRecord
 from source.runner import list_sources, run_source
 from source.scope import parse_scope
+from orchestrator_summary import build_run_summary, log_run_summary
 
 load_dotenv()
 
@@ -458,7 +459,8 @@ def _process_dedupe_record(
             "resolution_detail": "status=net_new; routing_reason=unparseable_input",
         }
         summary_delta["net_new"] = 1
-        logger.info("Net-new candidate (unparseable input): %s", canonical["address"])
+        if verbose:
+            logger.info("Net-new candidate (unparseable input): %s", canonical["address"])
         return result_row, summary_delta
 
     resolution = resolver.resolve(canonical)
@@ -515,31 +517,34 @@ def _process_dedupe_record(
         if sf_client and not dry_run:
             sf_client.log_duplicate(canonical, matched.get("Id", ""))
         summary_delta["duplicates"] = 1
-        logger.info(
-            "Duplicate%s: %s (combined=%s address=%s distance=%sm radius=%sm)",
-            " (dry-run)" if dry_run else " skipped",
-            canonical["address"],
-            resolution.get("combined_score"),
-            resolution.get("address_score"),
-            f"{resolution.get('matched_distance_m'):.0f}"
-            if resolution.get("matched_distance_m") is not None
-            else "n/a",
-            urbanicity.get("search_radius_m"),
-        )
+        if verbose:
+            logger.info(
+                "Duplicate%s: %s (combined=%s address=%s distance=%sm radius=%sm)",
+                " (dry-run)" if dry_run else " skipped",
+                canonical["address"],
+                resolution.get("combined_score"),
+                resolution.get("address_score"),
+                f"{resolution.get('matched_distance_m'):.0f}"
+                if resolution.get("matched_distance_m") is not None
+                else "n/a",
+                urbanicity.get("search_radius_m"),
+            )
         return result_row, summary_delta
 
     if status == "review":
         summary_delta["review"] = 1
-        logger.info(
-            "Review queued: %s (combined=%s %s)",
-            canonical["address"],
-            resolution.get("combined_score"),
-            resolution.get("resolution_detail"),
-        )
+        if verbose:
+            logger.info(
+                "Review queued: %s (combined=%s %s)",
+                canonical["address"],
+                resolution.get("combined_score"),
+                resolution.get("resolution_detail"),
+            )
         return result_row, summary_delta
 
     summary_delta["net_new"] = 1
-    logger.info("Net-new candidate: %s", canonical["address"])
+    if verbose:
+        logger.info("Net-new candidate: %s", canonical["address"])
     return result_row, summary_delta
 
 
@@ -649,32 +654,19 @@ def run_dedupe_pipeline(
         output = _write_dedupe_results(run_dir, result_rows)
         _write_review_log_from_rows(run_dir, result_rows)
         _write_sf_upload_csv(result_rows, canonical_records, run_dir)
-        logger.info("Wrote dedupe results to %s", output.resolve())
-        if summary["review"]:
-            logger.info("Wrote review log to %s", review_log.resolve())
+        if verbose:
+            logger.info("Wrote dedupe results to %s", output.resolve())
+            if summary["review"]:
+                logger.info("Wrote review log to %s", review_log.resolve())
 
-    if verbose:
-        logger.info("")
-        logger.info("#" * 72)
-        logger.info("FINAL SUMMARY")
-        logger.info("  processed  : %d", summary["processed"])
-        logger.info("  duplicates : %d  (skip — already in Salesforce)", summary["duplicates"])
-        logger.info("  review     : %d  (manual check — see %s)", summary["review"], review_log)
-        logger.info("  net_new    : %d  (OK to classify / upload next)", summary["net_new"])
-        logger.info("  errors     : %d", summary["errors"])
-        if dry_run:
-            logger.info("  mode       : DRY-RUN — no records written to Salesforce")
-        logger.info("#" * 72)
-
-    logger.info(
-        "Dedupe summary — processed=%s duplicates=%s review=%s net_new=%s errors=%s%s",
-        summary["processed"],
-        summary["duplicates"],
-        summary["review"],
-        summary["net_new"],
-        summary["errors"],
-        " (dry-run, no Salesforce writes)" if dry_run else "",
+    rollup = build_run_summary(
+        processed=summary["processed"],
+        geocode_ok=len(canonical_records),
+        geocode_failed=len(failures),
+        result_rows=result_rows,
+        dry_run=dry_run,
     )
+    log_run_summary(rollup, run_dir)
     return summary
 
 
@@ -695,10 +687,13 @@ def main(
     canonical_records, failures = _normalize_batch(raw_records, verbose=verbose)
     run_dir = RUNS_DIR / f"orchestrator_{datetime.now().strftime('%Y-%m-%d_%H%M%S')}"
     run_dir.mkdir(parents=True, exist_ok=True)
+    if not verbose:
+        logger.info("Run directory: %s", run_dir.resolve())
 
     resolver = SiteResolver(verbose=verbose)
     sf_client = None if dry_run else SalesforceClient()
     result_rows: list[dict[str, Any]] = []
+    upload_outcomes: list[dict[str, Any]] = []
 
     summary = {
         "processed": len(raw_records),
@@ -710,11 +705,12 @@ def main(
     }
 
     for _, exc in failures:
-        logger.exception("Failed to normalize record: %s", exc)
+        logger.error("Failed to normalize record: %s", exc)
 
     if canonical_records:
         candidates = resolver.prefetch(canonical_records)
-        logger.info("Prefetched %s Salesforce candidates for dedupe", len(candidates))
+        if verbose:
+            logger.info("Prefetched %s Salesforce candidates for dedupe", len(candidates))
 
     dedupe_total = len(canonical_records)
     classified_by_index: dict[int, dict[str, Any]] = {}
@@ -733,17 +729,12 @@ def main(
             result_rows.append(result_row)
             for key, value in delta.items():
                 summary[key] += value
-
-            if result_row["status"] != "net_new":
-                continue
-
-            classified = classify_record(canonical, run_dir=run_dir)
-            classified_by_index[len(result_rows) - 1] = classified
-            logger.info("Classified net-new site: %s", canonical["address"])
-
         except Exception as exc:
             summary["errors"] += 1
-            logger.exception("Failed to process record: %s", exc)
+            if verbose:
+                logger.exception("Failed to dedupe record: %s", exc)
+            else:
+                logger.error("Failed to dedupe record: %s", exc)
 
     if result_rows:
         apply_batch_postprocess(result_rows)
@@ -751,6 +742,39 @@ def main(
         summary["duplicates"] = status_counts["duplicates"]
         summary["review"] = status_counts["review"]
         summary["net_new"] = status_counts["net_new"]
+
+    classify_targets = [
+        (index, canonical_records[index])
+        for index, row in enumerate(result_rows)
+        if row.get("status") == "net_new" and index < len(canonical_records)
+    ]
+    classify_total = len(classify_targets)
+    if classify_total and not verbose:
+        logger.info("Classifying %d net-new sites", classify_total)
+    for classify_index, (index, canonical) in enumerate(classify_targets, start=1):
+        try:
+            if not verbose:
+                logger.info(
+                    "[%d/%d] %s",
+                    classify_index,
+                    classify_total,
+                    (canonical.get("address") or "")[:72],
+                )
+            classified_by_index[index] = classify_record(
+                canonical,
+                run_dir=run_dir,
+                quiet=not verbose,
+            )
+            if verbose:
+                logger.info("Classified net-new site: %s", canonical["address"])
+        except Exception as exc:
+            summary["errors"] += 1
+            if verbose:
+                logger.exception("Failed to classify record: %s", exc)
+            else:
+                logger.error("Failed to classify %s: %s", canonical.get("address"), exc)
+
+    if result_rows:
         output = _write_dedupe_results(run_dir, result_rows)
         _write_review_log_from_rows(run_dir, result_rows)
         _write_sf_upload_csv(
@@ -759,7 +783,8 @@ def main(
             run_dir,
             classified_by_index=classified_by_index,
         )
-        logger.info("Wrote dedupe results to %s", output)
+        if verbose:
+            logger.info("Wrote dedupe results to %s", output)
 
         if sf_client and not dry_run:
             upload_targets = [
@@ -768,6 +793,8 @@ def main(
                 if row.get("status") == "net_new" and classified_by_index.get(index) is not None
             ]
             upload_total = len(upload_targets)
+            if upload_total and not verbose:
+                logger.info("Uploading %d sites to Salesforce", upload_total)
             if verbose and upload_total:
                 logger.info("=" * 72)
                 logger.info("SALESFORCE UPLOAD (%d net-new sites)", upload_total)
@@ -781,8 +808,8 @@ def main(
                     classified=classified,
                     dedupe_row=row,
                 )
-                csv_row = upload_record_to_csv_row(upload_record)
                 if verbose:
+                    csv_row = upload_record_to_csv_row(upload_record)
                     logger.info(
                         "[%d/%d] Creating Site__c — %s",
                         upload_index,
@@ -799,44 +826,66 @@ def main(
                     result = sf_client.create_site(upload_record, verbose=verbose)
                     summary["loaded"] += 1
                     sf_id = result.get("id") or "—"
-                    logger.info(
-                        "Loaded net-new site: %s (Id=%s)",
-                        canonical["address"],
-                        sf_id,
+                    upload_outcomes.append(
+                        {
+                            "address": canonical.get("address"),
+                            "status": "loaded",
+                            "sf_id": sf_id,
+                        }
                     )
+                    if verbose:
+                        logger.info(
+                            "Loaded net-new site: %s (Id=%s)",
+                            canonical["address"],
+                            sf_id,
+                        )
                 except Exception as exc:
                     summary["errors"] += 1
-                    logger.exception(
-                        "Upload failed for %s — continuing with remaining sites: %s",
-                        canonical["address"],
-                        exc,
+                    upload_outcomes.append(
+                        {
+                            "address": canonical.get("address"),
+                            "status": "failed",
+                            "error": str(exc),
+                        }
                     )
-            if verbose and upload_total:
-                logger.info(
-                    "Salesforce upload complete — loaded=%d errors=%d",
-                    summary["loaded"],
-                    summary["errors"],
-                )
-                logger.info("=" * 72)
+                    if verbose:
+                        logger.exception(
+                            "Upload failed for %s — continuing with remaining sites: %s",
+                            canonical["address"],
+                            exc,
+                        )
+                    else:
+                        logger.error(
+                            "Upload failed for %s: %s",
+                            canonical.get("address"),
+                            exc,
+                        )
         elif dry_run and summary["net_new"]:
-            logger.info(
-                "Dry-run: %s net-new rows exported to sf_upload.csv (no Salesforce writes)",
-                summary["net_new"],
-            )
+            for index, row in enumerate(result_rows):
+                if row.get("status") != "net_new":
+                    continue
+                upload_outcomes.append(
+                    {
+                        "address": row.get("address")
+                        or (
+                            canonical_records[index].get("address")
+                            if index < len(canonical_records)
+                            else ""
+                        ),
+                        "status": "skipped",
+                    }
+                )
 
-        if summary["review"]:
-            logger.info("Wrote review log to %s", _review_log_path(run_dir))
-
-    logger.info(
-        "Summary — processed=%s duplicates=%s review=%s net_new=%s loaded=%s errors=%s%s",
-        summary["processed"],
-        summary["duplicates"],
-        summary["review"],
-        summary["net_new"],
-        summary["loaded"],
-        summary["errors"],
-        " (dry-run, no Salesforce writes)" if dry_run else "",
+    rollup = build_run_summary(
+        processed=summary["processed"],
+        geocode_ok=len(canonical_records),
+        geocode_failed=len(failures),
+        result_rows=result_rows,
+        classified_by_index=classified_by_index,
+        upload_outcomes=upload_outcomes,
+        dry_run=dry_run,
     )
+    log_run_summary(rollup, run_dir)
     return summary
 
 
@@ -884,7 +933,7 @@ def _parse_args() -> argparse.Namespace:
         "--verbose",
         "-v",
         action="store_true",
-        help="Print detailed step-by-step progress (on by default with --dry-run or --classify)",
+        help="Print detailed step-by-step progress (off by default; end-of-run summary always prints)",
     )
     parser.add_argument("--country", help="Country scope (e.g. US)")
     parser.add_argument("--state", help="State scope (e.g. WI)")
@@ -907,7 +956,7 @@ def _parse_args() -> argparse.Namespace:
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     args = _parse_args()
-    verbose = args.verbose or args.dry_run or args.classify
+    verbose = args.verbose
     scope = parse_scope(
         country=args.country,
         state=args.state,

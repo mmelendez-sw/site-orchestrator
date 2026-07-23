@@ -53,6 +53,8 @@ class SourceRecord:
             metadata.setdefault("label", self.label)
         if self.zip_code:
             metadata.setdefault("zip_code", self.zip_code)
+        if self.state:
+            metadata.setdefault("state", self.state)
         if self.county:
             metadata.setdefault("county", self.county)
         if self.country:
