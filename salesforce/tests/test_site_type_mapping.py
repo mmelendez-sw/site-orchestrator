@@ -24,8 +24,20 @@ def test_map_tower_subtype_to_salesforce():
     ) == "Stealth"
 
 
-def test_map_rooftop():
-    assert map_site_type_for_upload({"site_type": "rooftop"}) == "Rooftop"
+def test_map_rooftop_requires_cell_equipment():
+    assert (
+        map_site_type_for_upload(
+            {"site_type": "rooftop", "cell_equipment": True}
+        )
+        == "Rooftop"
+    )
+    assert map_site_type_for_upload({"site_type": "rooftop"}) == ""
+    assert (
+        map_site_type_for_upload(
+            {"site_type": "rooftop", "cell_equipment": False}
+        )
+        == ""
+    )
 
 
 def test_permit_text_fallback_for_tower_without_subtype():

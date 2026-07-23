@@ -125,8 +125,10 @@ def _write_sf_upload_csv(
     for index, row in enumerate(result_rows):
         if row.get("status") != "net_new":
             continue
-        canonical = canonical_records[index] if index < len(canonical_records) else {}
         classified = (classified_by_index or {}).get(index)
+        if classified is None:
+            continue
+        canonical = canonical_records[index] if index < len(canonical_records) else {}
         upload_records.append(
             build_upload_record(
                 canonical,

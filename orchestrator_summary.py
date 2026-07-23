@@ -155,6 +155,11 @@ def format_run_summary(summary: dict[str, Any]) -> str:
             lines.append(f"    - {_short_address(item)}  ({reason})")
         if summary["upload_skipped"]:
             lines.append(f"  skipped   : {len(summary['upload_skipped'])}")
+            for item in summary["upload_skipped"]:
+                reason = str(item.get("error") or "skipped").split("\n")[0]
+                if len(reason) > 90:
+                    reason = reason[:89] + "…"
+                lines.append(f"    - {_short_address(item)}  ({reason})")
 
     lines.append("=" * 72)
     return "\n".join(lines)

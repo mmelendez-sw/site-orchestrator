@@ -86,6 +86,9 @@ def map_upload_record_to_payload(record: dict[str, Any]) -> dict[str, Any]:
         if key not in record or record[key] is None:
             continue
         value = record[key]
+        if isinstance(value, str) and not value.strip():
+            # Omit blank optional fields (e.g. rooftop without cell_equipment -> no Site Type).
+            continue
         if key == "permit_metadata" and isinstance(value, dict):
             value = json.dumps(value)
         elif key == "verified_site":

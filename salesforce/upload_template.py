@@ -157,10 +157,15 @@ def map_classifier_site_type(
     classifier_type: str | None,
     *,
     tower_subtype: str | None = None,
+    cell_equipment: Any = None,
     permit_metadata: dict[str, Any] | None = None,
 ) -> str:
     return map_site_type_for_upload(
-        {"site_type": classifier_type, "tower_subtype": tower_subtype},
+        {
+            "site_type": classifier_type,
+            "tower_subtype": tower_subtype,
+            "cell_equipment": cell_equipment,
+        },
         permit_metadata=permit_metadata,
     )
 
@@ -234,6 +239,7 @@ def build_upload_record(
         resolved_site_type = map_classifier_site_type(
             classified.get("site_type"),
             tower_subtype=classified.get("tower_subtype"),
+            cell_equipment=classified.get("cell_equipment"),
             permit_metadata=canonical.get("permit_metadata"),
         )
 

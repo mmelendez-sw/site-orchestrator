@@ -106,13 +106,27 @@ def site_type_from_permit_metadata(metadata: dict[str, Any] | None) -> str | Non
     return site_type_from_permit_text(" ".join(chunks))
 
 
+def cell_equipment_confirmed(value: Any) -> bool:
+    """Return True when classifier positively identified cellular equipment."""
+    if value is True:
+        return True
+    if isinstance(value, (int, float)) and value == 1:
+        return True
+    text = str(value or "").strip().lower()
+    return text in {"true", "1", "yes"}
+
+
 def map_site_type_for_upload(
     classified: dict[str, Any] | None = None,
     *,
     permit_metadata: dict[str, Any] | None = None,
     explicit_site_type: str | None = None,
 ) -> str:
-    """Resolve Salesforce Site_Type__c from classifier output and permit hints."""
+    """Resolve Salesforce Site_Type__c from classifier output and permit hints.
+
+    Rooftop uploads as "Rooftop" only when cell_equipment was positively identified;
+    otherwise Site Type is left blank (record may still upload).
+    """
     if explicit_site_type:
         return explicit_site_type
 
@@ -130,6 +144,11 @@ def map_site_type_for_upload(
         if tower_subtype:
             return TOWER_SUBTYPE_TO_SF[tower_subtype]
         return TOWER_SUBTYPE_TO_SF["unclear"]
+
+    if raw_site_type == "rooftop":
+        if not cell_equipment_confirmed(classified.get("cell_equipment")):
+            return ""
+        return "Rooftop"
 
     if raw_site_type in SITE_TYPE_TO_SF:
         mapped = SITE_TYPE_TO_SF[raw_site_type]
