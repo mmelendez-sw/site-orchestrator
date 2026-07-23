@@ -53,6 +53,7 @@ def test_map_classifier_site_type():
     assert map_classifier_site_type("rooftop", cell_equipment=True) == "Rooftop"
     assert map_classifier_site_type("rooftop", cell_equipment=False) == ""
     assert map_classifier_site_type("unclear") == ""
+    assert map_classifier_site_type("other") == "Equipment Only"
 
 
 def test_csv_row_roundtrip():

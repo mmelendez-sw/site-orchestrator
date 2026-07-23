@@ -31,8 +31,17 @@ def _bucket_site_type(site_type: str | None) -> str:
 
 
 def _tier_label(tier: str | None) -> str:
-    key = str(tier or "").strip().lower() or "unknown"
-    return _TIER_LABELS.get(key, key or "unknown")
+    if tier is None:
+        return "unknown"
+    try:
+        if tier != tier:  # float NaN
+            return "unknown"
+    except Exception:
+        pass
+    key = str(tier).strip().lower()
+    if not key or key == "nan":
+        return "unknown"
+    return _TIER_LABELS.get(key, key)
 
 
 def _short_address(row: dict[str, Any], limit: int = 72) -> str:

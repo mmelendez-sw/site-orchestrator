@@ -35,7 +35,7 @@ TOWER_SUBTYPE_TO_SF: dict[str, str] = {
 
 SITE_TYPE_TO_SF: dict[str, str] = {
     "rooftop": "Rooftop",
-    "other": "Equipment",
+    "other": "Equipment Only",
     "small_cell": "Small Cell",
     "das": "DAS",
     "billboard": "Billboard",

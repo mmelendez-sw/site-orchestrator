@@ -52,7 +52,7 @@ SITE_TYPE_VALUES: tuple[str, ...] = (
     "Billboard",
     "DAS",
     "Datacenter",
-    "Equipment",
+    "Equipment Only",
     "Flagpole",
     "Guyed Tower",
     "Monopole",

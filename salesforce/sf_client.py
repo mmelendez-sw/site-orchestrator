@@ -63,6 +63,22 @@ class SalesforceClient:
         return results
 
 
+def _is_missing(value: Any) -> bool:
+    """True for None/blank/NaN — never send these in a Salesforce JSON payload."""
+    if value is None:
+        return True
+    if isinstance(value, float):
+        try:
+            return value != value  # NaN
+        except Exception:
+            return False
+    if isinstance(value, str) and not value.strip():
+        return True
+    if isinstance(value, str) and value.strip().lower() == "nan":
+        return True
+    return False
+
+
 def map_upload_record_to_payload(record: dict[str, Any]) -> dict[str, Any]:
     """Map a build_upload_record dict to Salesforce API field names (no API call)."""
     payload: dict[str, Any] = {}
@@ -71,15 +87,10 @@ def map_upload_record_to_payload(record: dict[str, Any]) -> dict[str, Any]:
             # Site_Address__c is used for dedupe reads; UAT treats it as read-only on insert.
             # Street/city/state/zip fields populate the record instead.
             continue
-        if key not in record or record[key] is None:
+        if key not in record or _is_missing(record[key]):
             continue
         value = record[key]
-        if isinstance(value, str) and not value.strip():
-            # Omit blank optional fields (e.g. rooftop without cell_equipment -> no Site Type).
-            continue
-        if key == "permit_metadata" and isinstance(value, dict):
-            value = json.dumps(value)
-        elif key == "verified_site":
+        if key == "verified_site":
             value = _coerce_bool(value)
         payload[sf_field] = value
     return payload

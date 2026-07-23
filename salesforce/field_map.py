@@ -2,6 +2,9 @@
 
 import os
 
+# Only fields that exist on Site__c and belong on the upload template.
+# Internal keys (permit_metadata, site_confidence, cell_equipment, source_url)
+# stay on the local upload dict for mapping/debug — they are not sent to SF.
 FIELD_MAP: dict[str, str] = {
     "lat": "Site_Latitude__c",
     "lng": "Site_Longitude__c",
@@ -13,11 +16,7 @@ FIELD_MAP: dict[str, str] = {
     "site_country": "Site_Country__c",
     "carrier_leasing_source": "Carrier_Leasing_Source__c",
     "owner_id": "OwnerId",
-    "permit_metadata": "Permit_Metadata__c",
     "site_type": "Site_Type__c",
-    "site_confidence": "Site_Confidence__c",
-    "cell_equipment": "Cell_Equipment__c",
-    "source_url": "Source_URL__c",
     "verified_site": "Verified_Site__c",
     "verified_site_source": "Verified_Site_Source__c",
     "morphology": "Morphology__c",
