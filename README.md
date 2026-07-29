@@ -18,9 +18,29 @@ site-orchestrator/
 ├── dedupe/                  # Salesforce spatial + fuzzy dedupe
 ├── classifier/              # NAIP/Nearmap imagery + Claude classification
 ├── salesforce/              # create sites + duplicate audit logging
+├── enrichment/              # FCC/TowerSource proximity + NAIP → SF updates
 ├── data/                    # input CSVs (gitignored)
 ├── runs/                    # runtime outputs (gitignored)
 └── chips/                   # saved imagery chips (gitignored)
+```
+
+### Enrichment — blank Site_Type__c → FCC/TowerSource → NAIP → SF update CSV
+
+Isolated on the `salesforce-update` branch. Queries production Site__c rows with blank
+`Site_Type__c`, checks `dbo.FCCTowerData` + `dbo.TowerSourceASRTowers` within 50 m,
+runs **NAIP-only** classification (no Nearmap), and writes:
+
+- `potential_sf_updates.csv` — eligible updates (review, then `--apply`)
+- `holdout_rooftop_other.csv` — rooftops / other / else (no SF write)
+
+```powershell
+pip install pyodbc   # if not already installed
+# Proximity-only (no AI spend):
+python -m enrichment --skip-classify --limit 20
+# Full NAIP classify → candidate CSV (still no SF writes):
+python -m enrichment --limit 20
+# After review, apply candidates one-by-one (continues on row failures):
+python -m enrichment --apply --apply-only --candidates runs\<run>\potential_sf_updates.csv
 ```
 
 Classifier-specific docs live in [`classifier/docs/`](classifier/docs/) (configuration, workflow guides, diagrams).

@@ -13,3 +13,4 @@ openpyxl==3.1.5
 tqdm==4.67.1
 simple-salesforce==1.12.6
 rapidfuzz==3.13.0
+pyodbc==5.2.0
