@@ -36,6 +36,8 @@ def build_blank_site_type_query(
     return (
         f"SELECT {field_list} FROM {OBJECT_NAME} "
         f"WHERE (Site_Type__c = null OR Site_Type__c = '') "
+        f"AND Site_Latitude__c != null AND Site_Latitude__c != '' "
+        f"AND Site_Longitude__c != null AND Site_Longitude__c != '' "
         f"AND Stage__c IN ({_soql_in(stages)}) "
         f"AND Owner__c IN ({_soql_in(owners)})"
     )
@@ -84,6 +86,7 @@ def build_update_payload(
     site_type: str | None = None,
     verified_site: bool | None = None,
     verified_site_source: str | None = None,
+    test_batch_flag: bool | None = None,
 ) -> dict[str, Any]:
     """Build a Site__c update payload (only set fields)."""
     payload: dict[str, Any] = {}
@@ -97,6 +100,8 @@ def build_update_payload(
         payload["Verified_Site__c"] = verified_site
     if verified_site_source:
         payload["Verified_Site_Source__c"] = verified_site_source
+    if test_batch_flag is not None:
+        payload["Test_Batch_Flag__c"] = test_batch_flag
     return payload
 
 
@@ -119,6 +124,82 @@ def update_site(
     return {"id": record_id, "status": result, "success": True}
 
 
+def apply_one_update(
+    client: SalesforceClient,
+    row: dict[str, Any],
+    *,
+    dry_run: bool = False,
+    verbose: bool = True,
+) -> dict[str, Any]:
+    """Update a single enrichment candidate row; never raises."""
+    from enrichment import progress
+
+    sf_id = str(row.get("Id") or row.get("sf_id") or "").strip()
+    match_source = str(row.get("match_source") or "").strip()
+    verified_source = str(row.get("update_verified_site_source") or "").strip()
+    hit_source = match_source if match_source and match_source != "none" else verified_source
+    hit_source = hit_source or "unknown"
+    payload = row.get("payload")
+    if not isinstance(payload, dict):
+        payload = build_update_payload(
+            latitude=_optional_float(row.get("update_lat")),
+            longitude=_optional_float(row.get("update_lng")),
+            site_type=(row.get("update_site_type") or None) or None,
+            verified_site=_optional_bool(row.get("update_verified_site")),
+            verified_site_source=(row.get("update_verified_site_source") or None) or None,
+            test_batch_flag=True,
+        )
+    entry = {
+        "Id": sf_id,
+        "success": False,
+        "dry_run": dry_run,
+        "error": "",
+        "status": "",
+        "payload": payload,
+    }
+    try:
+        if not sf_id:
+            raise ValueError("Missing Salesforce Id")
+        naip_site_type = str(row.get("naip_site_type") or "").strip().lower()
+        enrichment_fields = {
+            "Site_Latitude__c",
+            "Site_Longitude__c",
+            "Site_Type__c",
+            "Verified_Site__c",
+            "Verified_Site_Source__c",
+        }
+        allowed_types = {"tower", "rooftop"}
+        if enrichment_fields.intersection(payload) and naip_site_type not in allowed_types:
+            raise ValueError(
+                f"Salesforce updates require NAIP site_type=tower or rooftop; got "
+                f"{naip_site_type or 'blank'}"
+            )
+        if not payload:
+            raise ValueError("Empty update payload")
+        if dry_run:
+            entry["success"] = True
+            entry["status"] = "dry_run"
+            if verbose:
+                progress.result(f"SF dry-run OK (not written) | source={hit_source}")
+            return entry
+        update_site(client, sf_id, payload, verbose=False)
+        entry["success"] = True
+        entry["status"] = "updated"
+        if verbose:
+            progress.result(
+                f"SF updated | source={hit_source} | "
+                f"type={payload.get('Site_Type__c') or '—'} | "
+                f"{payload.get('Site_Latitude__c')}, {payload.get('Site_Longitude__c')}"
+            )
+    except Exception as exc:  # noqa: BLE001 — per-row resilience
+        entry["error"] = str(exc)
+        entry["status"] = "failed"
+        logger.warning("update failed for %s: %s", sf_id, exc)
+        if verbose:
+            progress.warn(f"SF update failed — continuing: {exc}")
+    return entry
+
+
 def apply_updates_idempotent(
     client: SalesforceClient,
     rows: Iterable[dict[str, Any]],
@@ -132,51 +213,10 @@ def apply_updates_idempotent(
     rows_list = list(rows)
     results: list[dict[str, Any]] = []
     for index, row in enumerate(rows_list, start=1):
-        sf_id = str(row.get("Id") or row.get("sf_id") or "").strip()
-        payload = row.get("payload")
-        if not isinstance(payload, dict):
-            payload = build_update_payload(
-                latitude=_optional_float(row.get("update_lat")),
-                longitude=_optional_float(row.get("update_lng")),
-                site_type=(row.get("update_site_type") or None) or None,
-                verified_site=_optional_bool(row.get("update_verified_site")),
-                verified_site_source=(row.get("update_verified_site_source") or None) or None,
-            )
-        entry = {
-            "index": index,
-            "Id": sf_id,
-            "success": False,
-            "dry_run": dry_run,
-            "error": "",
-            "payload": payload,
-        }
         if verbose:
-            progress.step(
-                f"[{index}/{len(rows_list)}] Id={sf_id} | "
-                f"type={payload.get('Site_Type__c') or '—'} | "
-                f"lat={payload.get('Site_Latitude__c')} lng={payload.get('Site_Longitude__c')}"
-            )
-        try:
-            if not sf_id:
-                raise ValueError("Missing Salesforce Id")
-            if not payload:
-                raise ValueError("Empty update payload")
-            if dry_run:
-                entry["success"] = True
-                entry["status"] = "dry_run"
-                if verbose:
-                    progress.result("dry-run OK (not written)")
-            else:
-                update_site(client, sf_id, payload, verbose=verbose)
-                entry["success"] = True
-                entry["status"] = "updated"
-                if verbose:
-                    progress.result("Salesforce update OK")
-        except Exception as exc:  # noqa: BLE001 — per-row resilience
-            entry["error"] = str(exc)
-            logger.warning("[%d] update failed for %s: %s", index, sf_id, exc)
-            if verbose:
-                progress.warn(f"update failed — continuing: {exc}")
+            progress.step(f"[{index}/{len(rows_list)}] Id={row.get('Id') or '—'}")
+        entry = apply_one_update(client, row, dry_run=dry_run, verbose=verbose)
+        entry["index"] = index
         results.append(entry)
     return results
 

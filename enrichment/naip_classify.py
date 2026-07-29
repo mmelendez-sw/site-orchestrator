@@ -31,36 +31,29 @@ def classify_naip_only(
     # Ensure Nearmap path is skipped even if env has NAIP_ONLY=0.
     os.environ["NAIP_ONLY"] = "1"
 
-    from anthropic import Anthropic
     from google import genai
 
     from classifier import asset_classifier as ac
 
     # Refresh module flags after env mutation.
     ac.NAIP_ONLY = True
+    ac.QUIET = True
 
-    primary_provider, allow_claude_escalation = ac.resolve_ai_mode()
-    if verbose:
-        progress.step(
-            f"AI mode: primary={primary_provider} | "
-            f"claude_escalation={allow_claude_escalation}"
-        )
+    # This enrichment workflow is intentionally Gemini-only. Do not inherit
+    # BIFURCATED_AI/Claude escalation settings from the general classifier.
+    primary_provider = "gemini"
+    allow_claude_escalation = False
     clients: dict[str, object] = {}
-    if primary_provider == "gemini" or allow_claude_escalation:
-        if not os.environ.get("GEMINI_API_KEY"):
-            raise RuntimeError("GEMINI_API_KEY is required for NAIP classification")
-        clients["gemini"] = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
-    if primary_provider == "claude" or allow_claude_escalation:
-        if not os.environ.get("ANTHROPIC_API_KEY"):
-            raise RuntimeError("ANTHROPIC_API_KEY is required for NAIP classification")
-        clients["claude"] = Anthropic()
+    if not os.environ.get("GEMINI_API_KEY"):
+        raise RuntimeError("GEMINI_API_KEY is required for NAIP classification")
+    clients["gemini"] = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 
     if verbose:
-        progress.step("Fetching NAIP chip from Planetary Computer…")
+        progress.step("NAIP fetch")
     img, naip_meta, naip_geo = ac.fetch_chip(lat, lon)
     if img is None:
         if verbose:
-            progress.warn("No NAIP imagery at this point")
+            progress.warn("No NAIP imagery")
         return {
             "site_type": "no_imagery",
             "error": "no_naip_imagery",
@@ -75,16 +68,12 @@ def classify_naip_only(
     else:
         chip_path = None
 
-    if verbose:
-        img_date = (naip_meta or {}).get("image_date") or "—"
-        progress.result(f"NAIP chip ready (date={img_date}, saved={chip_path or 'no'})")
-
     row = {"id": site_id, "input_confidence": input_confidence}
     prompt = ac.build_classification_prompt(row)
     views = [(ac._naip_view_label(ac.CHIP_SIZE_M), img)]
 
     if verbose:
-        progress.step(f"Classify pass 1 ({primary_provider})…")
+        progress.step("Gemini classify")
     # Wide-AOI retry when primary is other/unclear (NAIP-only path).
     res, primary_model, escalation_model, escalation_reason_str = (
         ac.classify_with_routing(
@@ -98,7 +87,7 @@ def classify_naip_only(
     )
     if verbose:
         progress.result(
-            f"pass1 → type={res.get('site_type')} conf={res.get('site_confidence')}"
+            f"{res.get('site_type')} conf={res.get('site_confidence')}"
         )
     classification_stage = "primary"
     active_geo = naip_geo
@@ -111,7 +100,7 @@ def classify_naip_only(
         and ac.NAIP_WIDE_CHIP_M > ac.CHIP_SIZE_M
     ):
         if verbose:
-            progress.step(f"Wide NAIP retry ({int(ac.NAIP_WIDE_CHIP_M)} m)…")
+            progress.step("Wide NAIP retry")
         wide_img, wide_meta, wide_geo = ac.fetch_chip(lat, lon, chip_m=ac.NAIP_WIDE_CHIP_M)
         if wide_img is not None:
             wide_views = [(ac._naip_view_label(ac.NAIP_WIDE_CHIP_M), wide_img)]
@@ -141,21 +130,13 @@ def classify_naip_only(
                     chip_path = wide_path
                 if verbose:
                     progress.result(
-                        f"wide wins → type={res.get('site_type')} "
-                        f"conf={res.get('site_confidence')}"
+                        f"wide → {res.get('site_type')} conf={res.get('site_confidence')}"
                     )
 
     if allow_claude_escalation:
-        if verbose:
-            progress.step("Claude escalation check…")
         res, escalation_model, escalation_reason_str = ac.maybe_escalate_to_claude(
             res, clients, views, prompt, input_confidence, allow=True
         )
-        if verbose and escalation_model:
-            progress.result(
-                f"escalated ({escalation_reason_str}) → type={res.get('site_type')} "
-                f"conf={res.get('site_confidence')}"
-            )
 
     asset_lat = asset_lon = asset_offset_m = None
     box, box_view = res.get("asset_box_2d"), res.get("asset_view")
@@ -163,15 +144,10 @@ def classify_naip_only(
         located = ac.box_to_latlon(active_geo, box)
         if located:
             asset_lat, asset_lon, asset_offset_m = located
-            if verbose:
-                progress.result(
-                    f"asset box → {asset_lat:.6f}, {asset_lon:.6f} "
-                    f"(offset {asset_offset_m:.1f} m)"
-                )
 
     delay = ac.GEMINI_DELAY_S if primary_provider == "gemini" else ac.API_DELAY_S
-    if verbose:
-        progress.step(f"Rate-limit pause {delay:g}s…")
+    if verbose and delay:
+        progress.step(f"pause {delay:g}s")
     time.sleep(delay)
 
     return {

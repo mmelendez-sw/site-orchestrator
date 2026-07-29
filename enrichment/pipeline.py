@@ -56,39 +56,32 @@ def run_enrichment(
     sites: list[dict[str, Any]] | None = None,
     verbose: bool = True,
 ) -> dict[str, Any]:
-    """Run proximity + NAIP enrichment and write output CSVs.
-
-    Does not write to Salesforce. Use apply_candidate_csv(..., apply=True) for that.
-    """
+    """Run proximity + NAIP enrichment and write candidate/holdout CSVs."""
     run_dir.mkdir(parents=True, exist_ok=True)
     chip_dir = run_dir / "chips"
 
     progress.stage(
-        "START ENRICHMENT",
-        f"run_dir={run_dir} | limit={limit!s} | max_m={max_m} | "
-        f"skip_classify={skip_classify} | SF writes=NO",
+        "START",
+        f"limit={limit!s} | run_dir={run_dir.name}",
     )
 
     own_sql = False
     if sql_connection is None:
-        progress.stage("CONNECT AZURE SQL", "FCCTowerData + TowerSourceASRTowers")
+        progress.stage("1/4 CONNECT SQL")
         sql_connection = connect_mssql()
         own_sql = True
-        progress.result("SQL connected")
+        progress.result("connected")
 
     classify = classify_fn or classify_naip_only
 
     try:
         if sites is None:
-            progress.stage(
-                "QUERY SALESFORCE",
-                "blank Site_Type__c + stage/owner filters (read-only)",
-            )
+            progress.stage("2/4 QUERY SALESFORCE", "blank Site_Type + coords required")
             sites = query_blank_site_type_sites(sf_client)
-            progress.result(f"Fetched {len(sites)} Salesforce site(s)")
+            progress.result(f"{len(sites)} site(s)")
         if limit is not None:
             sites = sites[: max(0, limit)]
-            progress.step(f"Limiting batch to first {len(sites)} site(s)")
+            progress.step(f"processing first {len(sites)}")
 
         detail_rows: list[dict[str, Any]] = []
         cursor = sql_connection.cursor()
@@ -98,8 +91,8 @@ def run_enrichment(
             street = site.get("Site_Street__c") or ""
             city = site.get("Site_City__c") or ""
             progress.stage(
-                f"SITE {index}/{len(sites)}",
-                f"Id={sf_id} | {street}, {city}".strip(" |"),
+                f"3/4 SITE {index}/{len(sites)}",
+                f"{sf_id} | {street}, {city}".strip(" |"),
             )
             row = _process_site(
                 site,
@@ -110,16 +103,22 @@ def run_enrichment(
                 chip_dir=chip_dir,
                 verbose=verbose,
             )
+            row.setdefault("sf_update_status", "")
+            row.setdefault("sf_update_error", "")
+            if row.get("bucket") == BUCKET_POTENTIAL_UPDATE:
+                row["sf_update_status"] = "pending"
+            else:
+                row["sf_update_status"] = "skipped"
+
             detail_rows.append(row)
             progress.result(
-                f"bucket={row.get('bucket')} | match={row.get('match_source')} | "
+                f"{row.get('bucket')} | match={row.get('match_source')} | "
                 f"naip={row.get('naip_site_type') or '—'} | "
-                f"reason={row.get('holdout_reason') or '—'}"
+                f"sf={row.get('sf_update_status') or '—'}"
             )
-            # Checkpoint after each site for resume safety.
             write_csv(run_dir / DETAIL_CSV, detail_rows, DETAIL_COLUMNS)
 
-        progress.stage("WRITE OUTPUT CSVs", str(run_dir))
+        progress.stage("4/4 WRITE CSVs", str(run_dir.name))
         candidates = [r for r in detail_rows if r.get("bucket") == BUCKET_POTENTIAL_UPDATE]
         holdouts = [
             r
@@ -129,8 +128,7 @@ def run_enrichment(
         write_csv(run_dir / CANDIDATE_CSV, candidates, CANDIDATE_COLUMNS)
         write_csv(run_dir / HOLDOUT_CSV, holdouts, HOLDOUT_COLUMNS)
         progress.result(
-            f"{CANDIDATE_CSV} ({len(candidates)}) | {HOLDOUT_CSV} ({len(holdouts)}) | "
-            f"{DETAIL_CSV} ({len(detail_rows)})"
+            f"updates={len(candidates)} holdouts={len(holdouts)} total={len(detail_rows)}"
         )
 
         summary = {
@@ -202,6 +200,8 @@ def _process_site(
         "update_site_type": "",
         "update_verified_site": "",
         "update_verified_site_source": "",
+        "sf_update_status": "",
+        "sf_update_error": "",
         "error": "",
     }
 
@@ -217,7 +217,7 @@ def _process_site(
     base["sf_lng"] = sf_lng
     progress.step(f"SF pin: {sf_lat:.6f}, {sf_lng:.6f}")
 
-    progress.stage("PROXIMITY SEARCH", f"FCC + TowerSource within {max_m:g} m")
+    progress.stage("PROXIMITY", f"≤{max_m:g} m")
     try:
         hit = find_proximity_hit(cursor, sf_lat, sf_lng, max_m=max_m)
     except Exception as exc:  # noqa: BLE001
@@ -234,21 +234,17 @@ def _process_site(
         base["match_asset_type"] = hit.asset_type or ""
         classify_lat, classify_lng = hit.latitude, hit.longitude
         db_lat, db_lng = hit.latitude, hit.longitude
-        progress.result(
-            f"HIT {base['match_source']} at {hit.distance_m:.1f} m | "
-            f"coords={hit.latitude:.6f}, {hit.longitude:.6f} | "
-            f"asr={hit.asr_number or '—'}"
-        )
+        progress.result(f"{base['match_source']} @ {hit.distance_m:.1f} m")
     else:
         classify_lat, classify_lng = sf_lat, sf_lng
         db_lat = db_lng = None
-        progress.result("No DB hit — escalating to NAIP on Salesforce pin")
+        progress.result("no DB hit → NAIP on SF pin")
 
     base["classify_lat"] = classify_lat
     base["classify_lng"] = classify_lng
 
     if skip_classify:
-        progress.stage("SKIP CLASSIFY", "--skip-classify set (no NAIP/AI)")
+        progress.step("skip classify")
         if hit is not None:
             base["bucket"] = BUCKET_POTENTIAL_UPDATE
             base["holdout_reason"] = "skip_classify_db_hit"
@@ -262,10 +258,7 @@ def _process_site(
             base["holdout_reason"] = "skip_classify_no_db_hit"
         return base
 
-    progress.stage(
-        "NAIP CLASSIFY",
-        f"point={classify_lat:.6f}, {classify_lng:.6f} | Nearmap=OFF",
-    )
+    progress.stage("NAIP")
     try:
         classified = classify_fn(
             site_id=sf_id,
@@ -299,7 +292,6 @@ def _process_site(
     if classified.get("error"):
         base["error"] = classified.get("error")
 
-    progress.stage("BUCKET RESULT", "potential_update vs rooftop/other holdout")
     decision = bucket_classification(
         match_source=base["match_source"],
         classified=classified,
@@ -320,7 +312,7 @@ def apply_candidate_csv(
     apply: bool = False,
     verbose: bool = True,
 ) -> dict[str, Any]:
-    """Apply potential_sf_updates.csv one row at a time (idempotent on failure)."""
+    """Apply enrichment rows one at a time (idempotent on failure)."""
     import csv
 
     with candidate_csv.open(newline="", encoding="utf-8-sig") as handle:
@@ -328,7 +320,7 @@ def apply_candidate_csv(
 
     progress.stage(
         "APPLY SALESFORCE UPDATES" if apply else "DRY-RUN SF UPDATE PREVIEW",
-        f"{len(rows)} candidate row(s) from {candidate_csv} | "
+        f"{len(rows)} row(s) from {candidate_csv} | "
         f"{'LIVE WRITES' if apply else 'no writes'}",
     )
     results = apply_updates_idempotent(

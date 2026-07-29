@@ -39,6 +39,8 @@ DETAIL_COLUMNS: tuple[str, ...] = (
     "update_site_type",
     "update_verified_site",
     "update_verified_site_source",
+    "sf_update_status",
+    "sf_update_error",
     "error",
 )
 
@@ -52,6 +54,8 @@ CANDIDATE_COLUMNS: tuple[str, ...] = (
     "update_site_type",
     "update_verified_site",
     "update_verified_site_source",
+    "sf_update_status",
+    "sf_update_error",
     "naip_site_type",
     "naip_tower_subtype",
     "naip_site_confidence",

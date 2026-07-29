@@ -1,7 +1,8 @@
-"""CLI: python -m enrichment
+"""CLI: python -m enrichment.
 
-Default is dry-run (build CSVs only). Pass --apply to write Salesforce updates
-from an existing potential_sf_updates.csv.
+With --apply, processed sites are collected first and updated at run end.
+Every processed site gets the test-batch flag; eligible towers also get enrichment fields.
+Each Salesforce update remains isolated so one failure does not stop the rest.
 """
 
 from __future__ import annotations
@@ -19,13 +20,26 @@ if str(ROOT) not in sys.path:
 
 load_dotenv(ROOT / ".env")
 
-from enrichment.constants import CANDIDATE_CSV, PROXIMITY_MAX_M  # noqa: E402
+from enrichment.constants import CANDIDATE_CSV, DETAIL_CSV, PROXIMITY_MAX_M  # noqa: E402
 from enrichment.pipeline import (  # noqa: E402
     apply_candidate_csv,
     default_run_dir,
     run_enrichment,
 )
 from salesforce.sf_client import SalesforceClient  # noqa: E402
+
+
+def _quiet_third_party_loggers() -> None:
+    for name in (
+        "httpx",
+        "httpcore",
+        "google",
+        "google_genai",
+        "google.genai",
+        "urllib3",
+        "openai",
+    ):
+        logging.getLogger(name).setLevel(logging.WARNING)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -62,23 +76,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--apply",
         action="store_true",
         help=(
-            "Apply Salesforce updates from --candidates CSV. "
-            "Without this flag, no Salesforce writes occur."
+            "Flag every processed Salesforce row and update eligible towers "
+            "after enrichment completes"
         ),
     )
     parser.add_argument(
         "--candidates",
         type=Path,
         default=None,
-        help=(
-            f"Candidate CSV for --apply (default: <run-dir>/{CANDIDATE_CSV}). "
-            "When set with --apply, enrichment classify step is skipped."
-        ),
+        help=f"Candidate CSV for --apply-only (default: <run-dir>/{CANDIDATE_CSV})",
     )
     parser.add_argument(
         "--apply-only",
         action="store_true",
-        help="Only apply an existing candidates CSV (requires --candidates or --run-dir)",
+        help="Only apply an existing candidates CSV (requires --apply)",
     )
     parser.add_argument("-v", "--verbose", action="store_true")
     return parser
@@ -87,31 +98,25 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
+        level=logging.WARNING,
         format="%(levelname)s %(message)s",
     )
+    _quiet_third_party_loggers()
 
     run_dir = args.run_dir or default_run_dir(ROOT / "runs")
-    print("=" * 72, flush=True)
-    print("ENRICHMENT — FCC/TowerSource + NAIP (no Nearmap)", flush=True)
-    print(f"  run_dir : {run_dir}", flush=True)
-    print(f"  limit   : {args.limit}", flush=True)
-    print(f"  apply SF: {bool(args.apply)}", flush=True)
-    print("=" * 72, flush=True)
+    print(f"ENRICHMENT | limit={args.limit} | apply={bool(args.apply)} | {run_dir}", flush=True)
 
-    print("\n=== STAGE: AUTHENTICATE SALESFORCE ===", flush=True)
+    print("=== AUTHENTICATE SALESFORCE ===", flush=True)
     sf_client = SalesforceClient()
-    print("  ✓ Salesforce authenticated", flush=True)
+    print("  ✓ authenticated", flush=True)
 
-    if args.apply_only or (args.apply and args.candidates):
-        candidate_csv = args.candidates
-        if candidate_csv is None:
-            candidate_csv = run_dir / CANDIDATE_CSV
+    if args.apply_only:
+        if not args.apply:
+            logging.error("--apply-only requires --apply")
+            return 1
+        candidate_csv = args.candidates or (run_dir / CANDIDATE_CSV)
         if not candidate_csv.exists():
             logging.error("Candidates CSV not found: %s", candidate_csv)
-            return 1
-        if not args.apply:
-            logging.error("--apply-only requires --apply to write to Salesforce")
             return 1
         summary = apply_candidate_csv(
             sf_client=sf_client,
@@ -123,7 +128,6 @@ def main(argv: list[str] | None = None) -> int:
         print(summary)
         return 0 if summary.get("failed", 0) == 0 else 2
 
-    # Enrichment phase — never writes Site__c updates unless --apply with candidates.
     summary = run_enrichment(
         sf_client=sf_client,
         run_dir=run_dir,
@@ -135,7 +139,7 @@ def main(argv: list[str] | None = None) -> int:
     print(summary)
 
     if args.apply:
-        candidate_csv = args.candidates or (run_dir / CANDIDATE_CSV)
+        candidate_csv = run_dir / DETAIL_CSV
         apply_summary = apply_candidate_csv(
             sf_client=sf_client,
             candidate_csv=candidate_csv,
@@ -146,12 +150,6 @@ def main(argv: list[str] | None = None) -> int:
         print(apply_summary)
         return 0 if apply_summary.get("failed", 0) == 0 else 2
 
-    print(
-        f"\nReview CSVs in {run_dir}, then apply with:\n"
-        f"  python -m enrichment --apply --apply-only "
-        f"--candidates {run_dir / CANDIDATE_CSV} -v\n",
-        flush=True,
-    )
     return 0
 
 

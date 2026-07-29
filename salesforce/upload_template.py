@@ -76,6 +76,8 @@ VERIFIED_SITE_SOURCE_VALUES: tuple[str, ...] = (
     "FCC",
     "Google Map",
     "In Person Verified",
+    "NAIP",
+    "NearMap",
     "Permitting Data",
     "ReGrid",
     "Scadacore",

@@ -17,6 +17,7 @@ from enrichment.constants import (
     MATCH_SOURCE_NONE,
     MIN_UPDATE_CONFIDENCE,
     VERIFIED_SITE_SOURCE_FCC,
+    VERIFIED_SITE_SOURCE_NAIP,
 )
 
 
@@ -39,11 +40,12 @@ def bucket_classification(
     """Decide bucket and proposed Salesforce update fields.
 
     Rules:
-    - rooftop → holdout as potential_rooftop (no SF update)
+    - rooftop + cell equipment confirmed (medium/high conf) → potential_update
+    - rooftop without cell equipment → holdout as potential_rooftop
     - other / unclear / no_imagery / errors → holdout as other_or_else
     - tower (medium/high conf) → potential_update
     - DB hit coords preferred for lat/lng; else NAIP asset box; else SF pin
-    - Verified_Site / Source only when a database proximity hit exists
+    - DB hits verify as FCC; NAIP-only hits verify as NAIP
     """
     site_type_raw = str(classified.get("site_type") or "").strip().lower()
     error = classified.get("error")
@@ -54,19 +56,21 @@ def bucket_classification(
         return _holdout(BUCKET_OTHER, holdout_reason, classified)
 
     if site_type_raw == "rooftop":
-        return _holdout(BUCKET_ROOFTOP, "potential_rooftop", classified)
-
-    if site_type_raw in {"other", "unclear"}:
+        if not cell_equipment_confirmed(classified.get("cell_equipment")):
+            return _holdout(BUCKET_ROOFTOP, "potential_rooftop", classified)
+        if not _confidence_ok(classified.get("site_confidence")):
+            return _holdout(BUCKET_ROOFTOP, "low_confidence_rooftop", classified)
+    elif site_type_raw in {"other", "unclear"}:
         return _holdout(BUCKET_OTHER, site_type_raw, classified)
-
-    if site_type_raw != "tower":
+    elif site_type_raw != "tower":
         return _holdout(BUCKET_OTHER, f"else:{site_type_raw}", classified)
-
-    if not _confidence_ok(classified.get("site_confidence")):
+    elif not _confidence_ok(classified.get("site_confidence")):
         return _holdout(BUCKET_OTHER, "low_confidence", classified)
 
     sf_site_type = map_site_type_for_upload(classified)
     if not sf_site_type:
+        if site_type_raw == "rooftop":
+            return _holdout(BUCKET_ROOFTOP, "potential_rooftop", classified)
         return _holdout(BUCKET_OTHER, "unmapped_site_type", classified)
 
     update_lat, update_lng, coord_source = _resolve_update_coords(
@@ -81,6 +85,9 @@ def bucket_classification(
         return _holdout(BUCKET_SKIP, "missing_coordinates", classified)
 
     has_db_hit = match_source != MATCH_SOURCE_NONE
+    verified_source = (
+        VERIFIED_SITE_SOURCE_FCC if has_db_hit else VERIFIED_SITE_SOURCE_NAIP
+    )
     return {
         "bucket": BUCKET_POTENTIAL_UPDATE,
         "holdout_reason": "",
@@ -88,8 +95,8 @@ def bucket_classification(
         "update_lng": update_lng,
         "update_coord_source": coord_source,
         "update_site_type": sf_site_type,
-        "update_verified_site": True if has_db_hit else "",
-        "update_verified_site_source": VERIFIED_SITE_SOURCE_FCC if has_db_hit else "",
+        "update_verified_site": True,
+        "update_verified_site_source": verified_source,
         "cell_equipment": classified.get("cell_equipment"),
         "cell_equipment_confirmed": cell_equipment_confirmed(
             classified.get("cell_equipment")

@@ -192,10 +192,14 @@ class ProximityTests(unittest.TestCase):
 
 
 class BucketTests(unittest.TestCase):
-    def test_rooftop_holdout(self):
+    def test_rooftop_without_cell_equipment_holdout(self):
         decision = bucket_classification(
             match_source=MATCH_SOURCE_FCC,
-            classified={"site_type": "rooftop", "site_confidence": 0.9, "cell_equipment": True},
+            classified={
+                "site_type": "rooftop",
+                "site_confidence": 0.9,
+                "cell_equipment": False,
+            },
             db_lat=43.0,
             db_lng=-89.0,
             sf_lat=43.0,
@@ -204,6 +208,26 @@ class BucketTests(unittest.TestCase):
         self.assertEqual(decision["bucket"], BUCKET_ROOFTOP)
         self.assertEqual(decision["holdout_reason"], "potential_rooftop")
         self.assertEqual(decision["update_site_type"], "")
+
+    def test_rooftop_with_cell_equipment_is_candidate(self):
+        decision = bucket_classification(
+            match_source=MATCH_SOURCE_FCC,
+            classified={
+                "site_type": "rooftop",
+                "site_confidence": 0.85,
+                "cell_equipment": True,
+            },
+            db_lat=43.01,
+            db_lng=-89.01,
+            sf_lat=43.0,
+            sf_lng=-89.0,
+        )
+        self.assertEqual(decision["bucket"], BUCKET_POTENTIAL_UPDATE)
+        self.assertEqual(decision["update_lat"], 43.01)
+        self.assertEqual(decision["update_lng"], -89.01)
+        self.assertEqual(decision["update_site_type"], "Rooftop")
+        self.assertEqual(decision["update_verified_site"], True)
+        self.assertEqual(decision["update_verified_site_source"], "FCC")
 
     def test_other_holdout(self):
         decision = bucket_classification(
@@ -257,14 +281,16 @@ class BucketTests(unittest.TestCase):
         self.assertEqual(decision["update_lat"], 43.002)
         self.assertEqual(decision["update_lng"], -89.003)
         self.assertEqual(decision["update_coord_source"], "naip_asset_box")
-        self.assertEqual(decision["update_verified_site"], "")
-        self.assertEqual(decision["update_verified_site_source"], "")
+        self.assertEqual(decision["update_verified_site"], True)
+        self.assertEqual(decision["update_verified_site_source"], "NAIP")
 
 
 class SoqlTests(unittest.TestCase):
     def test_blank_site_type_query(self):
         soql = build_blank_site_type_query()
         self.assertIn("Site_Type__c = null OR Site_Type__c = ''", soql)
+        self.assertIn("Site_Latitude__c != null", soql)
+        self.assertIn("Site_Longitude__c != null", soql)
         self.assertIn("Enhanced/Unreviewed", soql)
         self.assertIn("Matthew Melendez", soql)
 
