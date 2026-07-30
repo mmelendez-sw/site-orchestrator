@@ -213,7 +213,7 @@ class BucketTests(unittest.TestCase):
         self.assertEqual(decision["holdout_reason"], "potential_rooftop")
         self.assertEqual(decision["update_site_type"], "")
 
-    def test_rooftop_with_cell_equipment_is_candidate(self):
+    def test_rooftop_with_cell_equipment_is_holdout(self):
         decision = bucket_classification(
             match_source=MATCH_SOURCE_FCC,
             classified={
@@ -226,12 +226,11 @@ class BucketTests(unittest.TestCase):
             sf_lat=43.0,
             sf_lng=-89.0,
         )
-        self.assertEqual(decision["bucket"], BUCKET_POTENTIAL_UPDATE)
-        self.assertEqual(decision["update_lat"], 43.01)
-        self.assertEqual(decision["update_lng"], -89.01)
-        self.assertEqual(decision["update_site_type"], "Rooftop")
-        self.assertEqual(decision["update_verified_site"], True)
-        self.assertEqual(decision["update_verified_site_source"], "FCC")
+        self.assertEqual(decision["bucket"], BUCKET_ROOFTOP)
+        self.assertEqual(decision["holdout_reason"], "potential_rooftop")
+        self.assertEqual(decision["update_site_type"], "")
+        self.assertEqual(decision["update_lat"], "")
+        self.assertEqual(decision["update_lng"], "")
 
     def test_other_holdout(self):
         decision = bucket_classification(
@@ -286,6 +285,45 @@ class BucketTests(unittest.TestCase):
             decision["update_verified_site_source"],
             "TowerSource",
         )
+
+    def test_distant_asset_box_is_held_out(self):
+        decision = bucket_classification(
+            match_source=MATCH_SOURCE_FCC,
+            classified={
+                "site_type": "tower",
+                "tower_subtype": "monopole",
+                "site_confidence": 0.8,
+                "cell_equipment": True,
+                "asset_lat": 45.132685,
+                "asset_lon": -93.268497,
+                "asset_offset_m": 149.0,
+            },
+            db_lat=45.131417,
+            db_lng=-93.269111,
+            sf_lat=45.131453,
+            sf_lng=-93.269147,
+        )
+        self.assertEqual(decision["bucket"], BUCKET_OTHER)
+        self.assertIn("asset_offset_149m", decision["holdout_reason"])
+        self.assertEqual(decision["update_site_type"], "")
+
+    def test_nearby_asset_box_still_updates(self):
+        decision = bucket_classification(
+            match_source=MATCH_SOURCE_FCC,
+            classified={
+                "site_type": "tower",
+                "tower_subtype": "monopole",
+                "site_confidence": 0.8,
+                "cell_equipment": True,
+                "asset_offset_m": 12.0,
+            },
+            db_lat=43.01,
+            db_lng=-89.01,
+            sf_lat=43.0,
+            sf_lng=-89.0,
+        )
+        self.assertEqual(decision["bucket"], BUCKET_POTENTIAL_UPDATE)
+        self.assertEqual(decision["update_site_type"], "Monopole")
 
     def test_tower_naip_escalation_uses_asset_box(self):
         decision = bucket_classification(

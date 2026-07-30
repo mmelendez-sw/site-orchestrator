@@ -4,6 +4,10 @@ from __future__ import annotations
 
 PROXIMITY_MAX_M = 50.0
 
+# The imagery model reports where it thinks the asset is. If that lands farther
+# than this from the point we classified, it described a different site.
+MAX_ASSET_OFFSET_M = PROXIMITY_MAX_M
+
 # Degrees buffer used for SQL bbox prefilter (~55 m at mid-latitudes).
 BBOX_BUFFER_DEG = 0.0006
 

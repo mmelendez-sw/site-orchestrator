@@ -168,10 +168,10 @@ def apply_one_update(
             "Verified_Site_Source__c",
         }
         has_enrichment = bool(enrichment_fields.intersection(payload))
-        allowed_types = {"tower", "rooftop"}
+        allowed_types = {"tower"}
         if has_enrichment and naip_site_type not in allowed_types:
             raise ValueError(
-                f"Salesforce updates require NAIP site_type=tower or rooftop; got "
+                f"Salesforce updates require NAIP site_type=tower; got "
                 f"{naip_site_type or 'blank'}"
             )
         if not payload:
