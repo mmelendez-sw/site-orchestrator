@@ -8,7 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
-from enrichment.bucketing import bucket_classification
+from enrichment.bucketing import bucket_classification, verified_source_for_match
 from enrichment.constants import (
     APPLY_LOG_CSV,
     BUCKET_OTHER,
@@ -252,7 +252,9 @@ def _process_site(
             base["update_lng"] = classify_lng
             base["update_coord_source"] = f"db:{base['match_source']}"
             base["update_verified_site"] = True
-            base["update_verified_site_source"] = "FCC"
+            base["update_verified_site_source"] = verified_source_for_match(
+                base["match_source"]
+            )
         else:
             base["bucket"] = BUCKET_OTHER
             base["holdout_reason"] = "skip_classify_no_db_hit"

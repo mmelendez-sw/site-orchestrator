@@ -138,10 +138,6 @@ def apply_one_update(
     from enrichment import progress
 
     sf_id = str(row.get("Id") or row.get("sf_id") or "").strip()
-    match_source = str(row.get("match_source") or "").strip()
-    verified_source = str(row.get("update_verified_site_source") or "").strip()
-    hit_source = match_source if match_source and match_source != "none" else verified_source
-    hit_source = hit_source or "unknown"
     payload = row.get("payload")
     if not isinstance(payload, dict):
         payload = build_update_payload(
@@ -171,8 +167,9 @@ def apply_one_update(
             "Verified_Site__c",
             "Verified_Site_Source__c",
         }
+        has_enrichment = bool(enrichment_fields.intersection(payload))
         allowed_types = {"tower", "rooftop"}
-        if enrichment_fields.intersection(payload) and naip_site_type not in allowed_types:
+        if has_enrichment and naip_site_type not in allowed_types:
             raise ValueError(
                 f"Salesforce updates require NAIP site_type=tower or rooftop; got "
                 f"{naip_site_type or 'blank'}"
@@ -183,17 +180,13 @@ def apply_one_update(
             entry["success"] = True
             entry["status"] = "dry_run"
             if verbose:
-                progress.result(f"SF dry-run OK (not written) | source={hit_source}")
+                progress.result(_format_apply_result(payload, dry_run=True))
             return entry
         update_site(client, sf_id, payload, verbose=False)
         entry["success"] = True
         entry["status"] = "updated"
         if verbose:
-            progress.result(
-                f"SF updated | source={hit_source} | "
-                f"type={payload.get('Site_Type__c') or '—'} | "
-                f"{payload.get('Site_Latitude__c')}, {payload.get('Site_Longitude__c')}"
-            )
+            progress.result(_format_apply_result(payload, dry_run=False))
     except Exception as exc:  # noqa: BLE001 — per-row resilience
         entry["error"] = str(exc)
         entry["status"] = "failed"
@@ -201,6 +194,27 @@ def apply_one_update(
         if verbose:
             progress.warn(f"SF update failed — continuing: {exc}")
     return entry
+
+
+def _format_apply_result(payload: dict[str, Any], *, dry_run: bool) -> str:
+    """Human-readable apply line: enrichment details, or LLM-only flag."""
+    prefix = "SF dry-run OK (not written)" if dry_run else "SF updated"
+    enrichment_fields = {
+        "Site_Latitude__c",
+        "Site_Longitude__c",
+        "Site_Type__c",
+        "Verified_Site__c",
+        "Verified_Site_Source__c",
+    }
+    if not enrichment_fields.intersection(payload):
+        return f"{prefix} | LLM-classified only (no site fields written)"
+
+    site_type = payload.get("Site_Type__c") or "—"
+    verified = payload.get("Verified_Site_Source__c") or "—"
+    lat = payload.get("Site_Latitude__c")
+    lng = payload.get("Site_Longitude__c")
+    coords = f"{lat}, {lng}" if lat is not None and lng is not None else "coords unchanged"
+    return f"{prefix} | verified={verified} | type={site_type} | {coords}"
 
 
 def apply_updates_idempotent(

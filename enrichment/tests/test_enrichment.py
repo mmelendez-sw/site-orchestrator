@@ -266,6 +266,27 @@ class BucketTests(unittest.TestCase):
         self.assertEqual(decision["update_verified_site"], True)
         self.assertEqual(decision["update_verified_site_source"], "FCC")
 
+    def test_towersource_hit_uses_towersource_verified_source(self):
+        decision = bucket_classification(
+            match_source=MATCH_SOURCE_TOWERSOURCE,
+            classified={
+                "site_type": "tower",
+                "tower_subtype": "monopole",
+                "site_confidence": 0.85,
+                "cell_equipment": True,
+            },
+            db_lat=43.01,
+            db_lng=-89.01,
+            sf_lat=43.0,
+            sf_lng=-89.0,
+        )
+        self.assertEqual(decision["bucket"], BUCKET_POTENTIAL_UPDATE)
+        self.assertEqual(decision["update_verified_site"], True)
+        self.assertEqual(
+            decision["update_verified_site_source"],
+            "TowerSource",
+        )
+
     def test_tower_naip_escalation_uses_asset_box(self):
         decision = bucket_classification(
             match_source=MATCH_SOURCE_NONE,
@@ -319,18 +340,31 @@ class SoqlTests(unittest.TestCase):
 
 
 class MssqlConnStringTests(unittest.TestCase):
-    def test_defaults_to_noninteractive_aad(self):
-        import os
-        from unittest.mock import patch
+    def test_defaults_to_token_auth_without_authentication_keyword(self):
+        conn = build_odbc_connection_string(
+            server="example.database.windows.net",
+            database="db",
+            authentication="",
+        )
+        self.assertNotIn("Authentication=", conn)
+        self.assertIn("Server=tcp:example.database.windows.net,1433", conn)
 
-        with patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("AZURE_SQL_ODBC_AUTHENTICATION", None)
-            conn = build_odbc_connection_string(
+    def test_rejects_dotnet_only_auth_value(self):
+        # ActiveDirectoryDefault is not an ODBC value; it maps to token auth.
+        conn = build_odbc_connection_string(
+            server="example.database.windows.net",
+            database="db",
+            authentication="ActiveDirectoryDefault",
+        )
+        self.assertNotIn("Authentication=", conn)
+
+    def test_rejects_unknown_auth_value(self):
+        with self.assertRaises(ValueError):
+            build_odbc_connection_string(
                 server="example.database.windows.net",
                 database="db",
+                authentication="NotARealMode",
             )
-        self.assertIn("Authentication=ActiveDirectoryDefault", conn)
-        self.assertIn("Server=tcp:example.database.windows.net,1433", conn)
 
     def test_rejects_interactive_auth(self):
         with self.assertRaises(ValueError):

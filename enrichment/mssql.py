@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import struct
 from dataclasses import dataclass
 from typing import Any, Iterable, Sequence
 
@@ -42,6 +43,60 @@ _INTERACTIVE_AUTH_MODES = {
     "activedirectorydevicecode",
 }
 
+# Values the ODBC driver itself understands. "ActiveDirectoryDefault" is a
+# .NET SqlClient concept and is rejected by the driver, so it maps to the
+# access-token path below instead.
+_ODBC_AUTH_MODES = {
+    "sqlpassword",
+    "activedirectorypassword",
+    "activedirectoryintegrated",
+    "activedirectoryinteractive",
+    "activedirectorydevicecode",
+    "activedirectoryserviceprincipal",
+    "activedirectorymsi",
+    "activedirectorymanagedidentity",
+}
+
+# Auth handled by azure-identity: acquire a token and hand it to the driver.
+_TOKEN_AUTH_MODES = {"", "accesstoken", "default", "activedirectorydefault"}
+
+SQL_COPT_SS_ACCESS_TOKEN = 1256
+AZURE_SQL_SCOPE = "https://database.windows.net/.default"
+
+
+def resolve_authentication(authentication: str | None = None) -> str:
+    """Normalize the configured auth mode; '' means access-token auth."""
+    resolved = (
+        authentication
+        if authentication is not None
+        else os.environ.get("AZURE_SQL_ODBC_AUTHENTICATION", "")
+    ).strip()
+
+    if resolved.lower() in _TOKEN_AUTH_MODES:
+        return ""
+
+    if resolved.lower() not in _ODBC_AUTH_MODES:
+        raise ValueError(
+            f"Unsupported AZURE_SQL_ODBC_AUTHENTICATION={resolved!r}. "
+            "Leave it blank for non-interactive token auth (az login / managed "
+            "identity), or use one of: "
+            "ActiveDirectoryServicePrincipal, ActiveDirectoryIntegrated, "
+            "ActiveDirectoryPassword, SqlPassword."
+        )
+
+    allow_interactive = (
+        os.environ.get("AZURE_SQL_ALLOW_INTERACTIVE", "").strip().lower()
+        in {"1", "true", "yes"}
+    )
+    if resolved.lower() in _INTERACTIVE_AUTH_MODES and not allow_interactive:
+        raise ValueError(
+            f"Refusing interactive SQL auth ({resolved}). "
+            "Leave AZURE_SQL_ODBC_AUTHENTICATION blank for token auth, or use "
+            "ActiveDirectoryServicePrincipal with AZURE_SQL_UID/PWD. "
+            "Set AZURE_SQL_ALLOW_INTERACTIVE=1 only if you intentionally want a browser prompt."
+        )
+    return resolved
+
 
 def build_odbc_connection_string(
     *,
@@ -54,9 +109,9 @@ def build_odbc_connection_string(
 ) -> str:
     """Build an ODBC connection string from env or explicit overrides.
 
-    Default auth is ActiveDirectoryDefault (non-interactive): uses Azure CLI /
-    VS Code / environment / managed-identity credentials. For headless automation
-    prefer ActiveDirectoryServicePrincipal with AZURE_SQL_UID / AZURE_SQL_PWD.
+    With no explicit auth mode the string carries no credentials; callers pair it
+    with an Entra access token (see connect_mssql), which works non-interactively
+    from `az login`, environment credentials, or a managed identity.
     """
     server = (server or os.environ.get("AZURE_SQL_SERVER") or "").strip()
     database = (database or os.environ.get("AZURE_SQL_DATABASE") or "").strip()
@@ -65,32 +120,13 @@ def build_odbc_connection_string(
         or os.environ.get("AZURE_SQL_DRIVER")
         or "ODBC Driver 18 for SQL Server"
     ).strip()
-    authentication = (
-        authentication
-        if authentication is not None
-        else (
-            os.environ.get("AZURE_SQL_ODBC_AUTHENTICATION")
-            or "ActiveDirectoryDefault"
-        )
-    ).strip()
+    authentication = resolve_authentication(authentication)
     uid = uid if uid is not None else os.environ.get("AZURE_SQL_UID", "").strip()
     pwd = pwd if pwd is not None else os.environ.get("AZURE_SQL_PWD", "").strip()
 
     if not server or not database:
         raise ValueError(
             "AZURE_SQL_SERVER and AZURE_SQL_DATABASE must be set in the environment"
-        )
-
-    allow_interactive = (
-        os.environ.get("AZURE_SQL_ALLOW_INTERACTIVE", "").strip().lower()
-        in {"1", "true", "yes"}
-    )
-    if authentication.lower() in _INTERACTIVE_AUTH_MODES and not allow_interactive:
-        raise ValueError(
-            f"Refusing interactive SQL auth ({authentication}). "
-            "Use ActiveDirectoryDefault (az login / managed identity) or "
-            "ActiveDirectoryServicePrincipal with AZURE_SQL_UID/PWD. "
-            "Set AZURE_SQL_ALLOW_INTERACTIVE=1 only if you intentionally want a browser prompt."
         )
 
     if authentication.lower() == "activedirectoryserviceprincipal" and (
@@ -110,11 +146,27 @@ def build_odbc_connection_string(
     ]
     if authentication:
         parts.append(f"Authentication={authentication}")
-    if uid:
-        parts.append(f"Uid={uid}")
-    if pwd:
-        parts.append(f"Pwd={pwd}")
+        if uid:
+            parts.append(f"Uid={uid}")
+        if pwd:
+            parts.append(f"Pwd={pwd}")
     return ";".join(parts)
+
+
+def _access_token_struct() -> bytes:
+    """Fetch an Entra token for Azure SQL in the packed form ODBC expects."""
+    try:
+        from azure.identity import DefaultAzureCredential
+    except ImportError as exc:  # pragma: no cover
+        raise ImportError(
+            "azure-identity is required for non-interactive Azure SQL auth. "
+            "Install with: pip install azure-identity"
+        ) from exc
+
+    credential = DefaultAzureCredential(exclude_interactive_browser_credential=True)
+    token = credential.get_token(AZURE_SQL_SCOPE).token
+    encoded = token.encode("utf-16-le")
+    return struct.pack("<I", len(encoded)) + encoded
 
 
 def connect_mssql(connection_string: str | None = None):
@@ -128,7 +180,14 @@ def connect_mssql(connection_string: str | None = None):
         ) from exc
 
     conn_str = connection_string or build_odbc_connection_string()
+    use_token = connection_string is None and not resolve_authentication()
     logger.info("Connecting to Azure SQL…")
+    if use_token:
+        return pyodbc.connect(
+            conn_str,
+            timeout=30,
+            attrs_before={SQL_COPT_SS_ACCESS_TOKEN: _access_token_struct()},
+        )
     return pyodbc.connect(conn_str, timeout=30)
 
 

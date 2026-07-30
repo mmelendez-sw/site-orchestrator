@@ -15,9 +15,11 @@ from enrichment.constants import (
     BUCKET_ROOFTOP,
     BUCKET_SKIP,
     MATCH_SOURCE_NONE,
+    MATCH_SOURCE_TOWERSOURCE,
     MIN_UPDATE_CONFIDENCE,
     VERIFIED_SITE_SOURCE_FCC,
     VERIFIED_SITE_SOURCE_NAIP,
+    VERIFIED_SITE_SOURCE_TOWERSOURCE,
 )
 
 
@@ -26,6 +28,15 @@ def _confidence_ok(value: Any, minimum: float = MIN_UPDATE_CONFIDENCE) -> bool:
         return float(value) >= minimum
     except (TypeError, ValueError):
         return False
+
+
+def verified_source_for_match(match_source: str) -> str:
+    """Map an enrichment match source to the Salesforce picklist value."""
+    if match_source == MATCH_SOURCE_TOWERSOURCE:
+        return VERIFIED_SITE_SOURCE_TOWERSOURCE
+    if match_source != MATCH_SOURCE_NONE:
+        return VERIFIED_SITE_SOURCE_FCC
+    return VERIFIED_SITE_SOURCE_NAIP
 
 
 def bucket_classification(
@@ -84,10 +95,7 @@ def bucket_classification(
     if update_lat is None or update_lng is None:
         return _holdout(BUCKET_SKIP, "missing_coordinates", classified)
 
-    has_db_hit = match_source != MATCH_SOURCE_NONE
-    verified_source = (
-        VERIFIED_SITE_SOURCE_FCC if has_db_hit else VERIFIED_SITE_SOURCE_NAIP
-    )
+    verified_source = verified_source_for_match(match_source)
     return {
         "bucket": BUCKET_POTENTIAL_UPDATE,
         "holdout_reason": "",

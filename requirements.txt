@@ -14,3 +14,4 @@ tqdm==4.67.1
 simple-salesforce==1.12.6
 rapidfuzz==3.13.0
 pyodbc==5.2.0
+azure-identity==1.23.1
