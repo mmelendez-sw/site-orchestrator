@@ -362,6 +362,7 @@ class SoqlTests(unittest.TestCase):
             soql,
         )
         self.assertIn("Matthew Melendez", soql)
+        self.assertNotIn("Site Acquisition Team", soql)
 
     def test_excluded_stages_remain_excluded_when_requested(self):
         soql = build_blank_site_type_query(

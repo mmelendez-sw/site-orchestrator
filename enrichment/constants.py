@@ -43,7 +43,7 @@ EXCLUDED_STAGE_FILTER = (
 )
 
 DEFAULT_OWNER_FILTER = (
-    "Site Acquisition Team",
+    # "Site Acquisition Team",  # Re-enable after Matthew-only production rollout.
     "Matthew Melendez",
 )
 
