@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
@@ -59,6 +60,7 @@ def run_enrichment(
     """Run proximity + NAIP enrichment and write candidate/holdout CSVs."""
     run_dir.mkdir(parents=True, exist_ok=True)
     chip_dir = run_dir / "chips"
+    progress.reset_run_timer()
 
     progress.stage(
         "START",
@@ -94,6 +96,7 @@ def run_enrichment(
                 f"3/4 SITE {index}/{len(sites)}",
                 f"{sf_id} | {street}, {city}".strip(" |"),
             )
+            site_t0 = time.monotonic()
             row = _process_site(
                 site,
                 cursor=cursor,
@@ -103,6 +106,7 @@ def run_enrichment(
                 chip_dir=chip_dir,
                 verbose=verbose,
             )
+            site_elapsed = time.monotonic() - site_t0
             row.setdefault("sf_update_status", "")
             row.setdefault("sf_update_error", "")
             if row.get("bucket") == BUCKET_POTENTIAL_UPDATE:
@@ -114,7 +118,8 @@ def run_enrichment(
             progress.result(
                 f"{row.get('bucket')} | match={row.get('match_source')} | "
                 f"naip={row.get('naip_site_type') or '—'} | "
-                f"sf={row.get('sf_update_status') or '—'}"
+                f"sf={row.get('sf_update_status') or '—'}",
+                elapsed_s=site_elapsed,
             )
             write_csv(run_dir / DETAIL_CSV, detail_rows, DETAIL_COLUMNS)
 
@@ -320,6 +325,8 @@ def apply_candidate_csv(
     with candidate_csv.open(newline="", encoding="utf-8-sig") as handle:
         rows = list(csv.DictReader(handle))
 
+    if progress.run_elapsed() == 0.0:
+        progress.reset_run_timer()
     progress.stage(
         "APPLY SALESFORCE UPDATES" if apply else "DRY-RUN SF UPDATE PREVIEW",
         f"{len(rows)} row(s) from {candidate_csv} | "

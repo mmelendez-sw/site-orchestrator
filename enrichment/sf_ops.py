@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any, Iterable, Sequence
 
 from salesforce.field_map import OBJECT_NAME
@@ -232,8 +233,21 @@ def apply_updates_idempotent(
     for index, row in enumerate(rows_list, start=1):
         if verbose:
             progress.step(f"[{index}/{len(rows_list)}] Id={row.get('Id') or '—'}")
-        entry = apply_one_update(client, row, dry_run=dry_run, verbose=verbose)
+        row_t0 = time.monotonic()
+        entry = apply_one_update(client, row, dry_run=dry_run, verbose=False)
+        row_elapsed = time.monotonic() - row_t0
         entry["index"] = index
+        if verbose:
+            if entry.get("success"):
+                progress.result(
+                    _format_apply_result(entry.get("payload") or {}, dry_run=dry_run),
+                    elapsed_s=row_elapsed,
+                )
+            else:
+                progress.warn(
+                    f"SF update failed — continuing: {entry.get('error') or 'unknown'}",
+                    elapsed_s=row_elapsed,
+                )
         results.append(entry)
     return results
 

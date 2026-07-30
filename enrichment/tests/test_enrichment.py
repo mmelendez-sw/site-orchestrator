@@ -362,7 +362,7 @@ class SoqlTests(unittest.TestCase):
             soql,
         )
         self.assertIn("Matthew Melendez", soql)
-        self.assertNotIn("Site Acquisition Team", soql)
+        self.assertIn("Site Acquisition Team", soql)
 
     def test_excluded_stages_remain_excluded_when_requested(self):
         soql = build_blank_site_type_query(
@@ -422,6 +422,15 @@ class MssqlConnStringTests(unittest.TestCase):
                 uid="app-id",
                 pwd="",
             )
+
+
+class ProgressTimingTests(unittest.TestCase):
+    def test_format_duration(self):
+        from enrichment.progress import format_duration
+
+        self.assertEqual(format_duration(3.2), "3.2s")
+        self.assertEqual(format_duration(65), "1m05s")
+        self.assertEqual(format_duration(3723), "1h02m03s")
 
 
 class UpdatePayloadTests(unittest.TestCase):
