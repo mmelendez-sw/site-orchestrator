@@ -1,7 +1,7 @@
 """CLI: python -m enrichment.
 
 With --apply, processed sites are collected first and updated at run end.
-Every processed site gets the test-batch flag; eligible towers also get enrichment fields.
+Every processed site is marked LLM-classified; eligible sites also get enrichment fields.
 Each Salesforce update remains isolated so one failure does not stop the rest.
 """
 
@@ -76,7 +76,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--apply",
         action="store_true",
         help=(
-            "Flag every processed Salesforce row and update eligible towers "
+            "Mark every processed Salesforce row LLM-classified and update eligible sites "
             "after enrichment completes"
         ),
     )

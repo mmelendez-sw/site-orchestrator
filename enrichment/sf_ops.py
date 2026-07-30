@@ -86,7 +86,7 @@ def build_update_payload(
     site_type: str | None = None,
     verified_site: bool | None = None,
     verified_site_source: str | None = None,
-    test_batch_flag: bool | None = None,
+    llm_classified: bool | None = None,
 ) -> dict[str, Any]:
     """Build a Site__c update payload (only set fields)."""
     payload: dict[str, Any] = {}
@@ -100,8 +100,8 @@ def build_update_payload(
         payload["Verified_Site__c"] = verified_site
     if verified_site_source:
         payload["Verified_Site_Source__c"] = verified_site_source
-    if test_batch_flag is not None:
-        payload["Test_Batch_Flag__c"] = test_batch_flag
+    if llm_classified is not None:
+        payload["LLM_Classified__c"] = llm_classified
     return payload
 
 
@@ -147,7 +147,7 @@ def apply_one_update(
             site_type=(row.get("update_site_type") or None) or None,
             verified_site=_optional_bool(row.get("update_verified_site")),
             verified_site_source=(row.get("update_verified_site_source") or None) or None,
-            test_batch_flag=True,
+            llm_classified=True,
         )
     entry = {
         "Id": sf_id,

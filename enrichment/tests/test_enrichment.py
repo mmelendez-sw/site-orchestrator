@@ -296,6 +296,10 @@ class SoqlTests(unittest.TestCase):
 
 
 class UpdatePayloadTests(unittest.TestCase):
+    def test_llm_classified_checkbox(self):
+        payload = build_update_payload(llm_classified=True)
+        self.assertEqual(payload, {"LLM_Classified__c": True})
+
     def test_payload_omits_blank(self):
         payload = build_update_payload(
             latitude=1.0,
