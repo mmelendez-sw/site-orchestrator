@@ -11,6 +11,7 @@ from salesforce.sf_client import SalesforceClient, _is_missing
 from enrichment.constants import (
     DEFAULT_OWNER_FILTER,
     DEFAULT_STAGE_FILTER,
+    EXCLUDED_STAGE_FILTER,
     SF_QUERY_FIELDS,
 )
 
@@ -31,14 +32,16 @@ def build_blank_site_type_query(
     owners: Sequence[str] = DEFAULT_OWNER_FILTER,
     fields: Sequence[str] = SF_QUERY_FIELDS,
 ) -> str:
-    """SOQL for Site__c rows with blank/null Site_Type__c in the target queue."""
+    """SOQL for unclassified Site__c rows with blank Site_Type__c in the target queue."""
     field_list = ", ".join(fields)
     return (
         f"SELECT {field_list} FROM {OBJECT_NAME} "
         f"WHERE (Site_Type__c = null OR Site_Type__c = '') "
+        f"AND LLM_Classified__c = false "
         f"AND Site_Latitude__c != null AND Site_Latitude__c != '' "
         f"AND Site_Longitude__c != null AND Site_Longitude__c != '' "
         f"AND Stage__c IN ({_soql_in(stages)}) "
+        f"AND Stage__c NOT IN ({_soql_in(EXCLUDED_STAGE_FILTER)}) "
         f"AND Owner__c IN ({_soql_in(owners)})"
     )
 

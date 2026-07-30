@@ -30,7 +30,12 @@ DEFAULT_STAGE_FILTER = (
     "Enhanced/Unreviewed",
     "New/Unreviewed",
     "Outreach",
-    "Outreach - Verified",
+)
+
+# Hard exclusion applied independently of the caller-provided stage filter.
+EXCLUDED_STAGE_FILTER = (
+    "Working-Connected",
+    "Qualified (Converted)",
 )
 
 DEFAULT_OWNER_FILTER = (

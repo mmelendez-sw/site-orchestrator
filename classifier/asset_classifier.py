@@ -122,7 +122,7 @@ MODELS = [
 ]
 _model_idx = 0
 API_DELAY_S = float(os.environ.get("CLAUDE_DELAY_S", "12"))
-GEMINI_DELAY_S = float(os.environ.get("GEMINI_DELAY_S", "30"))
+GEMINI_DELAY_S = float(os.environ.get("GEMINI_DELAY_S", "5"))
 GEMINI_RETRIES = int(os.environ.get("GEMINI_RETRIES", "6"))
 GEMINI_RETRY_BASE_S = float(os.environ.get("GEMINI_RETRY_BASE_S", "20"))
 INPUT_CSV = "data/assets.csv"    # columns: id; lat+lon OR address; optional: label, input_confidence

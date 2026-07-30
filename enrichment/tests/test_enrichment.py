@@ -13,7 +13,11 @@ from enrichment.constants import (
     MATCH_SOURCE_NONE,
     MATCH_SOURCE_TOWERSOURCE,
 )
-from enrichment.mssql import fcc_coordinates, find_proximity_hit
+from enrichment.mssql import (
+    build_odbc_connection_string,
+    fcc_coordinates,
+    find_proximity_hit,
+)
 from enrichment.sf_ops import build_blank_site_type_query, build_update_payload
 
 
@@ -289,10 +293,62 @@ class SoqlTests(unittest.TestCase):
     def test_blank_site_type_query(self):
         soql = build_blank_site_type_query()
         self.assertIn("Site_Type__c = null OR Site_Type__c = ''", soql)
+        self.assertIn("LLM_Classified__c = false", soql)
         self.assertIn("Site_Latitude__c != null", soql)
         self.assertIn("Site_Longitude__c != null", soql)
         self.assertIn("Enhanced/Unreviewed", soql)
+        self.assertNotIn("Outreach - Verified", soql)
+        self.assertIn(
+            "Stage__c NOT IN ('Working-Connected', 'Qualified (Converted)')",
+            soql,
+        )
         self.assertIn("Matthew Melendez", soql)
+
+    def test_excluded_stages_remain_excluded_when_requested(self):
+        soql = build_blank_site_type_query(
+            stages=("Outreach", "Working-Connected", "Qualified (Converted)")
+        )
+        self.assertIn(
+            "Stage__c IN ('Outreach', 'Working-Connected', 'Qualified (Converted)')",
+            soql,
+        )
+        self.assertIn(
+            "Stage__c NOT IN ('Working-Connected', 'Qualified (Converted)')",
+            soql,
+        )
+
+
+class MssqlConnStringTests(unittest.TestCase):
+    def test_defaults_to_noninteractive_aad(self):
+        import os
+        from unittest.mock import patch
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("AZURE_SQL_ODBC_AUTHENTICATION", None)
+            conn = build_odbc_connection_string(
+                server="example.database.windows.net",
+                database="db",
+            )
+        self.assertIn("Authentication=ActiveDirectoryDefault", conn)
+        self.assertIn("Server=tcp:example.database.windows.net,1433", conn)
+
+    def test_rejects_interactive_auth(self):
+        with self.assertRaises(ValueError):
+            build_odbc_connection_string(
+                server="example.database.windows.net",
+                database="db",
+                authentication="ActiveDirectoryInteractive",
+            )
+
+    def test_service_principal_requires_secrets(self):
+        with self.assertRaises(ValueError):
+            build_odbc_connection_string(
+                server="example.database.windows.net",
+                database="db",
+                authentication="ActiveDirectoryServicePrincipal",
+                uid="app-id",
+                pwd="",
+            )
 
 
 class UpdatePayloadTests(unittest.TestCase):

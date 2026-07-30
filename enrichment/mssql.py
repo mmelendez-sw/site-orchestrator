@@ -36,6 +36,13 @@ class ProximityHit:
     raw: dict[str, Any] | None = None
 
 
+# Browser / device-code flows — blocked unless AZURE_SQL_ALLOW_INTERACTIVE=1.
+_INTERACTIVE_AUTH_MODES = {
+    "activedirectoryinteractive",
+    "activedirectorydevicecode",
+}
+
+
 def build_odbc_connection_string(
     *,
     server: str | None = None,
@@ -45,7 +52,12 @@ def build_odbc_connection_string(
     uid: str | None = None,
     pwd: str | None = None,
 ) -> str:
-    """Build an ODBC connection string from env or explicit overrides."""
+    """Build an ODBC connection string from env or explicit overrides.
+
+    Default auth is ActiveDirectoryDefault (non-interactive): uses Azure CLI /
+    VS Code / environment / managed-identity credentials. For headless automation
+    prefer ActiveDirectoryServicePrincipal with AZURE_SQL_UID / AZURE_SQL_PWD.
+    """
     server = (server or os.environ.get("AZURE_SQL_SERVER") or "").strip()
     database = (database or os.environ.get("AZURE_SQL_DATABASE") or "").strip()
     driver = (
@@ -55,8 +67,11 @@ def build_odbc_connection_string(
     ).strip()
     authentication = (
         authentication
-        or os.environ.get("AZURE_SQL_ODBC_AUTHENTICATION")
-        or ""
+        if authentication is not None
+        else (
+            os.environ.get("AZURE_SQL_ODBC_AUTHENTICATION")
+            or "ActiveDirectoryDefault"
+        )
     ).strip()
     uid = uid if uid is not None else os.environ.get("AZURE_SQL_UID", "").strip()
     pwd = pwd if pwd is not None else os.environ.get("AZURE_SQL_PWD", "").strip()
@@ -64,6 +79,26 @@ def build_odbc_connection_string(
     if not server or not database:
         raise ValueError(
             "AZURE_SQL_SERVER and AZURE_SQL_DATABASE must be set in the environment"
+        )
+
+    allow_interactive = (
+        os.environ.get("AZURE_SQL_ALLOW_INTERACTIVE", "").strip().lower()
+        in {"1", "true", "yes"}
+    )
+    if authentication.lower() in _INTERACTIVE_AUTH_MODES and not allow_interactive:
+        raise ValueError(
+            f"Refusing interactive SQL auth ({authentication}). "
+            "Use ActiveDirectoryDefault (az login / managed identity) or "
+            "ActiveDirectoryServicePrincipal with AZURE_SQL_UID/PWD. "
+            "Set AZURE_SQL_ALLOW_INTERACTIVE=1 only if you intentionally want a browser prompt."
+        )
+
+    if authentication.lower() == "activedirectoryserviceprincipal" and (
+        not uid or not pwd
+    ):
+        raise ValueError(
+            "ActiveDirectoryServicePrincipal requires AZURE_SQL_UID (app id) "
+            "and AZURE_SQL_PWD (client secret)"
         )
 
     parts = [

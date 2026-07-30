@@ -63,7 +63,7 @@ Boolean flags: set to `1`, `true`, or `yes` to enable. Default is `0` (off).
 | `CLAUDE_MODELS` | `claude-sonnet-4-6,claude-haiku-4-5-20251001` | Comma-separated Claude models. First is primary; hops to next on rate limits or 404. Used when `BIFURCATED_AI=0`, or for Claude escalation / wide-AOI / zoom when bifurcated. |
 | `CLAUDE_ESCALATION_MODEL` | `claude-sonnet-4-6` | Fixed Claude model for bifurcated escalation (does not use fallback chain). |
 | `GEMINI_MODEL` | `gemini-2.5-flash` | Gemini model for first pass when `BIFURCATED_AI=1` or `GEMINI_ONLY=1`. |
-| `GEMINI_DELAY_S` | `30` | Seconds between assets when Gemini is the primary provider. |
+| `GEMINI_DELAY_S` | `5` | Seconds between assets when Gemini is the primary provider. |
 | `GEMINI_RETRIES` | `6` | Retries per Gemini call on transient `429` / `503` errors. |
 | `GEMINI_RETRY_BASE_S` | `20` | Base backoff seconds for Gemini retries (doubles each attempt, cap 120s). |
 | `NAIP_WIDE_CHIP_M` | `500` | Wide NAIP chip side length (meters) when `WIDE_AOI_STAGE=1`. |
@@ -178,7 +178,7 @@ GEMINI_API_KEY=your-gemini-key
 
 ```powershell
 # Fast local debug — NAIP only, Gemini tower screening, no Nearmap/Claude quota
-$env:NAIP_ONLY="1"; $env:GEMINI_ONLY="1"; $env:TOWER_ONLY="1"; $env:ZOOM_STAGE="0"; $env:GEMINI_MODEL="gemini-3.1-flash-lite"; $env:GEMINI_DELAY_S="30"; python classifier/asset_classifier.py -i data/no_match_naip_150.csv
+$env:NAIP_ONLY="1"; $env:GEMINI_ONLY="1"; $env:TOWER_ONLY="1"; $env:ZOOM_STAGE="0"; $env:GEMINI_MODEL="gemini-3.1-flash-lite"; $env:GEMINI_DELAY_S="5"; python classifier/asset_classifier.py -i data/no_match_naip_150.csv
 
 # Production-style tiered + bifurcated (set keys in .env first)
 $env:NEARMAP_TIERED="1"; $env:BIFURCATED_AI="1"; python asset_classifier.py -i dc-assets.csv
