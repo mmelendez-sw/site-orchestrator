@@ -18,6 +18,24 @@ from enrichment.constants import (
 
 logger = logging.getLogger(__name__)
 
+# Site fields written for tower enrichment (vs LLM_Classified__c-only updates).
+ENRICHMENT_FIELDS = frozenset(
+    {
+        "Site_Latitude__c",
+        "Site_Longitude__c",
+        "Site_Type__c",
+        "Verified_Site__c",
+        "Verified_Site_Source__c",
+    }
+)
+
+
+def is_enrichment_payload(payload: dict[str, Any] | None) -> bool:
+    """True when the payload updates tower/site fields, not only LLM_Classified__c."""
+    if not payload:
+        return False
+    return bool(ENRICHMENT_FIELDS.intersection(payload))
+
 
 def _soql_quote(value: str) -> str:
     return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
@@ -161,14 +179,7 @@ def apply_one_update(
         if not sf_id:
             raise ValueError("Missing Salesforce Id")
         naip_site_type = str(row.get("naip_site_type") or "").strip().lower()
-        enrichment_fields = {
-            "Site_Latitude__c",
-            "Site_Longitude__c",
-            "Site_Type__c",
-            "Verified_Site__c",
-            "Verified_Site_Source__c",
-        }
-        has_enrichment = bool(enrichment_fields.intersection(payload))
+        has_enrichment = is_enrichment_payload(payload)
         allowed_types = {"tower"}
         if has_enrichment and naip_site_type not in allowed_types:
             raise ValueError(
@@ -200,14 +211,7 @@ def apply_one_update(
 def _format_apply_result(payload: dict[str, Any], *, dry_run: bool) -> str:
     """Human-readable apply line: enrichment details, or LLM-only flag."""
     prefix = "SF dry-run OK (not written)" if dry_run else "SF updated"
-    enrichment_fields = {
-        "Site_Latitude__c",
-        "Site_Longitude__c",
-        "Site_Type__c",
-        "Verified_Site__c",
-        "Verified_Site_Source__c",
-    }
-    if not enrichment_fields.intersection(payload):
+    if not is_enrichment_payload(payload):
         return f"{prefix} | LLM-classified only (no site fields written)"
 
     site_type = payload.get("Site_Type__c") or "—"

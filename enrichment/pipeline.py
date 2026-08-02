@@ -32,6 +32,7 @@ from enrichment.outputs import (
 from enrichment import progress
 from enrichment.sf_ops import (
     apply_updates_idempotent,
+    is_enrichment_payload,
     parse_sf_lat_lng,
     query_blank_site_type_sites,
 )
@@ -368,12 +369,25 @@ def apply_candidate_csv(
             "payload_json",
         ),
     )
+    tower_updated = sum(
+        1
+        for r in results
+        if r.get("success") and is_enrichment_payload(r.get("payload"))
+    )
+    llm_classified = sum(
+        1
+        for r in results
+        if r.get("success") and not is_enrichment_payload(r.get("payload"))
+    )
+    failed = sum(1 for r in results if not r.get("success"))
     summary = {
         "total": len(results),
-        "success": sum(1 for r in results if r.get("success")),
-        "failed": sum(1 for r in results if not r.get("success")),
+        "success": tower_updated,
+        "llm_classified": llm_classified,
+        "failed": failed,
         "apply": apply,
         "log": str(log_path),
     }
+    progress.dump_summary(summary)
     logger.info("Apply summary: %s", summary)
     return summary
