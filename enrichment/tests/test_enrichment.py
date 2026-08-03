@@ -363,6 +363,7 @@ class SoqlTests(unittest.TestCase):
         )
         self.assertIn("Matthew Melendez", soql)
         self.assertIn("Site Acquisition Team", soql)
+        self.assertIn("Site_Street__c LIKE '4%'", soql)
 
     def test_excluded_stages_remain_excluded_when_requested(self):
         soql = build_blank_site_type_query(
@@ -438,6 +439,13 @@ class UpdatePayloadTests(unittest.TestCase):
         payload = build_update_payload(llm_classified=True)
         self.assertEqual(payload, {"LLM_Classified__c": True})
 
+    def test_test_batch_flag(self):
+        payload = build_update_payload(llm_classified=True, test_batch_flag=True)
+        self.assertEqual(
+            payload,
+            {"LLM_Classified__c": True, "Test_Batch_Flag__c": True},
+        )
+
     def test_payload_omits_blank(self):
         payload = build_update_payload(
             latitude=1.0,
@@ -456,6 +464,114 @@ class UpdatePayloadTests(unittest.TestCase):
                 "Verified_Site_Source__c": "FCC",
             },
         )
+
+
+class _FakeSiteSObject:
+    def __init__(self, fail_payloads_containing=None):
+        self.calls: list[tuple[str, dict]] = []
+        self._fail_if = fail_payloads_containing or []
+
+    def update(self, record_id, payload):
+        self.calls.append((record_id, dict(payload)))
+        for needle in self._fail_if:
+            if needle in payload:
+                raise RuntimeError(
+                    "[{'errorCode': 'DUPLICATES_DETECTED', "
+                    "'message': 'Same site address exists in the system.'}]"
+                )
+        return 204
+
+
+class _FakeSF:
+    def __init__(self, site_sobject):
+        self.Site__c = site_sobject
+
+
+class _FakeClient:
+    def __init__(self, site_sobject):
+        self.sf = _FakeSF(site_sobject)
+
+
+class DuplicateFallbackTests(unittest.TestCase):
+    def test_enrichment_duplicate_retries_llm_and_test_batch(self):
+        from enrichment.sf_ops import apply_one_update
+
+        site = _FakeSiteSObject(fail_payloads_containing=["Site_Type__c"])
+        client = _FakeClient(site)
+        row = {
+            "Id": "a0ZTEST000000001",
+            "naip_site_type": "tower",
+            "payload": {
+                "Site_Latitude__c": 1.0,
+                "Site_Longitude__c": 2.0,
+                "Site_Type__c": "Monopole",
+                "Verified_Site__c": True,
+                "Verified_Site_Source__c": "FCC",
+                "LLM_Classified__c": True,
+            },
+        }
+        entry = apply_one_update(client, row, dry_run=False, verbose=False)
+        self.assertTrue(entry["success"])
+        self.assertEqual(entry["status"], "updated_llm_after_duplicate")
+        self.assertEqual(
+            entry["payload"],
+            {"LLM_Classified__c": True, "Test_Batch_Flag__c": True},
+        )
+        self.assertIn("DUPLICATES_DETECTED", entry["error"])
+        self.assertEqual(len(site.calls), 2)
+        self.assertIn("Site_Type__c", site.calls[0][1])
+        self.assertEqual(
+            site.calls[1][1],
+            {"LLM_Classified__c": True, "Test_Batch_Flag__c": True},
+        )
+
+    def test_non_duplicate_failure_does_not_fallback(self):
+        from enrichment.sf_ops import apply_one_update
+
+        class BoomSite:
+            calls = []
+
+            def update(self, record_id, payload):
+                self.calls.append((record_id, dict(payload)))
+                raise RuntimeError("REQUEST_LIMIT_EXCEEDED")
+
+        site = BoomSite()
+        entry = apply_one_update(
+            _FakeClient(site),
+            {
+                "Id": "a0ZTEST000000002",
+                "naip_site_type": "tower",
+                "payload": {
+                    "Site_Type__c": "Monopole",
+                    "Site_Latitude__c": 1.0,
+                    "Site_Longitude__c": 2.0,
+                    "LLM_Classified__c": True,
+                },
+            },
+            dry_run=False,
+            verbose=False,
+        )
+        self.assertFalse(entry["success"])
+        self.assertEqual(entry["status"], "failed")
+        self.assertEqual(len(site.calls), 1)
+
+    def test_llm_only_duplicate_does_not_retry(self):
+        from enrichment.sf_ops import apply_one_update
+
+        site = _FakeSiteSObject(fail_payloads_containing=["LLM_Classified__c"])
+        entry = apply_one_update(
+            _FakeClient(site),
+            {
+                "Id": "a0ZTEST000000003",
+                "naip_site_type": "other",
+                "payload": {"LLM_Classified__c": True},
+            },
+            dry_run=False,
+            verbose=False,
+        )
+        self.assertFalse(entry["success"])
+        self.assertEqual(entry["status"], "failed")
+        self.assertEqual(len(site.calls), 1)
 
 
 if __name__ == "__main__":

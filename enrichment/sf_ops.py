@@ -61,7 +61,8 @@ def build_blank_site_type_query(
         f"AND Site_Longitude__c != null AND Site_Longitude__c != '' "
         f"AND Stage__c IN ({_soql_in(stages)}) "
         f"AND Stage__c NOT IN ({_soql_in(EXCLUDED_STAGE_FILTER)}) "
-        f"AND Owner__c IN ({_soql_in(owners)})"
+        f"AND Owner__c IN ({_soql_in(owners)}) "
+        f"AND Site_Street__c LIKE '4%'"
     )
 
 
@@ -101,6 +102,13 @@ def parse_sf_lat_lng(row: dict[str, Any]) -> tuple[float, float] | None:
         return None
 
 
+# Fallback when Site_Duplicate_Rule blocks enrichment field writes.
+DUPLICATE_FALLBACK_PAYLOAD = {
+    "LLM_Classified__c": True,
+    "Test_Batch_Flag__c": True,
+}
+
+
 def build_update_payload(
     *,
     latitude: float | None = None,
@@ -109,6 +117,7 @@ def build_update_payload(
     verified_site: bool | None = None,
     verified_site_source: str | None = None,
     llm_classified: bool | None = None,
+    test_batch_flag: bool | None = None,
 ) -> dict[str, Any]:
     """Build a Site__c update payload (only set fields)."""
     payload: dict[str, Any] = {}
@@ -124,7 +133,22 @@ def build_update_payload(
         payload["Verified_Site_Source__c"] = verified_site_source
     if llm_classified is not None:
         payload["LLM_Classified__c"] = llm_classified
+    if test_batch_flag is not None:
+        payload["Test_Batch_Flag__c"] = test_batch_flag
     return payload
+
+
+def _is_duplicates_detected(exc: BaseException) -> bool:
+    """True when Salesforce rejected the update for Site_Duplicate_Rule."""
+    return "DUPLICATES_DETECTED" in str(exc)
+
+
+def _is_duplicate_fallback_payload(payload: dict[str, Any] | None) -> bool:
+    if not payload:
+        return False
+    return set(payload) == set(DUPLICATE_FALLBACK_PAYLOAD) and all(
+        payload.get(key) == value for key, value in DUPLICATE_FALLBACK_PAYLOAD.items()
+    )
 
 
 def update_site(
@@ -153,7 +177,11 @@ def apply_one_update(
     dry_run: bool = False,
     verbose: bool = True,
 ) -> dict[str, Any]:
-    """Update a single enrichment candidate row; never raises."""
+    """Update a single enrichment candidate row; never raises.
+
+    On DUPLICATES_DETECTED for an enrichment payload, retries once with
+    LLM_Classified__c + Test_Batch_Flag__c only so the site leaves the queue.
+    """
     from enrichment import progress
 
     sf_id = str(row.get("Id") or row.get("sf_id") or "").strip()
@@ -200,6 +228,46 @@ def apply_one_update(
         if verbose:
             progress.result(_format_apply_result(payload, dry_run=False))
     except Exception as exc:  # noqa: BLE001 — per-row resilience
+        if (
+            not dry_run
+            and sf_id
+            and _is_duplicates_detected(exc)
+            and is_enrichment_payload(payload)
+            and not _is_duplicate_fallback_payload(payload)
+        ):
+            fallback = dict(DUPLICATE_FALLBACK_PAYLOAD)
+            try:
+                update_site(client, sf_id, fallback, verbose=False)
+                entry["success"] = True
+                entry["status"] = "updated_llm_after_duplicate"
+                entry["payload"] = fallback
+                entry["error"] = f"fallback after DUPLICATES_DETECTED: {exc}"
+                logger.warning(
+                    "enrichment blocked by duplicate for %s — wrote LLM/Test_Batch only",
+                    sf_id,
+                )
+                if verbose:
+                    progress.warn(
+                        "SF duplicate blocked enrichment — "
+                        "wrote LLM-classified + Test_Batch_Flag only"
+                    )
+                return entry
+            except Exception as fallback_exc:  # noqa: BLE001
+                entry["error"] = (
+                    f"DUPLICATES_DETECTED fallback also failed: {fallback_exc} "
+                    f"(original: {exc})"
+                )
+                entry["status"] = "failed"
+                entry["payload"] = fallback
+                logger.warning(
+                    "duplicate fallback failed for %s: %s", sf_id, fallback_exc
+                )
+                if verbose:
+                    progress.warn(
+                        f"SF update failed — continuing: {entry['error']}"
+                    )
+                return entry
+
         entry["error"] = str(exc)
         entry["status"] = "failed"
         logger.warning("update failed for %s: %s", sf_id, exc)
@@ -208,9 +276,19 @@ def apply_one_update(
     return entry
 
 
-def _format_apply_result(payload: dict[str, Any], *, dry_run: bool) -> str:
+def _format_apply_result(
+    payload: dict[str, Any],
+    *,
+    dry_run: bool,
+    status: str = "",
+) -> str:
     """Human-readable apply line: enrichment details, or LLM-only flag."""
     prefix = "SF dry-run OK (not written)" if dry_run else "SF updated"
+    if status == "updated_llm_after_duplicate":
+        return (
+            f"{prefix} | duplicate fallback | "
+            "LLM-classified + Test_Batch_Flag (no site fields written)"
+        )
     if not is_enrichment_payload(payload):
         return f"{prefix} | LLM-classified only (no site fields written)"
 
@@ -244,7 +322,11 @@ def apply_updates_idempotent(
         if verbose:
             if entry.get("success"):
                 progress.result(
-                    _format_apply_result(entry.get("payload") or {}, dry_run=dry_run),
+                    _format_apply_result(
+                        entry.get("payload") or {},
+                        dry_run=dry_run,
+                        status=str(entry.get("status") or ""),
+                    ),
                     elapsed_s=row_elapsed,
                 )
             else:
