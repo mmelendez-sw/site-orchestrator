@@ -45,6 +45,7 @@ EXCLUDED_STAGE_FILTER = (
 DEFAULT_OWNER_FILTER = (
     "Site Acquisition Team",
     "Matthew Melendez",
+    "Marketing Campaign",
 )
 
 MATCH_SOURCE_FCC = "FCC"
