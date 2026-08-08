@@ -43,6 +43,21 @@ python -m enrichment --limit 20
 python -m enrichment --apply --apply-only --candidates runs\<run>\potential_sf_updates.csv
 ```
 
+**Reprocess holdouts (Nearmap + Claude) — use local data, do not reset `LLM_Classified__c`:**
+holdouts were already marked classified so they leave the blank-`Site_Type` queue.
+Address-pin / rural offset cases need a different pass, not another NAIP enrichment pull.
+
+```powershell
+python scripts/coalesce_enrichment_latest.py
+python scripts/export_reprocess_cohorts.py
+# → runs/_artifacts/reprocess_cohorts/...
+```
+
+Run folders are grouped by **pipeline process** under `runs/`:
+- `enrichment/sf_blank_site_type_naip_aug2026/` — blank Site_Type → NAIP → SF update
+- `pipeline_e2e/` — CSV → dedupe → Nearmap/Claude → SF create
+- `csv_sf_upload/` — `sf_upload.csv` creates
+
 Classifier-specific docs live in [`classifier/docs/`](classifier/docs/) (configuration, workflow guides, diagrams).
 
 ## Setup

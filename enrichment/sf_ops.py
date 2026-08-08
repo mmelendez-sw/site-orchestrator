@@ -62,7 +62,7 @@ def build_blank_site_type_query(
         f"AND Stage__c IN ({_soql_in(stages)})"
         f"AND Stage__c NOT IN ({_soql_in(EXCLUDED_STAGE_FILTER)}) "
         f"AND Owner__c IN ({_soql_in(owners)})"
-        f"AND (Site_Street__c LIKE '2%')"
+        #f"AND (Site_Street__c LIKE '2%')"
     )
 
 
