@@ -59,10 +59,10 @@ def build_blank_site_type_query(
         f"AND LLM_Classified__c = false "
         f"AND Site_Latitude__c != null AND Site_Latitude__c != '' "
         f"AND Site_Longitude__c != null AND Site_Longitude__c != '' "
-        f"AND Stage__c IN ({_soql_in(stages)}) "
+        f"AND Stage__c IN ({_soql_in(stages)})"
         f"AND Stage__c NOT IN ({_soql_in(EXCLUDED_STAGE_FILTER)}) "
-        f"AND Owner__c IN ({_soql_in(owners)}) "
-        f"AND Site_Street__c LIKE '1%'"
+        f"AND Owner__c IN ({_soql_in(owners)})"
+        f"AND (Site_Street__c LIKE '2%')"
     )
 
 
@@ -313,8 +313,14 @@ def apply_updates_idempotent(
     rows_list = list(rows)
     results: list[dict[str, Any]] = []
     for index, row in enumerate(rows_list, start=1):
+        sf_id = str(row.get("Id") or row.get("sf_id") or "").strip()
+        address = progress.format_site_address(row)
         if verbose:
-            progress.step(f"[{index}/{len(rows_list)}] Id={row.get('Id') or '—'}")
+            progress.step(f"[{index}/{len(rows_list)}] Id={sf_id or '—'}")
+        else:
+            progress.row_count(
+                index, len(rows_list), sf_id=sf_id, address=address
+            )
         row_t0 = time.monotonic()
         entry = apply_one_update(client, row, dry_run=dry_run, verbose=False)
         row_elapsed = time.monotonic() - row_t0

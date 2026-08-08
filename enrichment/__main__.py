@@ -91,7 +91,15 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Only apply an existing candidates CSV (requires --apply)",
     )
-    parser.add_argument("-v", "--verbose", action="store_true")
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help=(
+            "Print full stage banners and per-step details "
+            "(default: compact [n/N] Id | address | run time)"
+        ),
+    )
     return parser
 
 
@@ -123,7 +131,7 @@ def main(argv: list[str] | None = None) -> int:
             candidate_csv=candidate_csv,
             run_dir=run_dir,
             apply=True,
-            verbose=True,
+            verbose=args.verbose,
         )
         print(summary)
         return 0 if summary.get("failed", 0) == 0 else 2
@@ -134,7 +142,7 @@ def main(argv: list[str] | None = None) -> int:
         limit=args.limit,
         max_m=args.max_m,
         skip_classify=args.skip_classify,
-        verbose=True,
+        verbose=args.verbose,
     )
     print(summary)
 
@@ -145,7 +153,7 @@ def main(argv: list[str] | None = None) -> int:
             candidate_csv=candidate_csv,
             run_dir=run_dir,
             apply=True,
-            verbose=True,
+            verbose=args.verbose,
         )
         print(apply_summary)
         return 0 if apply_summary.get("failed", 0) == 0 else 2

@@ -63,6 +63,32 @@ def step(message: str) -> None:
     print(f"  → {message}", flush=True)
 
 
+def row_count(
+    index: int,
+    total: int,
+    *,
+    sf_id: str = "",
+    address: str = "",
+) -> None:
+    """Compact per-row progress: count, Salesforce Id, address, run elapsed."""
+    sid = (sf_id or "").strip() or "—"
+    addr = (address or "").strip() or "—"
+    print(
+        f"[{index}/{total}] {sid} | {addr} | run {format_duration(run_elapsed())}",
+        flush=True,
+    )
+
+
+def format_site_address(row: dict[str, Any]) -> str:
+    """Street, city, state from an SF/enrichment row."""
+    parts = [
+        str(row.get("Site_Street__c") or "").strip(),
+        str(row.get("Site_City__c") or "").strip(),
+        str(row.get("Site_State__c") or "").strip(),
+    ]
+    return ", ".join(p for p in parts if p)
+
+
 def result(message: str, *, elapsed_s: float | None = None) -> None:
     """Print a success line; elapsed_s overrides stage elapsed when provided."""
     seconds = stage_elapsed() if elapsed_s is None else elapsed_s
