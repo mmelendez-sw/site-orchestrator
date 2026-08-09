@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-PROXIMITY_MAX_M = 50.0
+PROXIMITY_MAX_M = 25.0
 
 # The imagery model reports where it thinks the asset is. If that lands farther
 # than this from the point we classified, it described a different site.
 MAX_ASSET_OFFSET_M = PROXIMITY_MAX_M
 
-# Degrees buffer used for SQL bbox prefilter (~55 m at mid-latitudes).
-BBOX_BUFFER_DEG = 0.0006
+# Degrees buffer used for SQL bbox prefilter (~25–30 m at mid-latitudes).
+BBOX_BUFFER_DEG = 0.0003
 
 FCC_TABLE = "dbo.FCCTowerData"
 TOWERSOURCE_TABLE = "dbo.TowerSourceASRTowers"
@@ -69,3 +69,6 @@ APPLY_LOG_CSV = "sf_update_apply_log.csv"
 
 # Medium/high confidence required for automatic update candidacy.
 MIN_UPDATE_CONFIDENCE = 0.6
+
+# Rooftop cell gear must clear this bar (when the model reports a confidence).
+MIN_ROOFTOP_CELL_CONFIDENCE = 0.75

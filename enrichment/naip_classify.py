@@ -346,6 +346,14 @@ def classify_site_imagery(
                 f"escalated ({escalation_reason_str}) → {res.get('site_type')}"
             )
 
+    # Final HVAC false-positive guard for rooftop cell=true.
+    res = ac.maybe_recheck_rooftop_cell_false_positive(
+        primary_provider if not escalation_model else "claude",
+        clients,
+        res,
+        views,
+    )
+
     asset_lat = asset_lon = asset_offset_m = None
     box, box_view = res.get("asset_box_2d"), res.get("asset_view")
     if box and ac._is_naip_view(box_view) and naip_geo:

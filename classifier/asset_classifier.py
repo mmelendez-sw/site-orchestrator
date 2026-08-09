@@ -203,10 +203,11 @@ antennas - monopole, lattice/self-support tower, or guyed mast. Top-down cues: \
 tiny footprint, long thin linear shadow, lattice cross-pattern, guy wires, \
 small cleared/fenced compound with equipment cabinets. Oblique cues: a tall \
 thin structure rising far above its surroundings.
-- ROOFTOP SITE: a building whose roof hosts the cellular equipment. Cues: \
-panel antennas / sector frames at roof corners or edges (often 3 sectors), \
-triangular/rectangular antenna mounts, microwave backhaul dishes, equipment \
-cabinets with cable trays, short masts on the parapet.
+- ROOFTOP SITE: a building whose roof hosts cellular telecom equipment. True \
+cues: panel antennas / sector frames at roof corners or edges (often 3 sectors), \
+triangular or steel antenna mounts, microwave backhaul dishes, RRUs, telecom \
+cabinets with cable trays, short masts or poles carrying panel antennas on the \
+parapet. Ordinary building mechanicals alone are NOT a rooftop cell site.
 - STEALTH / BUILDING-TOWER SITE: a structure that looks like a building but \
 has a tall narrow tower section - church steeple, clock tower, faux-building \
 monopole, or a tower segment rising from one corner of a larger footprint. \
@@ -249,17 +250,27 @@ clearest instead.
 - asset_view: the exact label of the view the box was drawn on (e.g. "NAIP \
 top-down"). Set both fields to null only if no asset can be located at all.
 
-TASK 3 - cell_equipment: is cellular equipment visible on the located asset \
-(antennas, sector frames, dishes, cabinets, cable trays)?
-- true: visible evidence; false: none visible; null: cannot assess (resolution \
-or viewing angle insufficient).
-On rooftops, equipment is often missed when it sits in **building shadow**, \
-along shaded parapets, or reads similarly to HVAC. In oblique views, inspect \
-sunlit AND shaded roof edges, corners, and mechanical zones before calling \
-false.
+TASK 3 - cell_equipment: is cellular telecom equipment visible on the located asset?
+- true: clear visible evidence of cellular gear; false: none visible; null: cannot \
+assess (resolution or viewing angle insufficient). Prefer null over true when unsure.
+TRUE only for cellular/telecom hardware, for example:
+- Panel / sector antennas (flat vertical rectangles on frames, often ~3 sectors)
+- Microwave / backhaul dishes, RRUs, cable trays feeding antenna mounts
+- Short masts or poles on the parapet carrying antennas
+- Telecom equipment cabinets clearly paired with antenna mounts (not alone)
+FALSE / NOT cellular (very common false positives — do not mark true):
+- HVAC condensers, chillers, air handlers, cooling towers
+- Roof vents, pipes, stacks, drains, skylights, access hatches
+- Solar panels, satellite TV dishes for building use, water tanks
+- Random dark rectangles in neat rows across a roof (typical multi-zone HVAC)
+On rooftops, gear is often missed when it sits in **building shadow** or along \
+shaded parapets. In oblique views, inspect sunlit AND shaded roof edges, corners, \
+and mechanical zones before calling false. Top-down-only HVAC clusters must never \
+be called cellular.
 
 Field meanings: site_evidence and cell_equipment_evidence are one short \
-sentence each, citing the specific views and cues used.
+sentence each, citing the specific views and cues used. For cell_equipment true, \
+evidence must name the antenna/dish/mount cue — not "equipment on roof".
 """
 
 TOWER_ONLY_CLASSIFICATION_PROMPT = """\
@@ -337,19 +348,20 @@ INPUT_CONFIDENCE_PROMPTS = {
     "high": (
         "\n\nSOURCE TRUST: HIGH. The coordinate comes from a trusted source that "
         "expects an active cellular asset at this location. Prioritize finding "
-        "the host structure and any cellular equipment. Do not call "
-        "cell_equipment false from a quick scan - inspect roof edges, parapets, "
-        "and shaded areas on oblique views. Prefer null over false when "
-        "imagery is ambiguous."
+        "the host structure and any cellular equipment. Inspect roof edges, "
+        "parapets, and shaded areas on oblique views. Prefer null over false "
+        "when imagery is ambiguous — but never mark HVAC or ordinary roof "
+        "mechanicals as cell_equipment true."
     ),
     "medium": (
         "\n\nSOURCE TRUST: MEDIUM. The coordinate likely points to a cellular "
         "site but may be approximate. Weight oblique views when assessing "
-        "rooftop equipment in shadow."
+        "rooftop equipment in shadow. Do not confuse HVAC with cellular gear."
     ),
     "low": (
         "\n\nSOURCE TRUST: LOW. The coordinate is exploratory; apply normal "
-        "evidence standards."
+        "evidence standards. Prefer null/false over true for cell_equipment "
+        "when cues are ambiguous."
     ),
 }
 
@@ -361,11 +373,32 @@ here.
 Re-examine every view - especially Nearmap obliques and shaded roof areas:
 - Thin rectangular panel antennas on parapets or short masts
 - Sector frames at roof corners (often three sectors)
-- Microwave dishes, RRUs, cable trays, equipment cabinets
-- Gear hidden in building shadow or mistaken for HVAC
+- Microwave dishes, RRUs, cable trays, telecom cabinets paired with mounts
 
-Return the same JSON schema. If any plausible cellular equipment is visible, \
-set cell_equipment true and explain which view and shaded/sunlit area shows it.
+Do NOT flip to true for HVAC condensers, vents, pipes, skylights, drains, or \
+rows of identical mechanical units. Prefer null over true when ambiguous.
+
+Return the same JSON schema. If any clear cellular equipment is visible, \
+set cell_equipment true and explain which view shows the antenna/dish/mount.
+"""
+
+EQUIPMENT_FALSE_POSITIVE_RECHECK_PROMPT = """\
+You previously set cell_equipment=true on a rooftop. Perform a STRICT \
+false-positive check against ordinary building mechanicals.
+
+Confirm TRUE only if you see unmistakable cellular/telecom hardware \
+(panel/sector antennas, microwave dishes, RRUs, parapet masts with antennas, \
+telecom cabinets feeding antenna mounts).
+
+Set cell_equipment=false when the objects are HVAC, vents, pipes, skylights, \
+drains, solar, or other non-telecom roof plant — including neat rows of dark \
+rectangles typical of multi-zone condensers.
+
+Set cell_equipment=null if top-down resolution cannot distinguish HVAC from \
+antennas and no oblique view confirms antennas.
+
+Return the same JSON schema. Update cell_equipment_evidence to cite the \
+decisive cue (or why it is HVAC / ambiguous).
 """
 
 # Enforced via Claude tool input_schema so every reply parses into this shape.
@@ -649,6 +682,42 @@ def maybe_recheck_equipment(provider: str, clients: dict, res: dict, views: list
     else:
         _step_done("equipment recheck", "still no cell gear")
     return res
+
+
+def maybe_recheck_rooftop_cell_false_positive(
+    provider: str, clients: dict, res: dict, views: list
+) -> dict:
+    """Downgrade rooftop cell_equipment=true when HVAC is more likely."""
+    if str(res.get("site_type") or "").strip().lower() != "rooftop":
+        return res
+    if res.get("cell_equipment") is not True:
+        return res
+    if not views:
+        return res
+    recheck = classify_site(
+        provider, clients, views, prompt=EQUIPMENT_FALSE_POSITIVE_RECHECK_PROMPT
+    )
+    new_cell = recheck.get("cell_equipment")
+    if new_cell is True:
+        res["cell_equipment_confidence"] = recheck.get(
+            "cell_equipment_confidence", res.get("cell_equipment_confidence")
+        )
+        res["cell_equipment_evidence"] = recheck.get(
+            "cell_equipment_evidence", res.get("cell_equipment_evidence")
+        )
+        normalize_model_result(res)
+        _step_done("cell FP recheck", "confirmed cellular")
+        return res
+    res["cell_equipment"] = new_cell  # false or null
+    if "cell_equipment_confidence" in recheck:
+        res["cell_equipment_confidence"] = recheck.get("cell_equipment_confidence")
+    if recheck.get("cell_equipment_evidence"):
+        res["cell_equipment_evidence"] = recheck.get("cell_equipment_evidence")
+    normalize_model_result(res)
+    label = "downgraded to false" if new_cell is False else "downgraded to null"
+    _step_done("cell FP recheck", label)
+    return res
+
 
 # ----------------------------- geocoding ------------------------------------
 
@@ -1231,6 +1300,9 @@ def naip_age_blocks_early_stop(
 
 def escalation_reason(res: dict) -> str | None:
     """Why a Gemini result should escalate to Claude; None if no escalation."""
+    # Definitive no-gear after Nearmap/Gemini — don't burn Claude credits.
+    if res.get("cell_equipment") is False:
+        return None
     if res.get("site_type") == "other":
         return "other_type"
     if res.get("site_type") == "unclear":
@@ -1300,6 +1372,7 @@ def classify_with_tiers(lat: float, lon: float, img: Image.Image | None,
     views = build_views(nearmap_views)
     res = classify_site(provider, clients, views, prompt=prompt)
     res = maybe_recheck_equipment(provider, clients, res, views, input_confidence)
+    res = maybe_recheck_rooftop_cell_false_positive(provider, clients, res, views)
     _step_done("classify (Nearmap vert)", _brief_pass_result(res))
     if tier_confident_stop(res):
         return res, nearmap_views, nearmap_date, "vert_only", views
@@ -1318,6 +1391,7 @@ def classify_with_tiers(lat: float, lon: float, img: Image.Image | None,
     views = build_views(nearmap_views)
     res = classify_site(provider, clients, views, prompt=prompt)
     res = maybe_recheck_equipment(provider, clients, res, views, input_confidence)
+    res = maybe_recheck_rooftop_cell_false_positive(provider, clients, res, views)
     _step_done("classify (Nearmap obliques)", _brief_pass_result(res))
     return res, nearmap_views, nearmap_date, "full", views
 
@@ -2436,6 +2510,12 @@ def main():
                         res, clients, views, prompt, input_confidence,
                         allow=True))
 
+            fp_provider = (
+                "claude" if escalation_model else primary_provider
+            )
+            res = maybe_recheck_rooftop_cell_false_positive(
+                fp_provider, clients, res, views
+            )
 
             # Convert the detection box to real-world coordinates - only valid
             # when the box was drawn on the georeferenced NAIP chip

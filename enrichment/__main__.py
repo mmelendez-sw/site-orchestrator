@@ -66,7 +66,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-m",
         type=float,
         default=PROXIMITY_MAX_M,
-        help="Proximity radius in meters (default: 50)",
+        help="Proximity radius in meters (default: 25)",
     )
     parser.add_argument(
         "--skip-classify",

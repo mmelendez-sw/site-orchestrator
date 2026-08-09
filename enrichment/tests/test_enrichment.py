@@ -210,27 +210,51 @@ class BucketTests(unittest.TestCase):
             sf_lng=-89.0,
         )
         self.assertEqual(decision["bucket"], BUCKET_ROOFTOP)
-        self.assertEqual(decision["holdout_reason"], "potential_rooftop")
+        self.assertEqual(decision["holdout_reason"], "rooftop_no_cell_equipment")
         self.assertEqual(decision["update_site_type"], "")
 
-    def test_rooftop_with_cell_equipment_is_holdout(self):
+    def test_rooftop_with_cell_equipment_is_candidate(self):
         decision = bucket_classification(
             match_source=MATCH_SOURCE_FCC,
             classified={
                 "site_type": "rooftop",
                 "site_confidence": 0.85,
                 "cell_equipment": True,
+                "cell_equipment_confidence": 0.9,
+                "nearmap_tier": "vert_only",
+                "nearmap_views": "Vert",
             },
             db_lat=43.01,
             db_lng=-89.01,
             sf_lat=43.0,
             sf_lng=-89.0,
         )
+        self.assertEqual(decision["bucket"], BUCKET_POTENTIAL_UPDATE)
+        self.assertEqual(decision["holdout_reason"], "")
+        self.assertEqual(decision["update_site_type"], "Rooftop")
+        self.assertEqual(decision["update_lat"], 43.01)
+        self.assertEqual(decision["update_lng"], -89.01)
+        self.assertEqual(decision["update_verified_site"], True)
+        self.assertEqual(decision["update_verified_site_source"], "FCC")
+
+    def test_rooftop_low_cell_confidence_is_held_out(self):
+        decision = bucket_classification(
+            match_source=MATCH_SOURCE_NONE,
+            classified={
+                "site_type": "rooftop",
+                "site_confidence": 0.9,
+                "cell_equipment": True,
+                "cell_equipment_confidence": 0.4,
+                "nearmap_tier": "vert_only",
+                "nearmap_views": "Vert",
+            },
+            db_lat=None,
+            db_lng=None,
+            sf_lat=43.0,
+            sf_lng=-89.0,
+        )
         self.assertEqual(decision["bucket"], BUCKET_ROOFTOP)
-        self.assertEqual(decision["holdout_reason"], "potential_rooftop")
-        self.assertEqual(decision["update_site_type"], "")
-        self.assertEqual(decision["update_lat"], "")
-        self.assertEqual(decision["update_lng"], "")
+        self.assertEqual(decision["holdout_reason"], "rooftop_low_cell_confidence")
 
     def test_other_holdout(self):
         decision = bucket_classification(
@@ -334,6 +358,7 @@ class BucketTests(unittest.TestCase):
                 "site_confidence": 0.7,
                 "asset_lat": 43.002,
                 "asset_lon": -89.003,
+                "nearmap_tier": "naip_only",
             },
             db_lat=None,
             db_lng=None,
@@ -346,6 +371,26 @@ class BucketTests(unittest.TestCase):
         self.assertEqual(decision["update_coord_source"], "naip_asset_box")
         self.assertEqual(decision["update_verified_site"], True)
         self.assertEqual(decision["update_verified_site_source"], "NAIP")
+
+    def test_nearmap_imagery_sets_verified_nearmap(self):
+        decision = bucket_classification(
+            match_source=MATCH_SOURCE_NONE,
+            classified={
+                "site_type": "rooftop",
+                "site_confidence": 0.9,
+                "cell_equipment": True,
+                "cell_equipment_confidence": 0.85,
+                "nearmap_tier": "vert_only",
+                "nearmap_views": "Vert",
+            },
+            db_lat=None,
+            db_lng=None,
+            sf_lat=43.0,
+            sf_lng=-89.0,
+        )
+        self.assertEqual(decision["bucket"], BUCKET_POTENTIAL_UPDATE)
+        self.assertEqual(decision["update_site_type"], "Rooftop")
+        self.assertEqual(decision["update_verified_site_source"], "NearMap")
 
 
 class SoqlTests(unittest.TestCase):

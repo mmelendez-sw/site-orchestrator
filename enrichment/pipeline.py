@@ -9,7 +9,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
-from enrichment.bucketing import bucket_classification, verified_source_for_match
+from enrichment.bucketing import (
+    bucket_classification,
+    imagery_bucket,
+    verified_source_for_match,
+)
 from enrichment.constants import (
     APPLY_LOG_CSV,
     BUCKET_OTHER,
@@ -128,8 +132,11 @@ def run_enrichment(
             detail_rows.append(row)
             if verbose:
                 progress.result(
-                    f"{row.get('bucket')} | match={row.get('match_source')} | "
-                    f"naip={row.get('naip_site_type') or '—'} | "
+                    f"{row.get('bucket')} | type={row.get('naip_site_type') or '—'} | "
+                    f"img={row.get('imagery_used') or '—'} | "
+                    f"tier={row.get('nearmap_tier') or '—'} | "
+                    f"ai={row.get('escalation_model') or row.get('primary_model') or '—'} | "
+                    f"src={row.get('update_verified_site_source') or '—'} | "
                     f"sf={row.get('sf_update_status') or '—'}",
                     elapsed_s=site_elapsed,
                 )
@@ -160,6 +167,25 @@ def run_enrichment(
             "holdout_rooftop": sum(1 for r in holdouts if r.get("bucket") == BUCKET_ROOFTOP),
             "holdout_other": sum(1 for r in holdouts if r.get("bucket") == BUCKET_OTHER),
             "errors": sum(1 for r in detail_rows if r.get("error")),
+            "imagery_naip_only": sum(
+                1 for r in detail_rows if r.get("imagery_used") == "naip"
+            ),
+            "imagery_nearmap_vert": sum(
+                1 for r in detail_rows if r.get("imagery_used") == "nearmap_vert"
+            ),
+            "imagery_nearmap_oblique": sum(
+                1 for r in detail_rows if r.get("imagery_used") == "nearmap_oblique"
+            ),
+            "gemini_sites": sum(
+                1
+                for r in detail_rows
+                if str(r.get("primary_model") or "").lower() == "gemini"
+            ),
+            "claude_escalations": sum(
+                1
+                for r in detail_rows
+                if str(r.get("escalation_model") or "").lower() == "claude"
+            ),
         }
         (run_dir / "summary.json").write_text(
             json.dumps(summary, indent=2), encoding="utf-8"
@@ -209,6 +235,13 @@ def _process_site(
         "naip_tower_subtype": "",
         "naip_site_confidence": "",
         "naip_cell_equipment": "",
+        "classification_stage": "",
+        "nearmap_tier": "",
+        "nearmap_views": "",
+        "imagery_used": "",
+        "primary_model": "",
+        "escalation_model": "",
+        "escalation_reason": "",
         "asset_lat": "",
         "asset_lon": "",
         "asset_offset_m": "",
@@ -315,6 +348,13 @@ def _process_site(
     base["naip_tower_subtype"] = classified.get("tower_subtype") or ""
     base["naip_site_confidence"] = classified.get("site_confidence") or ""
     base["naip_cell_equipment"] = classified.get("cell_equipment")
+    base["classification_stage"] = classified.get("classification_stage") or ""
+    base["nearmap_tier"] = classified.get("nearmap_tier") or ""
+    base["nearmap_views"] = classified.get("nearmap_views") or ""
+    base["imagery_used"] = imagery_bucket(classified)
+    base["primary_model"] = classified.get("primary_model") or ""
+    base["escalation_model"] = classified.get("escalation_model") or ""
+    base["escalation_reason"] = classified.get("escalation_reason") or ""
     base["asset_lat"] = classified.get("asset_lat") or ""
     base["asset_lon"] = classified.get("asset_lon") or ""
     base["asset_offset_m"] = classified.get("asset_offset_m") or ""

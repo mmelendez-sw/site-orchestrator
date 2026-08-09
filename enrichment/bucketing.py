@@ -17,9 +17,11 @@ from enrichment.constants import (
     MATCH_SOURCE_NONE,
     MATCH_SOURCE_TOWERSOURCE,
     MAX_ASSET_OFFSET_M,
+    MIN_ROOFTOP_CELL_CONFIDENCE,
     MIN_UPDATE_CONFIDENCE,
     VERIFIED_SITE_SOURCE_FCC,
     VERIFIED_SITE_SOURCE_NAIP,
+    VERIFIED_SITE_SOURCE_NEARMAP,
     VERIFIED_SITE_SOURCE_TOWERSOURCE,
 )
 
@@ -29,6 +31,14 @@ def _confidence_ok(value: Any, minimum: float = MIN_UPDATE_CONFIDENCE) -> bool:
         return float(value) >= minimum
     except (TypeError, ValueError):
         return False
+
+
+def _rooftop_cell_confidence_ok(classified: dict[str, Any]) -> bool:
+    """When cell confidence is reported, require the rooftop minimum."""
+    raw = classified.get("cell_equipment_confidence")
+    if raw is None or str(raw).strip() == "":
+        return True
+    return _confidence_ok(raw, MIN_ROOFTOP_CELL_CONFIDENCE)
 
 
 def _asset_offset_too_far(
@@ -43,13 +53,50 @@ def _asset_offset_too_far(
     return offset if offset > maximum else None
 
 
-def verified_source_for_match(match_source: str) -> str:
-    """Map an enrichment match source to the Salesforce picklist value."""
+def verified_source_for_match(
+    match_source: str,
+    *,
+    classified: dict[str, Any] | None = None,
+) -> str:
+    """Map match + imagery used to the Salesforce Verified_Site_Source__c value."""
     if match_source == MATCH_SOURCE_TOWERSOURCE:
         return VERIFIED_SITE_SOURCE_TOWERSOURCE
     if match_source != MATCH_SOURCE_NONE:
         return VERIFIED_SITE_SOURCE_FCC
+    if classified and _used_nearmap_imagery(classified):
+        return VERIFIED_SITE_SOURCE_NEARMAP
     return VERIFIED_SITE_SOURCE_NAIP
+
+
+def _used_nearmap_imagery(classified: dict[str, Any]) -> bool:
+    """True when classification consumed Nearmap (vert and/or obliques)."""
+    tier = str(classified.get("nearmap_tier") or "").strip().lower()
+    if tier in {"vert_only", "full", "wide_aoi", "zoom"}:
+        return True
+    views = str(classified.get("nearmap_views") or "").strip()
+    if not views:
+        return False
+    # Explicit NAIP-only tiers should not flip to NearMap just from empty leftovers.
+    if tier in {"naip_only", "naip_wide"}:
+        return False
+    return True
+
+
+def imagery_bucket(classified_or_row: dict[str, Any]) -> str:
+    """Coarse imagery label for run summaries: naip | nearmap_vert | nearmap_oblique."""
+    tier = str(
+        classified_or_row.get("nearmap_tier")
+        or classified_or_row.get("classification_stage")
+        or ""
+    ).strip().lower()
+    views = str(classified_or_row.get("nearmap_views") or "")
+    view_parts = {p.strip() for p in views.split(",") if p.strip()}
+    has_oblique = bool(view_parts - {"Vert"}) or tier == "full"
+    if tier in {"full", "wide_aoi", "zoom"} or has_oblique:
+        return "nearmap_oblique"
+    if tier in {"vert_only"} or "Vert" in view_parts:
+        return "nearmap_vert"
+    return "naip"
 
 
 def bucket_classification(
@@ -64,13 +111,15 @@ def bucket_classification(
     """Decide bucket and proposed Salesforce update fields.
 
     Rules:
-    - rooftop → always holdout as potential_rooftop (NAIP rooftop signals are
-      unreliable; Nearmap stage will handle rooftops later)
     - other / unclear / no_imagery / errors → holdout as other_or_else
-    - tower (medium/high conf) → potential_update
-    - asset located beyond MAX_ASSET_OFFSET_M from the classified point → holdout
+    - tower or rooftop (medium/high conf) → potential_update
+      (rooftop requires confirmed cell_equipment; maps to Site_Type__c = Rooftop)
+    - rooftop without cell gear / low conf → holdout as potential_rooftop
+    - tower asset located beyond MAX_ASSET_OFFSET_M → holdout
+      (rooftops still update Site Type; far boxes fall back to the SF pin)
     - DB hit coords preferred for lat/lng; else NAIP asset box; else SF pin
-    - DB hits verify as FCC/TowerSource; NAIP-only hits verify as NAIP
+    - DB hits verify as FCC/TowerSource; imagery-only hits verify as NearMap
+      when Nearmap was used, else NAIP
     """
     site_type_raw = str(classified.get("site_type") or "").strip().lower()
     error = classified.get("error")
@@ -80,11 +129,8 @@ def bucket_classification(
         holdout_reason = str(error or site_type_raw or "no_classification")
         return _holdout(BUCKET_OTHER, holdout_reason, classified)
 
-    if site_type_raw == "rooftop":
-        return _holdout(BUCKET_ROOFTOP, "potential_rooftop", classified)
-
     far_offset = _asset_offset_too_far(classified)
-    if far_offset is not None:
+    if far_offset is not None and site_type_raw != "rooftop":
         return _holdout(
             BUCKET_OTHER,
             f"asset_offset_{far_offset:g}m_exceeds_{MAX_ASSET_OFFSET_M:g}m",
@@ -93,27 +139,41 @@ def bucket_classification(
 
     if site_type_raw in {"other", "unclear"}:
         return _holdout(BUCKET_OTHER, site_type_raw, classified)
-    if site_type_raw != "tower":
+    if site_type_raw not in {"tower", "rooftop"}:
         return _holdout(BUCKET_OTHER, f"else:{site_type_raw}", classified)
     if not _confidence_ok(classified.get("site_confidence")):
+        if site_type_raw == "rooftop":
+            return _holdout(BUCKET_ROOFTOP, "low_confidence", classified)
         return _holdout(BUCKET_OTHER, "low_confidence", classified)
 
     sf_site_type = map_site_type_for_upload(classified)
     if not sf_site_type:
+        if site_type_raw == "rooftop":
+            return _holdout(BUCKET_ROOFTOP, "rooftop_no_cell_equipment", classified)
         return _holdout(BUCKET_OTHER, "unmapped_site_type", classified)
 
-    update_lat, update_lng, coord_source = _resolve_update_coords(
-        match_source=match_source,
-        classified=classified,
-        db_lat=db_lat,
-        db_lng=db_lng,
-        sf_lat=sf_lat,
-        sf_lng=sf_lng,
-    )
+    if site_type_raw == "rooftop" and not _rooftop_cell_confidence_ok(classified):
+        return _holdout(BUCKET_ROOFTOP, "rooftop_low_cell_confidence", classified)
+
+    if site_type_raw == "rooftop" and far_offset is not None:
+        if sf_lat is None or sf_lng is None:
+            return _holdout(BUCKET_SKIP, "missing_coordinates", classified)
+        update_lat, update_lng, coord_source = sf_lat, sf_lng, "sf_pin"
+    else:
+        update_lat, update_lng, coord_source = _resolve_update_coords(
+            match_source=match_source,
+            classified=classified,
+            db_lat=db_lat,
+            db_lng=db_lng,
+            sf_lat=sf_lat,
+            sf_lng=sf_lng,
+        )
     if update_lat is None or update_lng is None:
         return _holdout(BUCKET_SKIP, "missing_coordinates", classified)
 
-    verified_source = verified_source_for_match(match_source)
+    verified_source = verified_source_for_match(
+        match_source, classified=classified
+    )
     return {
         "bucket": BUCKET_POTENTIAL_UPDATE,
         "holdout_reason": "",
