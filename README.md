@@ -10,14 +10,17 @@ source → ingest → dedupe → classifier → salesforce
 
 ```
 site-orchestrator/
-├── orchestrator.py          # wires the full pipeline
+├── orchestrator.py          # CSV/permits → dedupe → classify → SF create
+├── tower_snap.py            # FCC/TowerSource proximity helpers
+├── enrichment/              # SF pull → proximity → Nearmap/AI → SF update
 ├── requirements.txt
 ├── .env.example
 ├── source/                  # permit discovery (gov data, CSV/JSON, scripts)
 ├── ingest/                  # geocode + normalize to canonical records
 ├── dedupe/                  # Salesforce spatial + fuzzy dedupe
-├── classifier/              # NAIP/Nearmap imagery + Claude classification
-├── salesforce/              # create sites + duplicate audit logging
+├── classifier/              # NAIP/Nearmap imagery + Gemini/Claude classification
+├── salesforce/              # create/update Site__c
+├── scripts/                 # one-off upload/retry helpers
 ├── data/                    # input CSVs (gitignored)
 ├── runs/                    # runtime outputs (gitignored)
 └── chips/                   # saved imagery chips (gitignored)
@@ -117,6 +120,18 @@ python orchestrator.py --source file --input data/WI_assets.csv --state WI --cla
 python scripts/export_sf_upload.py --input runs/dedupe_2026-06-18_155235/dedupe_results.csv
 ```
 
+### 6. Salesforce enrichment (update existing sites)
+
+Pull existing `Site__c` rows (e.g. NFL leasing source + blank Site Type), run FCC/TowerSource proximity + Nearmap/bifurcated classify, write candidate/holdout CSVs. Add `--apply` only when ready to update Salesforce.
+
+```powershell
+# Classify only (no SF writes)
+python -m enrichment --limit 25 -v
+
+# Classify + apply updates
+python -m enrichment --limit 25 --apply -v
+```
+
 ## Run the full orchestrator
 
 ```powershell
@@ -144,6 +159,8 @@ Runtime outputs (`runs/`, `chips/`, `results.csv`) are gitignored and stay local
 ## Branch workflow
 
 - **`main`** — stable
+- **`nearmap-run`** — Nearmap/bifurcated classify + enrichment (ops candidate)
+- **`salesforce-update`** — prior enrichment/SF-update work
 - **`dev`** — active development
 
 ## Further reading

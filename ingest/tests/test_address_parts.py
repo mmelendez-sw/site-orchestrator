@@ -44,3 +44,26 @@ def test_parse_address_components_nominatim_full_state_name():
     )
     assert parts["site_state"] == "WI"
     assert parts["zip_code"] == "53225"
+
+
+def test_parse_address_components_nominatim_dc_ward():
+    parts = parse_address_components(
+        "1201, 4th Street Southeast, Capitol Waterfront Neighborhood, "
+        "Ward 8, Washington, District of Columbia, 20003, United States"
+    )
+    assert parts["site_street"] is not None
+    assert parts["site_street"].lower().startswith("1201 4th street southeast")
+    assert parts["site_city"] == "Washington"
+    assert parts["site_state"] == "DC"
+    assert parts["zip_code"] == "20003"
+
+
+def test_parse_address_components_nominatim_dc_poi_prefix():
+    parts = parse_address_components(
+        "Humane Rescue Alliance, 1201, New York Avenue Northeast, Ivy City, "
+        "Northeast, Ward 5, Washington, District of Columbia, 20002, United States"
+    )
+    assert parts["site_street"] == "1201 New York Avenue Northeast"
+    assert parts["site_city"] == "Washington"
+    assert parts["site_state"] == "DC"
+    assert parts["zip_code"] == "20002"

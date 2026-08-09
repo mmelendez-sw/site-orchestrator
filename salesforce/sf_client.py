@@ -49,7 +49,15 @@ class SalesforceClient:
         payload = self._map_record(record)
         if verbose:
             logger.info("  SF payload: %s", json.dumps(payload, default=str))
-        result = getattr(self.sf, OBJECT_NAME).create(payload)
+        try:
+            result = getattr(self.sf, OBJECT_NAME).create(payload)
+        except Exception as exc:
+            # simple_salesforce often wraps API errors as "Malformed request …"
+            # with the useful body on content/response; surface that for retries.
+            detail = _salesforce_error_detail(exc)
+            if detail:
+                raise RuntimeError(f"Salesforce create failed: {detail}") from exc
+            raise
         created = dict(result)
         if verbose:
             logger.info("  Salesforce create OK — Id=%s success=%s", created.get("id"), created.get("success"))
@@ -61,6 +69,26 @@ class SalesforceClient:
         for record in records:
             results.append(self.create_site(record))
         return results
+
+
+def _salesforce_error_detail(exc: BaseException) -> str:
+    """Extract a readable Salesforce API error body from a client exception."""
+    chunks: list[str] = []
+    content = getattr(exc, "content", None)
+    if content is not None:
+        try:
+            chunks.append(json.dumps(content, default=str)[:2000])
+        except Exception:
+            chunks.append(str(content)[:2000])
+    response = getattr(exc, "response", None)
+    if response is not None:
+        text = getattr(response, "text", None)
+        if text:
+            chunks.append(str(text)[:2000])
+    message = str(exc).strip()
+    if message and message not in chunks:
+        chunks.append(message[:500])
+    return " | ".join(chunks)
 
 
 def _is_missing(value: Any) -> bool:

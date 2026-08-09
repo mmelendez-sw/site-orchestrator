@@ -233,6 +233,9 @@ def build_upload_record(
             or meta.get("state")
             or dedupe_row.get("state")
         )
+    # Belt-and-suspenders for DC Nominatim forms that still lack a city token.
+    if not parts.get("site_city") and parts.get("site_state") == "DC":
+        parts["site_city"] = "Washington"
 
     resolved_site_type = site_type
     if not resolved_site_type:

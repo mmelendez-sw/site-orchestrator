@@ -137,10 +137,83 @@ def is_osm_verbose_address(address: str) -> bool:
     return bool(_OSM_MARKERS_RE.search(normalize_sf_address(address)))
 
 
+# Nominatim often emits full state names; keep a local map to avoid importing
+# ingest.address_parts (circular with parse_address_components).
+_OSM_STATE_NAME_TO_ABBR: dict[str, str] = {
+    "DISTRICT OF COLUMBIA": "DC",
+    "WISCONSIN": "WI",
+    "MARYLAND": "MD",
+    "VIRGINIA": "VA",
+    "NEW YORK": "NY",
+    "CALIFORNIA": "CA",
+    "TEXAS": "TX",
+    "FLORIDA": "FL",
+    "ILLINOIS": "IL",
+    "PENNSYLVANIA": "PA",
+    "OHIO": "OH",
+    "GEORGIA": "GA",
+    "NORTH CAROLINA": "NC",
+    "MICHIGAN": "MI",
+    "NEW JERSEY": "NJ",
+    "MASSACHUSETTS": "MA",
+    # Bare "Washington" is the DC city in Nominatim; use "Washington State" for WA.
+    "WASHINGTON STATE": "WA",
+    "ARIZONA": "AZ",
+    "COLORADO": "CO",
+    "MINNESOTA": "MN",
+    "OREGON": "OR",
+}
+
+
+def _osm_part_is_state(part: str) -> str | None:
+    """Return a 2-letter state code when a comma-part is a state name or abbrev."""
+    text = part.strip()
+    if not text:
+        return None
+    upper = text.upper()
+    if re.match(r"^[A-Z]{2}$", upper):
+        return upper
+    return _OSM_STATE_NAME_TO_ABBR.get(upper)
+
+
+def _osm_street_stop_part(part: str, *, city: str | None) -> bool:
+    """True when a comma-part ends the street portion of an OSM address."""
+    upper = part.strip().upper()
+    if not upper:
+        return True
+    if city and upper == city.upper():
+        return True
+    if re.search(r"\bCOUNTY\b", upper):
+        return True
+    if _OSM_MARKERS_RE.search(part):
+        return True
+    if _WARD_DC_RE.search(part):
+        return True
+    if _osm_part_is_state(part):
+        return True
+    if re.match(r"^\d{5}(?:-\d{4})?$", upper):
+        return True
+    # Standalone quadrant / neighborhood tokens after the street line.
+    if upper in {"NORTHEAST", "NORTHWEST", "SOUTHEAST", "SOUTHWEST"}:
+        return True
+    if re.search(r"\b(?:NEIGHBORHOOD|WATERFRONT)\b", upper):
+        return True
+    return False
+
+
+_STREET_TYPE_TOKEN_RE = re.compile(
+    r"\b(?:Street|Avenue|Road|Drive|Boulevard|Lane|Court|Place|Way|Circle|"
+    r"Terrace|Highway|Parkway|St|Ave|Rd|Dr|Blvd|Ln|Ct|Pl|Cir|Ter|Hwy|Pkwy)\b",
+    re.IGNORECASE,
+)
+
+
 def collapse_osm_address(address: str) -> str:
     """Collapse OSM verbose addresses to USPS-style for scoring (R02)."""
     text = normalize_sf_address(address)
-    if not is_osm_verbose_address(text):
+    if not is_osm_verbose_address(text) and not re.search(
+        r"district of columbia|\bward\s+\d+", text, re.IGNORECASE
+    ):
         return text
 
     zip_code = parse_zip_from_address(text)
@@ -149,38 +222,53 @@ def collapse_osm_address(address: str) -> str:
     state: str | None = None
 
     for index, part in enumerate(parts):
-        if _OSM_MARKERS_RE.search(part):
+        # County labels carry the city in the prior comma-part — handle before
+        # the generic OSM-marker skip (COUNTY is also an OSM marker).
+        if re.search(r"\bCOUNTY\b", part, re.IGNORECASE):
+            if index > 0 and not city:
+                city = parts[index - 1].strip()
             continue
-        state_match = re.match(r"^([A-Z]{2})\b", part.upper())
-        if state_match:
-            state = state_match.group(1)
-            if index > 0 and not re.search(r"\bCOUNTY\b", parts[index - 1], re.IGNORECASE):
-                city = parts[index - 1]
+        if re.search(r"\bUNITED STATES\b", part, re.IGNORECASE):
+            continue
+        state_code = _osm_part_is_state(part)
+        if state_code:
+            state = state_code
+            if index > 0 and not city:
+                prev = parts[index - 1].strip()
+                if not _WARD_DC_RE.search(prev) and not _osm_street_stop_part(
+                    prev, city=None
+                ):
+                    city = prev
             break
-        if re.search(r"\bCOUNTY\b", part, re.IGNORECASE) and index > 0:
-            city = parts[index - 1]
+
+    # DC Nominatim: "... Washington, District of Columbia, ZIP, United States"
+    if not city and re.search(r"\bWashington\b", text, re.IGNORECASE) and (
+        state == "DC" or re.search(r"District of Columbia|\bDC\b", text, re.IGNORECASE)
+    ):
+        city = "Washington"
+        state = state or "DC"
 
     street_parts: list[str] = []
+    seen_street_type = False
     for part in parts:
-        upper = part.upper()
-        if city and upper == city.upper():
+        if _osm_street_stop_part(part, city=city):
             break
-        if re.search(r"\bCOUNTY\b", upper):
-            break
-        if _OSM_MARKERS_RE.search(part):
-            break
-        if re.match(r"^[A-Z]{2}\b", upper):
-            break
-        if re.match(r"^\d{5}(?:-\d{4})?$", upper):
+        # After house+street-type, further comma parts are neighborhoods/POIs.
+        if seen_street_type and not re.search(r"\d", part):
             break
         street_parts.append(part)
+        if _STREET_TYPE_TOKEN_RE.search(part):
+            seen_street_type = True
 
-    street = ", ".join(street_parts)
+    street = " ".join(street_parts)
     street = strip_leading_poi(street)
+    street = re.sub(r"^(\d+)\s*,\s*", r"\1 ", street)
     street = canonicalize_street_tokens(extract_street_line(street))
 
     if city and state and zip_code:
         return f"{street}, {city.upper()}, {state} {zip_code}"
+    if city and zip_code:
+        return f"{street}, {city.upper()}, {zip_code}"
     if zip_code:
         return f"{street}, {zip_code}"
     return street or text
@@ -263,11 +351,24 @@ def extract_city_from_address(address: str | None) -> str | None:
     if not text:
         return None
 
-    if is_osm_verbose_address(text):
+    if is_osm_verbose_address(text) or re.search(
+        r"district of columbia|\bward\s+\d+", text, re.IGNORECASE
+    ):
         parts = [part.strip() for part in text.split(",") if part.strip()]
         for index, part in enumerate(parts):
             if re.search(r"\bCOUNTY\b", part, re.IGNORECASE) and index > 0:
                 return _normalize_city(parts[index - 1])
+            state_code = _osm_part_is_state(part)
+            if state_code and index > 0:
+                prev = parts[index - 1].strip()
+                if not re.search(r"\bCOUNTY\b", prev, re.IGNORECASE) and not _WARD_DC_RE.search(
+                    prev
+                ):
+                    return _normalize_city(prev)
+        if re.search(r"\bWashington\b", text, re.IGNORECASE) and re.search(
+            r"District of Columbia|\bDC\b", text, re.IGNORECASE
+        ):
+            return _normalize_city("Washington")
 
     match = _STATE_ZIP_TAIL_RE.search(text)
     if match:

@@ -141,7 +141,22 @@ def test_collapse_osm_address_to_usps_style():
     assert "5825" in collapsed
     assert "MILWAUKEE" in collapsed
     assert "53208" in collapsed
+    assert "WI" in collapsed
     assert "COUNTY" not in collapsed.upper()
+    assert "STORY HILL" not in collapsed.upper()
+
+
+def test_collapse_osm_address_dc_ward_sets_washington():
+    raw = (
+        "1201, 4th Street Southeast, Capitol Waterfront Neighborhood, "
+        "Ward 8, Washington, District of Columbia, 20003, United States"
+    )
+    collapsed = collapse_osm_address(raw)
+    assert "1201" in collapsed
+    assert "WASHINGTON" in collapsed
+    assert "DC" in collapsed
+    assert "20003" in collapsed
+    assert "WARD" not in collapsed.upper()
 
 
 def test_normalize_for_scoring_improves_fire_station_match():

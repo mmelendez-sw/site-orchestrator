@@ -1,4 +1,4 @@
-"""Site orchestrator: source -> ingest -> dedupe -> classify -> Salesforce."""
+"""Site orchestrator: source -> ingest -> dedupe -> tower snap -> classify -> Salesforce."""
 
 from __future__ import annotations
 
@@ -37,6 +37,7 @@ from source.record import SourceRecord
 from source.runner import list_sources, run_source
 from source.scope import parse_scope
 from orchestrator_summary import build_run_summary, log_run_summary
+from tower_snap import apply_tower_db_snap
 
 load_dotenv()
 
@@ -110,6 +111,12 @@ DEDUPE_RESULT_FIELDS = [
     "threshold_version",
     "distance_override_applied",
     "resolution_detail",
+    "geocode_lat",
+    "geocode_lng",
+    "tower_snap_source",
+    "tower_snap_distance_m",
+    "tower_snap_asr",
+    "tower_snap_record_id",
 ]
 
 
@@ -814,6 +821,13 @@ def main(
     classify_total = len(classify_targets)
     classify_ok = 0
     if classify_total:
+        # Prefer FCC/TowerSource coords within 25 m before imagery so chips
+        # center on the registered tower point instead of the geocode pin.
+        apply_tower_db_snap(
+            classify_targets,
+            result_rows,
+            verbose=verbose,
+        )
         logger.info("CLASSIFY — %d net-new sites", classify_total)
         try:
             classified_list = classify_records(
@@ -1056,6 +1070,9 @@ def _parse_args() -> argparse.Namespace:
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(message)s")
+    # Quiet third-party chatter that otherwise floods -v runs (Gemini AFC + httpx).
+    for _noisy in ("google_genai", "google_genai.models", "httpx", "httpcore"):
+        logging.getLogger(_noisy).setLevel(logging.WARNING)
     args = _parse_args()
     verbose = args.verbose
     scope = parse_scope(

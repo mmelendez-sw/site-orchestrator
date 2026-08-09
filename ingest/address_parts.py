@@ -4,7 +4,13 @@ from __future__ import annotations
 
 import re
 
-from dedupe.address_match import extract_city_from_address, extract_street_line_raw
+from dedupe.address_match import (
+    collapse_osm_address,
+    extract_city_from_address,
+    extract_street_line_raw,
+    is_osm_verbose_address,
+    strip_leading_poi,
+)
 from ingest.address_utils import parse_zip_from_address
 
 _WS_RE = re.compile(r"\s+")
@@ -100,6 +106,14 @@ _US_STATE_NAME_TO_ABBR: dict[str, str] = {
 }
 
 
+def _is_verbose_geocoder_address(text: str) -> bool:
+    """True for Nominatim/OSM verbose forms (comma-heavy, wards, full state names)."""
+    return bool(
+        is_osm_verbose_address(text)
+        or re.search(r"district of columbia|\bward\s+\d+", text, re.IGNORECASE)
+    )
+
+
 def parse_address_components(
     address: str | None,
     *,
@@ -117,11 +131,19 @@ def parse_address_components(
             "site_country": country or "US",
         }
 
-    resolved_zip = zip_code or parse_zip_from_address(text)
-    city = extract_city_from_address(text)
+    # Nominatim returns "1201, 4th Street Southeast, Ward 8, Washington, …".
+    # Collapse to USPS-style before component split so street/city are usable.
+    parse_text = text
+    if _is_verbose_geocoder_address(text):
+        collapsed = collapse_osm_address(text)
+        if collapsed:
+            parse_text = collapsed
+
+    resolved_zip = zip_code or parse_zip_from_address(parse_text) or parse_zip_from_address(text)
+    city = extract_city_from_address(parse_text) or extract_city_from_address(text)
     state: str | None = None
 
-    tail = _STATE_ZIP_TAIL_RE.search(text)
+    tail = _STATE_ZIP_TAIL_RE.search(parse_text) or _STATE_ZIP_TAIL_RE.search(text)
     if tail:
         if not city:
             city = tail.group(1).strip()
@@ -129,7 +151,7 @@ def parse_address_components(
         if not resolved_zip:
             resolved_zip = tail.group(3)
     else:
-        state_match = _STATE_ONLY_RE.search(text)
+        state_match = _STATE_ONLY_RE.search(parse_text) or _STATE_ONLY_RE.search(text)
         if state_match:
             state = state_match.group(1).upper()
         else:
@@ -139,10 +161,40 @@ def parse_address_components(
                 if not resolved_zip:
                     resolved_zip = name_match.group(2)
 
-    if state is None and re.search(r"\bDC\b", text.upper()):
+    if state is None and re.search(r"\bDC\b|District of Columbia", text, re.IGNORECASE):
         state = "DC"
+    if not city and state == "DC" and re.search(r"\bWashington\b", text, re.IGNORECASE):
+        city = "Washington"
 
-    street = extract_street_line_raw(text)
+    if _is_verbose_geocoder_address(text):
+        # Prefer street from collapsed USPS form; fall back to POI-stripped head.
+        street = extract_street_line_raw(parse_text)
+        if not street or re.fullmatch(r"\d+", street or ""):
+            working = strip_leading_poi(text)
+            working = re.split(
+                r",\s*(?:Ward\s+\d+|Washington|District of Columbia|United States)\b",
+                working,
+                maxsplit=1,
+                flags=re.IGNORECASE,
+            )[0]
+            working = re.sub(r"^(\d+)\s*,\s*", r"\1 ", working.strip())
+            # Drop standalone region/neighborhood comma parts.
+            pieces: list[str] = []
+            for part in working.split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                if re.fullmatch(
+                    r"Northeast|Northwest|Southeast|Southwest|.+\s(?:Neighborhood|Waterfront)",
+                    part,
+                    flags=re.IGNORECASE,
+                ):
+                    break
+                pieces.append(part)
+            street = " ".join(pieces) if pieces else working
+    else:
+        street = extract_street_line_raw(parse_text)
+
     return {
         "site_street": format_address_for_upload(street) if street else None,
         "site_city": format_address_for_upload(city) if city else None,

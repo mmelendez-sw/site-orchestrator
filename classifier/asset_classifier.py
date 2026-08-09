@@ -97,6 +97,10 @@ ZOOM_STAGE = _env_flag("ZOOM_STAGE", default="1")
 WIDE_AOI_STAGE = _env_flag("WIDE_AOI_STAGE", default="1")
 TIER_CONF_HIGH = float(os.environ.get("TIER_CONF_HIGH", "0.75"))
 TIER_CONF_MEDIUM = float(os.environ.get("TIER_CONF_MEDIUM", "0.6"))
+# Stale NAIP cannot early-stop Nearmap for rooftops (equipment may post-date the chip),
+# unless confidence is at/above this override (definitive NAIP-only identification).
+NAIP_MAX_AGE_YEARS = float(os.environ.get("NAIP_MAX_AGE_YEARS", "2"))
+NAIP_AGE_HIGH_CONF_OVERRIDE = float(os.environ.get("NAIP_AGE_HIGH_CONF_OVERRIDE", "0.85"))
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 CLAUDE_ESCALATION_MODEL = os.environ.get(
     "CLAUDE_ESCALATION_MODEL", "claude-sonnet-4-6")
@@ -1189,6 +1193,42 @@ def tier_confident_stop(res: dict) -> bool:
     return True
 
 
+def naip_age_blocks_early_stop(
+    res: dict,
+    naip_age_years: float | None,
+    *,
+    max_age_years: float | None = None,
+    high_conf_override: float | None = None,
+) -> bool:
+    """True when stale NAIP must not early-stop Nearmap (rooftop equipment risk).
+
+    Towers can still stop on old NAIP. Rooftops on imagery older than
+    NAIP_MAX_AGE_YEARS continue to Nearmap, unless confidence is at/above
+    NAIP_AGE_HIGH_CONF_OVERRIDE (definitive asset ID on NAIP alone).
+    Early-stop still also requires tier_confident_stop (equipment decided).
+    """
+    if naip_age_years is None:
+        return False
+    try:
+        age = float(naip_age_years)
+    except (TypeError, ValueError):
+        return False
+    limit = NAIP_MAX_AGE_YEARS if max_age_years is None else float(max_age_years)
+    if age <= limit:
+        return False
+    if str(res.get("site_type") or "").strip().lower() != "rooftop":
+        return False
+    conf = normalize_confidence(res.get("site_confidence"))
+    override = (
+        NAIP_AGE_HIGH_CONF_OVERRIDE
+        if high_conf_override is None
+        else float(high_conf_override)
+    )
+    if conf is not None and conf >= override:
+        return False
+    return True
+
+
 def escalation_reason(res: dict) -> str | None:
     """Why a Gemini result should escalate to Claude; None if no escalation."""
     if res.get("site_type") == "other":
@@ -1225,7 +1265,8 @@ def _step_done(step: str, detail: str | None = None) -> None:
 def classify_with_tiers(lat: float, lon: float, img: Image.Image | None,
                         provider: str, clients: dict, prompt: str,
                         input_confidence: str,
-                        build_views) -> tuple[dict, dict, str | None, str, list]:
+                        build_views,
+                        naip_age_years: float | None = None) -> tuple[dict, dict, str | None, str, list]:
     """Tier 0 (NAIP) -> Tier 1 (Vert) -> Tier 2 (obliques). Returns
     (result, nearmap_views, nearmap_date, nearmap_tier, views)."""
     nearmap_views: dict = {}
@@ -1236,8 +1277,14 @@ def classify_with_tiers(lat: float, lon: float, img: Image.Image | None,
     res = classify_site(provider, clients, views, prompt=prompt)
     res = maybe_recheck_equipment(provider, clients, res, views, input_confidence)
     _step_done("classify (NAIP)", _brief_pass_result(res))
-    if tier_confident_stop(res):
+    if tier_confident_stop(res) and not naip_age_blocks_early_stop(res, naip_age_years):
         return res, nearmap_views, nearmap_date, "naip_only", views
+    if tier_confident_stop(res) and naip_age_blocks_early_stop(res, naip_age_years):
+        _step_done(
+            "Nearmap required",
+            f"rooftop on NAIP age {naip_age_years}y > {NAIP_MAX_AGE_YEARS:g}y "
+            f"and conf < {NAIP_AGE_HIGH_CONF_OVERRIDE:g}",
+        )
 
     if not NEARMAP_API_KEY:
         return res, nearmap_views, nearmap_date, "naip_only", views
@@ -2039,6 +2086,11 @@ def classify_record(
 def main():
     global INPUT_CSV, OUTPUT_CSV, EXECUTIVE_SUMMARY_MD, CHIP_DIR, RUN_DIR, QUIET
 
+    # Gemini SDK / httpx INFO lines (AFC banner, "HTTP Request: POST …") drown
+    # useful classify progress; keep warnings+.
+    for _noisy in ("google_genai", "google_genai.models", "httpx", "httpcore"):
+        logging.getLogger(_noisy).setLevel(logging.WARNING)
+
     parser = argparse.ArgumentParser(description="Classify cell sites from aerial imagery")
     parser.add_argument("--input", "-i", default=INPUT_CSV,
                         help=f"Input CSV (default: {INPUT_CSV})")
@@ -2143,6 +2195,9 @@ def main():
     if NEARMAP_TIERED and not NAIP_ONLY:
         _out("NEARMAP_TIERED=1 — tiered Nearmap fetch enabled "
               "(NAIP -> Vert -> obliques)")
+        _out(f"  rooftop on NAIP age > {NAIP_MAX_AGE_YEARS:g}y requires Nearmap "
+              f"unless conf >= {NAIP_AGE_HIGH_CONF_OVERRIDE:g} "
+              f"(NAIP_MAX_AGE_YEARS / NAIP_AGE_HIGH_CONF_OVERRIDE)")
 
     _out(f"Input:  {INPUT_CSV}")
     _out(f"Output: {OUTPUT_CSV} (detail/resume)")
@@ -2264,7 +2319,8 @@ def main():
                 res, nearmap_views, nearmap_date, nearmap_tier, views = (
                     classify_with_tiers(
                         lat, lon, img, primary_provider, clients, prompt,
-                        input_confidence, build_views))
+                        input_confidence, build_views,
+                        naip_age_years=(naip_meta or {}).get("image_age_years")))
                 primary_model = primary_provider
             else:
                 nearmap_tier = "full" if nearmap_views else "naip_only"

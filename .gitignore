@@ -1,8 +1,12 @@
 .venv/
 venv/
 __pycache__/
+*.py[cod]
 .env
 .DS_Store
+.cursor/
+
+# Runtime / local artifacts
 runs/
 chips/
 results.csv
@@ -11,6 +15,10 @@ results.csv
 *_results.xlsx
 *_EXECUTIVE_SUMMARY.md
 data/*.csv
+
+# Root-level local dumps (keep tree clean for EC2/on-prem clones)
+/*.csv
+!requirements.txt
 
 # Architecture diagrams (local only — edit/regenerate outside git)
 classifier/docs/diagrams/
