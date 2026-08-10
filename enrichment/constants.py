@@ -31,6 +31,8 @@ SF_QUERY_FIELDS = (
     "Owner__c",
     "Verified_Site__c",
     "Verified_Site_Source__c",
+    "LLM_Classified__c",
+    "LLM_Holdout__c",
 )
 
 DEFAULT_STAGE_FILTER = (

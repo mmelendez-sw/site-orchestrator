@@ -61,6 +61,7 @@ def build_blank_site_type_query(
     clauses = [
         "(Site_Type__c = null OR Site_Type__c = '')",
         "LLM_Classified__c = true",
+        "(LLM_Holdout__c = false OR LLM_Holdout__c = null)",
         "Site_Latitude__c != null AND Site_Latitude__c != ''",
         "Site_Longitude__c != null AND Site_Longitude__c != ''",
         f"Stage__c IN ({_soql_in(stages)})",
@@ -148,8 +149,10 @@ def parse_sf_lat_lng(row: dict[str, Any]) -> tuple[float, float] | None:
 
 # Fallback when Site_Duplicate_Rule blocks enrichment field writes.
 # LLM_Classified=false removes the site from the blank-Site_Type enrichment queue.
+# LLM_Holdout=true marks that enrichment could not write site fields.
 DUPLICATE_FALLBACK_PAYLOAD = {
     "LLM_Classified__c": False,
+    "LLM_Holdout__c": True,
     "Test_Batch_Flag__c": True,
 }
 
@@ -162,6 +165,7 @@ def build_update_payload(
     verified_site: bool | None = None,
     verified_site_source: str | None = None,
     llm_classified: bool | None = None,
+    llm_holdout: bool | None = None,
     test_batch_flag: bool | None = None,
 ) -> dict[str, Any]:
     """Build a Site__c update payload (only set fields)."""
@@ -178,9 +182,24 @@ def build_update_payload(
         payload["Verified_Site_Source__c"] = verified_site_source
     if llm_classified is not None:
         payload["LLM_Classified__c"] = llm_classified
+    if llm_holdout is not None:
+        payload["LLM_Holdout__c"] = llm_holdout
     if test_batch_flag is not None:
         payload["Test_Batch_Flag__c"] = test_batch_flag
     return payload
+
+
+def apply_queue_flags(payload: dict[str, Any]) -> dict[str, Any]:
+    """Set LLM_Classified / LLM_Holdout from whether site enrichment fields are present.
+
+    Successful enrichment: LLM_Classified=true, LLM_Holdout=false.
+    Holdout / dequeue-only: LLM_Classified=false, LLM_Holdout=true.
+    """
+    out = dict(payload)
+    is_enrich = is_enrichment_payload(out)
+    out["LLM_Classified__c"] = is_enrich
+    out["LLM_Holdout__c"] = not is_enrich
+    return out
 
 
 def _is_duplicates_detected(exc: BaseException) -> bool:
@@ -224,12 +243,13 @@ def apply_one_update(
 ) -> dict[str, Any]:
     """Update a single enrichment candidate row; never raises.
 
-    Eligible tower/rooftop writes keep LLM_Classified__c=true.
-    Holdouts (no site fields) set LLM_Classified__c=false so they leave the
-    blank-Site_Type + LLM_Classified=true enrichment queue.
+    Eligible tower/rooftop writes: LLM_Classified__c=true, LLM_Holdout__c=false.
+    Holdouts (no site fields): LLM_Classified__c=false, LLM_Holdout__c=true so
+    they leave the blank-Site_Type enrichment queue and are flagged as holdouts.
 
     On DUPLICATES_DETECTED for an enrichment payload, retries once with
-    LLM_Classified__c=false + Test_Batch_Flag__c so the site still dequeues.
+    LLM_Classified__c=false + LLM_Holdout__c=true + Test_Batch_Flag__c so the
+    site still dequeues.
     """
     from enrichment import progress
 
@@ -244,11 +264,15 @@ def apply_one_update(
             verified_site_source=(row.get("update_verified_site_source") or None)
             or None,
         )
-        # Enrichment writes stay classified; holdouts dequeue from the queue.
-        payload = {
-            **site_fields,
-            "LLM_Classified__c": is_enrichment_payload(site_fields),
-        }
+        payload = apply_queue_flags(site_fields)
+    else:
+        # Preserve explicit queue flags on prebuilt payloads; fill any gaps.
+        payload = dict(payload)
+        is_enrich = is_enrichment_payload(payload)
+        if "LLM_Classified__c" not in payload:
+            payload["LLM_Classified__c"] = is_enrich
+        if "LLM_Holdout__c" not in payload:
+            payload["LLM_Holdout__c"] = not is_enrich
     entry = {
         "Id": sf_id,
         "success": False,
@@ -297,13 +321,13 @@ def apply_one_update(
                 entry["payload"] = fallback
                 entry["error"] = f"fallback after DUPLICATES_DETECTED: {exc}"
                 logger.warning(
-                    "enrichment blocked by duplicate for %s — dequeued LLM/Test_Batch only",
+                    "enrichment blocked by duplicate for %s — dequeued LLM/Holdout/Test_Batch only",
                     sf_id,
                 )
                 if verbose:
                     progress.warn(
                         "SF duplicate blocked enrichment — "
-                        "dequeued (LLM_Classified=false + Test_Batch_Flag)"
+                        "dequeued (LLM_Classified=false, LLM_Holdout=true, Test_Batch_Flag)"
                     )
                 return entry
             except Exception as fallback_exc:  # noqa: BLE001
@@ -341,10 +365,13 @@ def _format_apply_result(
     if status == "updated_llm_after_duplicate":
         return (
             f"{prefix} | duplicate fallback | "
-            "dequeued (LLM_Classified=false + Test_Batch_Flag)"
+            "dequeued (LLM_Classified=false, LLM_Holdout=true, Test_Batch_Flag)"
         )
     if not is_enrichment_payload(payload):
-        return f"{prefix} | dequeued (LLM_Classified=false, no site fields written)"
+        return (
+            f"{prefix} | dequeued "
+            "(LLM_Classified=false, LLM_Holdout=true, no site fields written)"
+        )
 
     site_type = payload.get("Site_Type__c") or "—"
     verified = payload.get("Verified_Site_Source__c") or "—"

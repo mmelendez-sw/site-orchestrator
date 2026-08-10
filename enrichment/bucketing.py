@@ -88,9 +88,13 @@ def _parse_asset_box_2d(classified: dict[str, Any]) -> list[int] | None:
     if not isinstance(value, (list, tuple)) or len(value) < 4:
         return None
     try:
-        ymin, xmin, ymax, xmax = (int(v) for v in value[:4])
+        ymin, xmin, ymax, xmax = (int(round(float(v))) for v in value[:4])
     except (TypeError, ValueError):
         return None
+    if ymin > ymax:
+        ymin, ymax = ymax, ymin
+    if xmin > xmax:
+        xmin, xmax = xmax, xmin
     if not (0 <= ymin < ymax <= 1000 and 0 <= xmin < xmax <= 1000):
         return None
     return [ymin, xmin, ymax, xmax]

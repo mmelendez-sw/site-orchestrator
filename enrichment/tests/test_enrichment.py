@@ -395,17 +395,19 @@ class SoqlTests(unittest.TestCase):
         self.assertIn("Carrier_Leasing_Source__c LIKE '%NFL%'", soql)
         self.assertIn("Site_Latitude__c != null", soql)
         self.assertIn("LLM_Classified__c = true", soql)
+        self.assertIn("(LLM_Holdout__c = false OR LLM_Holdout__c = null)", soql)
 
     def test_blank_site_type_query_can_omit_carrier(self):
         soql = build_blank_site_type_query(carrier_like=None)
-        self.assertNotIn("Carrier_Leasing_Source__c", soql)
+        self.assertNotIn("Carrier_Leasing_Source__c LIKE", soql)
         self.assertIn("LLM_Classified__c = true", soql)
+        self.assertIn("LLM_Holdout__c", soql)
 
     def test_sites_by_ids_query(self):
         soql = build_sites_by_ids_query(["a0Z1", "a0Z2"])
         self.assertIn("Id IN ('a0Z1', 'a0Z2')", soql)
-        self.assertNotIn("Carrier_Leasing_Source__c", soql)
-        self.assertNotIn("LLM_Classified__c", soql)
+        self.assertNotIn("Carrier_Leasing_Source__c LIKE", soql)
+        self.assertNotIn("LLM_Classified__c =", soql)
 
 
 class PayloadTests(unittest.TestCase):
@@ -417,12 +419,14 @@ class PayloadTests(unittest.TestCase):
             verified_site=True,
             verified_site_source="NearMap",
             llm_classified=True,
+            llm_holdout=False,
         )
         self.assertEqual(payload["Site_Latitude__c"], 1.0)
         self.assertEqual(payload["Site_Type__c"], "Rooftop")
         self.assertTrue(payload["Verified_Site__c"])
         self.assertEqual(payload["Verified_Site_Source__c"], "NearMap")
         self.assertTrue(payload["LLM_Classified__c"])
+        self.assertFalse(payload["LLM_Holdout__c"])
 
 
 class _FakeSiteSObject:
@@ -474,7 +478,11 @@ class DuplicateFallbackTests(unittest.TestCase):
         self.assertEqual(entry["status"], "updated_llm_after_duplicate")
         self.assertEqual(
             entry["payload"],
-            {"LLM_Classified__c": False, "Test_Batch_Flag__c": True},
+            {
+                "LLM_Classified__c": False,
+                "LLM_Holdout__c": True,
+                "Test_Batch_Flag__c": True,
+            },
         )
         self.assertEqual(len(site.calls), 2)
 
@@ -495,7 +503,33 @@ class DuplicateFallbackTests(unittest.TestCase):
             verbose=False,
         )
         self.assertTrue(entry["success"])
-        self.assertEqual(entry["payload"], {"LLM_Classified__c": False})
+        self.assertEqual(
+            entry["payload"],
+            {"LLM_Classified__c": False, "LLM_Holdout__c": True},
+        )
+
+    def test_enrichment_write_clears_holdout_flag(self):
+        from enrichment.sf_ops import apply_one_update
+
+        site = _FakeSiteSObject()
+        entry = apply_one_update(
+            _FakeClient(site),
+            {
+                "Id": "a0ZTEST000000005",
+                "naip_site_type": "rooftop",
+                "update_lat": 43.0,
+                "update_lng": -89.0,
+                "update_site_type": "Rooftop",
+                "update_verified_site": True,
+                "update_verified_site_source": "NearMap",
+            },
+            dry_run=False,
+            verbose=False,
+        )
+        self.assertTrue(entry["success"])
+        self.assertTrue(entry["payload"]["LLM_Classified__c"])
+        self.assertFalse(entry["payload"]["LLM_Holdout__c"])
+        self.assertEqual(entry["payload"]["Site_Type__c"], "Rooftop")
 
 
 class ReviewOverlayTests(unittest.TestCase):
@@ -525,9 +559,23 @@ class CoordinationHelperTests(unittest.TestCase):
                 has_obliques=True,
             )
         )
-        self.assertTrue(
+        # Rooftop + no cell WITHOUT a locked oblique box must NOT block
+        # (parking-lot pin / mall-edge miss pattern).
+        self.assertFalse(
             ac.nearmap_full_blocks_rescue(
                 {"site_type": "rooftop", "cell_equipment": False},
+                nearmap_tier="full",
+                has_obliques=True,
+            )
+        )
+        self.assertTrue(
+            ac.nearmap_full_blocks_rescue(
+                {
+                    "site_type": "rooftop",
+                    "cell_equipment": False,
+                    "asset_view": "Nearmap oblique (North)",
+                    "asset_box_2d": [220, 310, 360, 420],
+                },
                 nearmap_tier="full",
                 has_obliques=True,
             )
@@ -544,6 +592,26 @@ class CoordinationHelperTests(unittest.TestCase):
                 {"site_type": "other"},
                 nearmap_tier="full",
                 has_obliques=False,
+            )
+        )
+
+    def test_needs_pin_offset_scout(self):
+        from classifier import asset_classifier as ac
+
+        self.assertTrue(ac.needs_pin_offset_scout({"site_type": "other"}))
+        self.assertTrue(
+            ac.needs_pin_offset_scout(
+                {"site_type": "rooftop", "cell_equipment": False}
+            )
+        )
+        self.assertFalse(
+            ac.needs_pin_offset_scout(
+                {"site_type": "rooftop", "cell_equipment": True}
+            )
+        )
+        self.assertFalse(
+            ac.needs_pin_offset_scout(
+                {"site_type": "tower", "cell_equipment": True}
             )
         )
 
@@ -583,6 +651,41 @@ class CoordinationHelperTests(unittest.TestCase):
         }
         out = ac.align_site_evidence_with_cell(res)
         self.assertNotIn("sector panel", out["site_evidence"].lower())
+
+    def test_coerce_asset_box_accepts_tight_antenna_box(self):
+        from classifier import asset_classifier as ac
+
+        # Tight sector-panel box (~5%) — valid for rooftop, too small for zoom scout.
+        tight = [480, 470, 530, 520]
+        self.assertEqual(ac.coerce_asset_box(tight), tight)
+        self.assertIsNone(ac._valid_box(tight))
+        # Inverted corners are repaired.
+        self.assertEqual(ac.coerce_asset_box([530, 520, 480, 470]), tight)
+        # Whole-scene rejected.
+        self.assertIsNone(ac.coerce_asset_box([0, 0, 900, 900]))
+
+    def test_enforce_rooftop_cell_requires_box(self):
+        from classifier import asset_classifier as ac
+
+        res = {
+            "site_type": "rooftop",
+            "cell_equipment": True,
+            "cell_equipment_evidence": "sectors on north",
+            "asset_box_2d": None,
+            "asset_view": None,
+        }
+        out = ac.enforce_rooftop_cell_requires_box(res)
+        self.assertIsNone(out["cell_equipment"])
+        self.assertEqual(out["dual_model_resolution"], "box_required")
+
+        ok = {
+            "site_type": "rooftop",
+            "cell_equipment": True,
+            "asset_view": "Nearmap oblique (North)",
+            "asset_box_2d": [220, 310, 360, 420],
+        }
+        kept = ac.enforce_rooftop_cell_requires_box(ok)
+        self.assertTrue(kept["cell_equipment"])
 
 
 if __name__ == "__main__":

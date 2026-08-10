@@ -8,7 +8,8 @@ Default flow (golden / high-precision):
 --apply alone no longer auto-pushes enrichment fields after classify.
 Use --apply-reviewed (optionally --approve-all) to push after human review.
 Holdouts are dequeued only when applying reviewed candidates (or with
---dequeue-holdouts on apply-reviewed).
+--dequeue-holdouts on apply-reviewed). Dequeue sets LLM_Classified__c=false
+and LLM_Holdout__c=true; successful Site Type writes clear the holdout flag.
 """
 
 from __future__ import annotations
@@ -131,7 +132,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "With --apply-reviewed: also dequeue non-candidate rows from "
-            "enrichment_detail.csv (LLM_Classified=false)"
+            "enrichment_detail.csv (LLM_Classified=false, LLM_Holdout=true)"
         ),
     )
     parser.add_argument(

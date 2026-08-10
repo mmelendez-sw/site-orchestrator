@@ -226,22 +226,28 @@ def classify_site_imagery(
         res, nearmap_tier=nearmap_tier, has_obliques=has_obliques
     )
     prior_nearmap_no_cell = bool(nearmap_blocks_rescue)
+    pin_offset_scout = (
+        not nearmap_blocks_rescue and ac.needs_pin_offset_scout(res)
+    )
+    # Snapshot before wide/zoom so a rejected re-center can restore a weak rooftop.
+    pre_scout_res = dict(res)
     if nearmap_blocks_rescue and verbose:
         progress.result(
-            "Nearmap full+obliques: rooftop no-cell — skip wide/zoom rescue"
+            "Nearmap full+obliques: locked HVAC rooftop — skip wide/zoom rescue"
         )
-    elif nearmap_settled_other and verbose:
+    elif pin_offset_scout and verbose:
         progress.result(
-            "Nearmap full+obliques: other/unclear — wide/zoom allowed with re-center"
+            "Pin may be offset — wide/zoom scout allowed "
+            f"(type={res.get('site_type')} cell={res.get('cell_equipment')!r})"
         )
 
-    # Wide Nearmap AOI when still other/unclear and no obliques.
+    # Wide Nearmap AOI when pin-centered call may have missed a nearby asset.
+    # Runs even with full obliques: the 100m pin chip often stops at a parking lot
+    # while the mall rooftop sits 100–200m away.
     if (
-        not nearmap_blocks_rescue
+        pin_offset_scout
         and not ac.NAIP_ONLY
         and ac.NEARMAP_API_KEY
-        and res.get("site_type") in ("other", "unclear")
-        and not has_obliques
     ):
         try:
             if verbose:
@@ -273,13 +279,14 @@ def classify_site_imagery(
                     f"wide → {res.get('site_type')} conf={res.get('site_confidence')}"
                 )
 
-    # NAIP wide chip retry — never overturn a settled Nearmap full+oblique negative.
+    # NAIP wide chip retry — never overturn a locked HVAC-only Nearmap rooftop.
     if (
-        not nearmap_blocks_rescue
+        pin_offset_scout
         and ac.WIDE_AOI_STAGE
         and img is not None
-        and res.get("site_type") in ("other", "unclear")
         and ac.NAIP_WIDE_CHIP_M > ac.CHIP_SIZE_M
+        and res.get("site_type") in ("other", "unclear", "rooftop")
+        and res.get("cell_equipment") is not True
     ):
         if verbose:
             progress.step(f"NAIP wide ({int(ac.NAIP_WIDE_CHIP_M)}m)")
@@ -321,11 +328,12 @@ def classify_site_imagery(
                         f"naip-wide → {res.get('site_type')} conf={res.get('site_confidence')}"
                     )
 
-    # Zoom stage — same Nearmap-final rule.
+    # Zoom stage — same pin-offset rule.
     if (
-        not nearmap_blocks_rescue
+        pin_offset_scout
         and ac.ZOOM_STAGE
-        and res.get("site_type") in ("other", "unclear")
+        and res.get("site_type") in ("other", "unclear", "rooftop")
+        and res.get("cell_equipment") is not True
     ):
         source_label, source_img = None, None
         if nearmap_views.get("Vert"):
@@ -358,11 +366,24 @@ def classify_site_imagery(
                         f"zoom → {res.get('site_type')} conf={res.get('site_confidence')}"
                     )
 
-    # Pin-offset rescue: if Nearmap said other but wide/zoom found a positive,
-    # re-center Nearmap on the asset box and require confirmation there.
+    # Pin-offset rescue: if pin-centered Nearmap was weak/other but wide/zoom
+    # found a positive, re-center Nearmap on the asset box and require confirmation.
+    pin_centered_weak = nearmap_settled_other or (
+        str(pre_scout_res.get("site_type") or "").lower() == "rooftop"
+        and pre_scout_res.get("cell_equipment") is not True
+        and not nearmap_blocks_rescue
+    )
+    scout_found_cell = (
+        res.get("site_type") in ac._positive_site_types()
+        and res.get("cell_equipment") is True
+        and (
+            classification_stage in {"wide_aoi", "zoom"}
+            or nearmap_tier in {"wide_aoi", "naip_wide", "zoom"}
+        )
+    )
     if (
-        nearmap_settled_other
-        and res.get("site_type") in ac._positive_site_types()
+        pin_centered_weak
+        and scout_found_cell
         and not ac.NAIP_ONLY
         and ac.NEARMAP_API_KEY
     ):
@@ -423,28 +444,13 @@ def classify_site_imagery(
                                 f"cell={res.get('cell_equipment')}"
                             )
                     else:
-                        # Do not keep an unvalidated wide/zoom resurrection.
-                        res = {
-                            "site_type": "other",
-                            "site_confidence": res.get("site_confidence") or 0.5,
-                            "site_evidence": (
-                                "Wide/zoom candidate rejected after Nearmap "
-                                "re-center (no confirmed cell gear)."
-                            ),
-                            "cell_equipment": False,
-                            "cell_equipment_confidence": 0.8,
-                            "cell_equipment_evidence": (
-                                check.get("cell_equipment_evidence")
-                                or "Re-center Nearmap did not confirm cellular gear."
-                            ),
-                            "cell_gear_kind": "none",
-                            "asset_box_2d": None,
-                            "asset_view": None,
-                        }
+                        # Restore pin-centered result (weak rooftop) rather than
+                        # forcing other when re-center rejects a wide scout hit.
+                        res = dict(pre_scout_res)
                         classification_stage = "pin_recenter_rejected"
                         if verbose:
                             progress.result(
-                                "re-center rejected — revert to other"
+                                "re-center rejected — keep pin-centered result"
                             )
 
     # Stamp imagery context before escalation / dual-model.
@@ -484,14 +490,27 @@ def classify_site_imagery(
         views,
         prior_nearmap_no_cell=prior_nearmap_no_cell,
     )
+    # Repair missing/invalid boxes before crop + dual-model.
+    box_provider = primary_provider if not escalation_model else "claude"
+    res = ac.maybe_repair_rooftop_asset_box(box_provider, clients, res, views)
     # Magnified crop recheck before dual-model confirm.
     res = ac.maybe_recheck_rooftop_cell_crop(
-        primary_provider if not escalation_model else "claude",
+        box_provider,
         clients,
         res,
         views,
     )
+    # No usable box ⇒ cannot keep rooftop cell=true (proof chain incomplete).
+    res = ac.enforce_rooftop_cell_requires_box(res, views)
     confirm_views, used_crop = ac.build_cell_confirm_views(res, views)
+    if (
+        str(res.get("site_type") or "").lower() == "rooftop"
+        and res.get("cell_equipment") is True
+        and not used_crop
+    ):
+        # Last resort: do not dual-confirm full-scene when box/crop failed.
+        res = ac.enforce_rooftop_cell_requires_box(res, views)
+        confirm_views, used_crop = ac.build_cell_confirm_views(res, views)
     if used_crop and verbose:
         progress.step("dual-model on cell crop")
     res, dual_model, cell_agree = ac.confirm_rooftop_cell_with_claude(
@@ -506,6 +525,12 @@ def classify_site_imagery(
         escalation_model = dual_model
         escalation_reason_str = escalation_reason_str or "rooftop_dual_model_cell"
     res["cell_models_agree"] = cell_agree
+    # Soft-keep / agree must still have a box for candidacy confidence.
+    if res.get("cell_equipment") is True:
+        res = ac.enforce_rooftop_cell_requires_box(res, views)
+        if res.get("cell_equipment") is not True:
+            cell_agree = False
+            res["cell_models_agree"] = False
     res = ac.align_site_evidence_with_cell(res)
 
     asset_lat = asset_lon = asset_offset_m = None

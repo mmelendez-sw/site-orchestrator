@@ -171,6 +171,10 @@ ZOOM_MAX_CANDIDATES = 6    # max zoom crops sent to stage-2 classifier
 ZOOM_OUTPUT_PX = 1024      # magnified crop size in pixels
 ZOOM_MIN_FRAC = 0.10       # minimum crop side as fraction of source image
 ZOOM_PAD_FRAC = 0.15       # padding around each candidate box
+# Rooftop gear boxes are intentionally tight (sector panels). Do not reuse
+# ZOOM_MIN_FRAC here — that rejects valid antenna boxes as "invalid".
+ASSET_BOX_MIN_FRAC = 0.03  # ~30/1000 normalized
+ASSET_BOX_MAX_SIDE = 500   # reject whole-roof / whole-scene boxes
 EXECUTIVE_SUMMARY_MD = "EXECUTIVE_SUMMARY.md"
 
 TOWER_SUBTYPE_SCHEMA_VALUES = [
@@ -221,6 +225,10 @@ Perform three tasks:
 
 TASK 1 - site_type. Search the ENTIRE extent of EVERY view - edges and corners \
 included, never just the center - and classify the site:
+- The recorded pin is often tens of meters off. If the center is a parking lot, \
+empty pavement, driveway, or landscaping next to a larger commercial / mall \
+building, search adjacent rooftops and tower compounds in the chip for cellular \
+gear — do not stop at "other" just because the pin itself is pavement.
 - "tower": a PURPOSE-BUILT cellular/telecom tower is visible. Must show cell \
 platforms, sector racks, microwave dishes, or a fenced telecom compound — NOT \
 a wood utility pole, street light, traffic signal, power transmission lattice, \
@@ -259,8 +267,9 @@ top-down only when gear is unmistakable from above. Prefer NAIP only when no \
 Nearmap view shows the gear.
 - The box must match the view named in asset_view; never reuse one box across \
 views. Leave both fields null only if no asset/gear can be located.
-- Keep the box compact: typically well under ~25% of the image on each side \
-unless the tower compound truly fills more.
+- Keep the box compact: typically 3–25% of the image on each side \
+unless the tower compound truly fills more. Never return inverted \
+coordinates (ymin must be < ymax, xmin < xmax).
 
 TASK 3 - cell_equipment: is cellular telecom equipment visible on the located asset?
 - true: clear visible evidence of cellular gear; false: none visible; null: cannot \
@@ -456,6 +465,26 @@ a rooftop or facade (sector panels, facade mounts, dishes, RRUs, parapet masts)?
 
 Answer cell_equipment true only with unmistakable telecom hardware. HVAC-only \
 roofs are false. Set cell_gear_kind and cite the view in cell_equipment_evidence.
+Return the same JSON schema.
+"""
+
+ROOFTOP_BOX_REPAIR_PROMPT = """\
+Prior classification suggested a rooftop cellular site but did not return a \
+usable asset_box_2d (missing, inverted, too small, or too large).
+
+Your ONLY job: locate cellular gear and draw ONE valid box.
+
+Rules:
+- Prefer a Nearmap oblique (North/East/South/West) where sector panels, dishes, \
+RRUs, or parapet masts are clearest. Do not box HVAC alone.
+- asset_box_2d = [ymin, xmin, ymax, xmax] integers in 0-1000 with ymin < ymax \
+and xmin < xmax. Draw TIGHTLY around the cellular hardware (typically 3–25% of \
+the image on each side — never the whole roof or whole building).
+- asset_view must be the exact label of that same view.
+- If cellular gear is clearly visible: site_type=rooftop, cell_equipment=true, \
+cell_gear_kind set, and both box fields filled.
+- If no cellular gear is visible: cell_equipment=false, cell_gear_kind=none, \
+leave asset_box_2d and asset_view null.
 Return the same JSON schema.
 """
 
@@ -925,19 +954,12 @@ def maybe_recheck_rooftop_cell_crop(
         return res
     if res.get("cell_equipment") is not True:
         return res
-    box = res.get("asset_box_2d")
-    if isinstance(box, str):
-        try:
-            box = json.loads(box)
-        except json.JSONDecodeError:
-            box = None
-    if not isinstance(box, (list, tuple)) or len(box) < 4:
-        _step_done("cell crop recheck", "skipped (no asset box)")
-        return res
-    valid = _valid_box(box)
+    valid = get_valid_asset_box(res)
     if not valid:
         _step_done("cell crop recheck", "skipped (invalid box)")
         return res
+    # Persist coerced geometry so later stages share the same box.
+    res["asset_box_2d"] = valid
 
     picked = pick_view_for_asset_box(res, views)
     if picked is None:
@@ -981,6 +1003,144 @@ def maybe_recheck_rooftop_cell_crop(
     normalize_model_result(res)
     label = "downgraded to false" if new_cell is False else "downgraded to null"
     _step_done("cell crop recheck", f"{label} on {source_label}")
+    return res
+
+
+def _oblique_views_only(views: list) -> list:
+    """Prefer Nearmap oblique chips for box repair / cell localization."""
+    obliques = []
+    for label, img in views:
+        lower = str(label).lower()
+        if "naip" in lower:
+            continue
+        if "oblique" in lower or any(
+            d in lower for d in ("north", "east", "south", "west")
+        ):
+            obliques.append((label, img))
+    return obliques
+
+
+def rooftop_box_is_usable(res: dict, views: list | None = None) -> bool:
+    """True when asset_box_2d is geometrically valid and matches a real view."""
+    if not get_valid_asset_box(res):
+        return False
+    view = str(res.get("asset_view") or "").strip()
+    if not view:
+        return False
+    if views is None:
+        return True
+    picked = pick_view_for_asset_box(res, views)
+    if picked is None:
+        return False
+    label, _img = picked
+    if asset_view_is_nearmap_oblique(view) and "naip" in str(label).lower():
+        return False
+    return True
+
+
+def maybe_repair_rooftop_asset_box(
+    provider: str, clients: dict, res: dict, views: list
+) -> dict:
+    """Re-ask for a tight oblique box when rooftop localization is incomplete.
+
+    Runs when site_type=rooftop and either cell=true or a strong rooftop call
+    lacks a usable box. Without a box, crop + dual-model cannot be trustworthy.
+    """
+    if str(res.get("site_type") or "").strip().lower() != "rooftop":
+        return res
+    if rooftop_box_is_usable(res, views):
+        # Persist coerced geometry.
+        valid = get_valid_asset_box(res)
+        if valid:
+            res["asset_box_2d"] = valid
+        return res
+
+    conf = normalize_confidence(res.get("site_confidence")) or 0.0
+    needs_repair = res.get("cell_equipment") is True or conf >= 0.7
+    if not needs_repair:
+        _step_done("box repair", "skipped (weak rooftop, no cell claim)")
+        return res
+
+    repair_views = _oblique_views_only(views) or list(views)
+    if not repair_views:
+        _step_done("box repair", "skipped (no views)")
+        return res
+
+    repair = classify_site(
+        provider, clients, repair_views, prompt=ROOFTOP_BOX_REPAIR_PROMPT
+    )
+    normalize_model_result(repair)
+
+    # Always absorb a usable repaired box.
+    if coerce_asset_box(repair.get("asset_box_2d")) and repair.get("asset_view"):
+        trial = dict(res)
+        trial["asset_box_2d"] = repair.get("asset_box_2d")
+        trial["asset_view"] = repair.get("asset_view")
+        if rooftop_box_is_usable(trial, views) or rooftop_box_is_usable(
+            trial, repair_views
+        ):
+            res["asset_box_2d"] = coerce_asset_box(repair.get("asset_box_2d"))
+            res["asset_view"] = repair.get("asset_view")
+            if repair.get("cell_equipment") is True:
+                res["cell_equipment"] = True
+                if repair.get("cell_equipment_confidence") is not None:
+                    res["cell_equipment_confidence"] = repair.get(
+                        "cell_equipment_confidence"
+                    )
+                if repair.get("cell_equipment_evidence"):
+                    res["cell_equipment_evidence"] = repair.get(
+                        "cell_equipment_evidence"
+                    )
+                if repair.get("cell_gear_kind"):
+                    res["cell_gear_kind"] = repair.get("cell_gear_kind")
+            elif repair.get("cell_equipment") is False:
+                res["cell_equipment"] = False
+                if repair.get("cell_equipment_evidence"):
+                    res["cell_equipment_evidence"] = repair.get(
+                        "cell_equipment_evidence"
+                    )
+                res["cell_gear_kind"] = repair.get("cell_gear_kind") or "none"
+            normalize_model_result(res)
+            _step_done(
+                "box repair",
+                f"repaired on {res.get('asset_view')} cell={res.get('cell_equipment')!r}",
+            )
+            return res
+
+    if repair.get("cell_equipment") is False:
+        res["cell_equipment"] = False
+        if repair.get("cell_equipment_evidence"):
+            res["cell_equipment_evidence"] = repair.get("cell_equipment_evidence")
+        res["cell_gear_kind"] = "none"
+        res["asset_box_2d"] = None
+        res["asset_view"] = None
+        normalize_model_result(res)
+        _step_done("box repair", "no cellular gear — cell=false")
+        return res
+
+    _step_done("box repair", "failed (still no usable box)")
+    return res
+
+
+def enforce_rooftop_cell_requires_box(res: dict, views: list | None = None) -> dict:
+    """Rooftop cell=true is incomplete without a usable localization box."""
+    if str(res.get("site_type") or "").strip().lower() != "rooftop":
+        return res
+    if res.get("cell_equipment") is not True:
+        return res
+    if rooftop_box_is_usable(res, views):
+        valid = get_valid_asset_box(res)
+        if valid:
+            res["asset_box_2d"] = valid
+        return res
+    res["cell_equipment"] = None
+    res["cell_models_agree"] = False
+    res["dual_model_resolution"] = "box_required"
+    prior = str(res.get("cell_equipment_evidence") or "").strip()
+    note = "Cell claim cleared: no usable asset_box_2d on a matching view."
+    res["cell_equipment_evidence"] = f"{prior} | {note}".strip(" |")
+    normalize_model_result(res)
+    _step_done("box gate", "cell cleared (box required)")
     return res
 
 
@@ -1336,18 +1496,43 @@ def box_to_latlon_centered(
 def nearmap_full_blocks_rescue(
     res: dict, *, nearmap_tier: str, has_obliques: bool
 ) -> bool:
-    """True when full Nearmap+obliques already settled rooftop with no cell.
+    """True when full Nearmap+obliques locked onto a specific HVAC-only rooftop.
 
-    That means we are on the right building (HVAC-only). Do not let NAIP-wide /
-    zoom invent a conflicting positive.
+    Only blocks wide/zoom when we have a compact Nearmap oblique asset box —
+    that means we are on the right building and should not invent cell gear
+    from a wider NAIP scout.
 
-    `other` / `unclear` does NOT block rescue — the SF pin may be offset and a
-    nearby rooftop may still be recoverable via wide scout + Nearmap re-center.
+    Without a locked box (common when the SF pin sits in a parking lot or
+    empty pavement next to a mall), wide/zoom + pin re-center must still run
+    so a nearby rooftop/tower can be recovered.
     """
     if str(nearmap_tier or "").strip().lower() != "full" or not has_obliques:
         return False
     site = str(res.get("site_type") or "").strip().lower()
-    return site == "rooftop" and res.get("cell_equipment") is False
+    if site != "rooftop" or res.get("cell_equipment") is not False:
+        return False
+    return has_locked_oblique_asset_box(res)
+
+
+def has_locked_oblique_asset_box(res: dict) -> bool:
+    """True when a compact Nearmap oblique box names a specific roof/host."""
+    if not asset_view_is_nearmap_oblique(res.get("asset_view")):
+        return False
+    return get_valid_asset_box(res) is not None
+
+
+def needs_pin_offset_scout(res: dict) -> bool:
+    """True when pin-centered imagery may have missed a nearby cellular asset.
+
+    Covers parking-lot / mall-edge pins: settled other/unclear, or a weak
+    rooftop call without confirmed cell gear.
+    """
+    site = str(res.get("site_type") or "").strip().lower()
+    if site in {"other", "unclear"}:
+        return True
+    if site == "rooftop" and res.get("cell_equipment") is not True:
+        return True
+    return False
 
 
 def asset_view_is_nearmap_oblique(asset_view: str | None) -> bool:
@@ -1375,17 +1560,11 @@ def should_soft_keep_gemini_cell(res: dict, *, from_wide_rescue: bool) -> bool:
         return False
     if not asset_view_is_nearmap_oblique(res.get("asset_view")):
         return False
-    box = res.get("asset_box_2d")
-    if isinstance(box, str):
-        try:
-            box = json.loads(box)
-        except json.JSONDecodeError:
-            box = None
-    valid = _valid_box(box) if box is not None else None
+    valid = get_valid_asset_box(res)
     if not valid:
         return False
     ymin, xmin, ymax, xmax = valid
-    # Reject whole-roof / whole-building boxes (loose FP magnets).
+    # Soft-keep requires a compact gear box (not a half-roof blob).
     if (ymax - ymin) > 400 or (xmax - xmin) > 400:
         return False
     conf = normalize_confidence(res.get("cell_equipment_confidence"))
@@ -1442,13 +1621,7 @@ def build_cell_confirm_views(res: dict, views: list) -> tuple[list, bool]:
 
     Returns (views_for_confirm, used_crop).
     """
-    box = res.get("asset_box_2d")
-    if isinstance(box, str):
-        try:
-            box = json.loads(box)
-        except json.JSONDecodeError:
-            box = None
-    valid = _valid_box(box) if isinstance(box, (list, tuple)) else None
+    valid = get_valid_asset_box(res)
     picked = pick_view_for_asset_box(res, views)
     if not valid or picked is None:
         return views, False
@@ -1458,6 +1631,7 @@ def build_cell_confirm_views(res: dict, views: list) -> tuple[list, bool]:
         "naip" in str(label).lower()
     ):
         return views, False
+    res["asset_box_2d"] = valid
     crop = _crop_zoom(img, valid)
     return [(f"cell crop ({label})", crop), (label, img)], True
 
@@ -2027,6 +2201,7 @@ def classify_chip(client: Anthropic, views: list[tuple[str, Image.Image]],
 
 
 def _valid_box(box) -> list[int] | None:
+    """Validate a zoom-scout candidate box (larger minimum side)."""
     try:
         ymin, xmin, ymax, xmax = (int(v) for v in box[:4])
     except (TypeError, ValueError):
@@ -2036,6 +2211,47 @@ def _valid_box(box) -> list[int] | None:
     if (ymax - ymin) < ZOOM_MIN_FRAC * 1000 or (xmax - xmin) < ZOOM_MIN_FRAC * 1000:
         return None
     return [ymin, xmin, ymax, xmax]
+
+
+def coerce_asset_box(box) -> list[int] | None:
+    """Normalize and validate a rooftop/tower asset_box_2d.
+
+    Fixes inverted corners and rejects empty / whole-scene boxes. Uses a
+    smaller minimum than zoom scout so tight antenna mounts stay valid.
+    """
+    if box is None or box == "":
+        return None
+    if isinstance(box, str):
+        try:
+            box = json.loads(box)
+        except json.JSONDecodeError:
+            return None
+    if not isinstance(box, (list, tuple)) or len(box) < 4:
+        return None
+    try:
+        ymin, xmin, ymax, xmax = (int(round(float(v))) for v in box[:4])
+    except (TypeError, ValueError):
+        return None
+    if ymin > ymax:
+        ymin, ymax = ymax, ymin
+    if xmin > xmax:
+        xmin, xmax = xmax, xmin
+    ymin = max(0, min(1000, ymin))
+    xmin = max(0, min(1000, xmin))
+    ymax = max(0, min(1000, ymax))
+    xmax = max(0, min(1000, xmax))
+    if ymin >= ymax or xmin >= xmax:
+        return None
+    min_side = ASSET_BOX_MIN_FRAC * 1000
+    if (ymax - ymin) < min_side or (xmax - xmin) < min_side:
+        return None
+    if (ymax - ymin) > ASSET_BOX_MAX_SIDE or (xmax - xmin) > ASSET_BOX_MAX_SIDE:
+        return None
+    return [ymin, xmin, ymax, xmax]
+
+
+def get_valid_asset_box(res: dict) -> list[int] | None:
+    return coerce_asset_box(res.get("asset_box_2d"))
 
 
 def _grid_boxes(grid: int = ZOOM_GRID) -> list[list[int]]:
@@ -3035,20 +3251,22 @@ def main():
             # Keep Gemini through wide/zoom retries; Claude only at the end.
             stage_provider = primary_provider
 
-            # Wide-AOI fallback: rural sites often have vert-only Nearmap
-            # coverage, and the asset may sit outside the narrow AOI entirely
+            # Wide-AOI fallback: pin may sit in a parking lot while the mall
+            # rooftop / tower is 100–250m away. Scout even when pin-centered
+            # Nearmap already had obliques, unless we locked an HVAC-only roof.
             has_obliques = any(n != "Vert" for n in nearmap_views)
             nearmap_blocks_rescue = nearmap_full_blocks_rescue(
                 res, nearmap_tier=nearmap_tier, has_obliques=has_obliques
             )
+            pin_offset_scout = (
+                not nearmap_blocks_rescue and needs_pin_offset_scout(res)
+            )
             if nearmap_blocks_rescue:
                 _step_done(
                     "Nearmap settled",
-                    "full+obliques negative — skip wide/zoom rescue",
+                    "locked HVAC rooftop — skip wide/zoom rescue",
                 )
-            if (not nearmap_blocks_rescue and not NAIP_ONLY and NEARMAP_API_KEY
-                    and res.get("site_type") in ("other", "unclear")
-                    and not has_obliques):
+            if pin_offset_scout and not NAIP_ONLY and NEARMAP_API_KEY:
                 try:
                     wide_views, wide_date = fetch_nearmap_views(
                         lat, lon, NEARMAP_FALLBACK_CHIP_M)
@@ -3070,8 +3288,9 @@ def main():
 
             # NAIP zoom-out: tower may sit just outside the 250 m frame (coords off).
             # One extra Gemini call — cheap catch for "tower exists but out of picture".
-            if (not nearmap_blocks_rescue and WIDE_AOI_STAGE and img is not None
-                    and res.get("site_type") in ("other", "unclear")
+            if (pin_offset_scout and WIDE_AOI_STAGE and img is not None
+                    and res.get("site_type") in ("other", "unclear", "rooftop")
+                    and res.get("cell_equipment") is not True
                     and NAIP_WIDE_CHIP_M > CHIP_SIZE_M):
                 try:
                     wide_img, wide_meta, wide_geo = fetch_chip(
@@ -3109,8 +3328,14 @@ def main():
 
             # Two-stage zoom: scout suspicious regions, magnify, re-classify.
             force_zoom = label_hint == "stealth"
-            if (not nearmap_blocks_rescue and ZOOM_STAGE
-                    and (force_zoom or res.get("site_type") in ("other", "unclear"))):
+            if (pin_offset_scout and ZOOM_STAGE
+                    and (
+                        force_zoom
+                        or (
+                            res.get("site_type") in ("other", "unclear", "rooftop")
+                            and res.get("cell_equipment") is not True
+                        )
+                    )):
                 source_label, source_img = None, None
                 if nearmap_views.get("Vert"):
                     source_label, source_img = "Nearmap top-down", nearmap_views["Vert"]
@@ -3148,6 +3373,29 @@ def main():
             res = maybe_recheck_rooftop_cell_false_positive(
                 fp_provider, clients, res, views
             )
+            res = maybe_repair_rooftop_asset_box(fp_provider, clients, res, views)
+            res = maybe_recheck_rooftop_cell_crop(fp_provider, clients, res, views)
+            res = enforce_rooftop_cell_requires_box(res, views)
+            confirm_views, _used_crop = build_cell_confirm_views(res, views)
+            res, dual_model, cell_agree = confirm_rooftop_cell_with_claude(
+                res,
+                clients,
+                confirm_views,
+                already_escalated=bool(escalation_model),
+                allow_soft_keep=True,
+                from_wide_rescue=classification_stage
+                in {"wide_aoi", "zoom", "pin_recenter_rejected"}
+                or nearmap_tier in {"naip_wide", "wide_aoi"},
+            )
+            if dual_model and not escalation_model:
+                escalation_model = dual_model
+                escalation_reason_str = (
+                    escalation_reason_str or "rooftop_dual_model_cell"
+                )
+            res["cell_models_agree"] = cell_agree
+            if res.get("cell_equipment") is True:
+                res = enforce_rooftop_cell_requires_box(res, views)
+            res = align_site_evidence_with_cell(res)
 
             # Convert the detection box to real-world coordinates - only valid
             # when the box was drawn on the georeferenced NAIP chip
