@@ -17,7 +17,11 @@ from enrichment.mssql import (
     fcc_coordinates,
     find_proximity_hit,
 )
-from enrichment.sf_ops import build_blank_site_type_query, build_update_payload
+from enrichment.sf_ops import (
+    build_blank_site_type_query,
+    build_sites_by_ids_query,
+    build_update_payload,
+)
 
 
 def _rooftop_ok(**overrides):
@@ -33,6 +37,8 @@ def _rooftop_ok(**overrides):
         "asset_lat": 43.0005,
         "asset_lon": -89.0005,
         "asset_offset_m": 20.0,
+        "asset_box_2d": "[220, 310, 360, 420]",
+        "asset_view": "Nearmap oblique (North)",
         "nearmap_tier": "full",
         "nearmap_views": "Vert,North,East,South,West",
     }
@@ -232,7 +238,7 @@ class BucketTests(unittest.TestCase):
             classified=_rooftop_ok(
                 asset_lat="",
                 asset_lon="",
-                asset_box_2d="[200, 300, 500, 600]",
+                asset_box_2d="[220, 310, 360, 420]",
                 asset_view="Nearmap oblique (North)",
             ),
             db_lat=None,
@@ -242,6 +248,34 @@ class BucketTests(unittest.TestCase):
         )
         self.assertEqual(decision["bucket"], BUCKET_POTENTIAL_UPDATE)
         self.assertEqual(decision["update_coord_source"], "nearmap_asset_box_pin")
+
+    def test_rooftop_naip_box_held_out(self):
+        decision = bucket_classification(
+            match_source=MATCH_SOURCE_NONE,
+            classified=_rooftop_ok(
+                asset_view="NAIP top-down",
+                cell_equipment_evidence="South oblique shows sector panels",
+            ),
+            db_lat=None,
+            db_lng=None,
+            sf_lat=43.0,
+            sf_lng=-89.0,
+        )
+        self.assertEqual(decision["holdout_reason"], "rooftop_needs_oblique_asset_box")
+
+    def test_rooftop_view_evidence_mismatch_held_out(self):
+        decision = bucket_classification(
+            match_source=MATCH_SOURCE_NONE,
+            classified=_rooftop_ok(
+                asset_view="Nearmap oblique (North)",
+                cell_equipment_evidence="South oblique shows sector panel antennas",
+            ),
+            db_lat=None,
+            db_lng=None,
+            sf_lat=43.0,
+            sf_lng=-89.0,
+        )
+        self.assertEqual(decision["holdout_reason"], "rooftop_view_evidence_mismatch")
 
     def test_rooftop_unclear_gear_with_cues_ok(self):
         decision = bucket_classification(
@@ -362,6 +396,17 @@ class SoqlTests(unittest.TestCase):
         self.assertIn("Site_Latitude__c != null", soql)
         self.assertIn("LLM_Classified__c = true", soql)
 
+    def test_blank_site_type_query_can_omit_carrier(self):
+        soql = build_blank_site_type_query(carrier_like=None)
+        self.assertNotIn("Carrier_Leasing_Source__c", soql)
+        self.assertIn("LLM_Classified__c = true", soql)
+
+    def test_sites_by_ids_query(self):
+        soql = build_sites_by_ids_query(["a0Z1", "a0Z2"])
+        self.assertIn("Id IN ('a0Z1', 'a0Z2')", soql)
+        self.assertNotIn("Carrier_Leasing_Source__c", soql)
+        self.assertNotIn("LLM_Classified__c", soql)
+
 
 class PayloadTests(unittest.TestCase):
     def test_build_update_payload_sets_expected_fields(self):
@@ -473,7 +518,7 @@ class CoordinationHelperTests(unittest.TestCase):
     def test_nearmap_full_blocks_rescue(self):
         from classifier import asset_classifier as ac
 
-        self.assertTrue(
+        self.assertFalse(
             ac.nearmap_full_blocks_rescue(
                 {"site_type": "other", "cell_equipment": False},
                 nearmap_tier="full",
@@ -502,7 +547,7 @@ class CoordinationHelperTests(unittest.TestCase):
             )
         )
 
-    def test_soft_keep_gemini_requires_full_oblique_and_cues(self):
+    def test_soft_keep_gemini_requires_oblique_box(self):
         from classifier import asset_classifier as ac
 
         base = {
@@ -511,6 +556,8 @@ class CoordinationHelperTests(unittest.TestCase):
             "cell_equipment_confidence": 0.9,
             "cell_equipment_evidence": "North oblique shows sector panel antennas",
             "site_evidence": "rooftop site",
+            "asset_view": "Nearmap oblique (North)",
+            "asset_box_2d": [220, 310, 360, 420],
         }
         self.assertTrue(
             ac.should_soft_keep_gemini_cell(base, from_wide_rescue=False)
@@ -518,10 +565,24 @@ class CoordinationHelperTests(unittest.TestCase):
         self.assertFalse(
             ac.should_soft_keep_gemini_cell(base, from_wide_rescue=True)
         )
-        weak = {**base, "nearmap_tier": "naip_wide"}
+        naip_box = {**base, "asset_view": "NAIP top-down"}
         self.assertFalse(
-            ac.should_soft_keep_gemini_cell(weak, from_wide_rescue=False)
+            ac.should_soft_keep_gemini_cell(naip_box, from_wide_rescue=False)
         )
+        huge = {**base, "asset_box_2d": [0, 0, 900, 900]}
+        self.assertFalse(
+            ac.should_soft_keep_gemini_cell(huge, from_wide_rescue=False)
+        )
+
+    def test_align_site_evidence_clears_cell_claims(self):
+        from classifier import asset_classifier as ac
+
+        res = {
+            "cell_equipment": False,
+            "site_evidence": "Oblique views show sector panel antennas on the roof",
+        }
+        out = ac.align_site_evidence_with_cell(res)
+        self.assertNotIn("sector panel", out["site_evidence"].lower())
 
 
 if __name__ == "__main__":

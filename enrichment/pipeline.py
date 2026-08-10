@@ -41,6 +41,7 @@ from enrichment.sf_ops import (
     is_enrichment_payload,
     parse_sf_lat_lng,
     query_blank_site_type_sites,
+    query_sites_by_ids,
 )
 
 logger = logging.getLogger(__name__)
@@ -62,6 +63,8 @@ def run_enrichment(
     skip_classify: bool = False,
     classify_fn: Callable[..., dict[str, Any]] | None = None,
     sites: list[dict[str, Any]] | None = None,
+    site_ids: list[str] | None = None,
+    carrier_like: str | None = "NFL",
     verbose: bool = True,
 ) -> dict[str, Any]:
     """Run proximity + NAIP enrichment and write candidate/holdout CSVs."""
@@ -88,9 +91,22 @@ def run_enrichment(
 
     try:
         if sites is None:
-            if verbose:
-                progress.stage("2/4 QUERY SALESFORCE", "blank Site_Type + coords required")
-            sites = query_blank_site_type_sites(sf_client)
+            if site_ids:
+                if verbose:
+                    progress.stage(
+                        "2/4 QUERY SALESFORCE",
+                        f"{len(site_ids)} explicit Id(s)",
+                    )
+                sites = query_sites_by_ids(sf_client, site_ids)
+            else:
+                if verbose:
+                    progress.stage(
+                        "2/4 QUERY SALESFORCE",
+                        f"blank Site_Type | carrier_like={carrier_like!r}",
+                    )
+                sites = query_blank_site_type_sites(
+                    sf_client, carrier_like=carrier_like
+                )
             if verbose:
                 progress.result(f"{len(sites)} site(s)")
         if limit is not None:

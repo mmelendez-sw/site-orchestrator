@@ -217,13 +217,22 @@ def classify_site_imagery(
     stage_provider = primary_provider
 
     has_obliques = any(name != "Vert" for name in nearmap_views)
+    nearmap_settled_other = (
+        nearmap_tier == "full"
+        and has_obliques
+        and res.get("site_type") in ("other", "unclear")
+    )
     nearmap_blocks_rescue = ac.nearmap_full_blocks_rescue(
         res, nearmap_tier=nearmap_tier, has_obliques=has_obliques
     )
     prior_nearmap_no_cell = bool(nearmap_blocks_rescue)
     if nearmap_blocks_rescue and verbose:
         progress.result(
-            "Nearmap full+obliques settled negative — skip wide/zoom rescue"
+            "Nearmap full+obliques: rooftop no-cell — skip wide/zoom rescue"
+        )
+    elif nearmap_settled_other and verbose:
+        progress.result(
+            "Nearmap full+obliques: other/unclear — wide/zoom allowed with re-center"
         )
 
     # Wide Nearmap AOI when still other/unclear and no obliques.
@@ -349,6 +358,95 @@ def classify_site_imagery(
                         f"zoom → {res.get('site_type')} conf={res.get('site_confidence')}"
                     )
 
+    # Pin-offset rescue: if Nearmap said other but wide/zoom found a positive,
+    # re-center Nearmap on the asset box and require confirmation there.
+    if (
+        nearmap_settled_other
+        and res.get("site_type") in ac._positive_site_types()
+        and not ac.NAIP_ONLY
+        and ac.NEARMAP_API_KEY
+    ):
+        box = res.get("asset_box_2d")
+        if isinstance(box, str):
+            try:
+                box = json.loads(box)
+            except json.JSONDecodeError:
+                box = None
+        located = None
+        box_view = res.get("asset_view")
+        if box and ac._is_naip_view(box_view) and naip_geo:
+            located = ac.box_to_latlon(naip_geo, box)
+        elif box and box_view and "top-down" in str(box_view).lower():
+            chip_m = float(nearmap_aoi_m or ac.NEARMAP_CHIP_M)
+            located = ac.box_to_latlon_centered(lat, lon, chip_m, box)
+        if located:
+            cand_lat, cand_lon, cand_offset = located
+            if cand_offset >= 20:
+                if verbose:
+                    progress.step(
+                        f"re-center Nearmap ({cand_offset:.0f}m from pin)"
+                    )
+                try:
+                    recenter_views, recenter_date = ac.fetch_nearmap_views(
+                        cand_lat, cand_lon
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    recenter_views, recenter_date = {}, None
+                    if verbose:
+                        progress.warn(f"re-center Nearmap failed: {exc}")
+                if recenter_views:
+                    views = build_views(recenter_views)
+                    check, _, _, _ = ac.classify_with_routing(
+                        stage_provider,
+                        clients,
+                        views,
+                        prompt,
+                        input_conf,
+                        escalate=False,
+                    )
+                    ok = (
+                        check.get("site_type") in ac._positive_site_types()
+                        and check.get("cell_equipment") is True
+                    )
+                    if ok:
+                        res = check
+                        lat, lon = cand_lat, cand_lon
+                        nearmap_views = recenter_views
+                        nearmap_date = recenter_date or nearmap_date
+                        nearmap_aoi_m = ac.NEARMAP_CHIP_M
+                        has_obliques = any(n != "Vert" for n in nearmap_views)
+                        classification_stage = "pin_recenter"
+                        nearmap_tier = "full" if has_obliques else "vert_only"
+                        if verbose:
+                            progress.result(
+                                f"re-center confirmed → {res.get('site_type')} "
+                                f"cell={res.get('cell_equipment')}"
+                            )
+                    else:
+                        # Do not keep an unvalidated wide/zoom resurrection.
+                        res = {
+                            "site_type": "other",
+                            "site_confidence": res.get("site_confidence") or 0.5,
+                            "site_evidence": (
+                                "Wide/zoom candidate rejected after Nearmap "
+                                "re-center (no confirmed cell gear)."
+                            ),
+                            "cell_equipment": False,
+                            "cell_equipment_confidence": 0.8,
+                            "cell_equipment_evidence": (
+                                check.get("cell_equipment_evidence")
+                                or "Re-center Nearmap did not confirm cellular gear."
+                            ),
+                            "cell_gear_kind": "none",
+                            "asset_box_2d": None,
+                            "asset_view": None,
+                        }
+                        classification_stage = "pin_recenter_rejected"
+                        if verbose:
+                            progress.result(
+                                "re-center rejected — revert to other"
+                            )
+
     # Stamp imagery context before escalation / dual-model.
     res["nearmap_tier"] = nearmap_tier
     res["nearmap_views"] = ",".join(nearmap_views) if nearmap_views else None
@@ -357,10 +455,14 @@ def classify_site_imagery(
     res["gemini_pre_escalation_cell_conf"] = res.get("cell_equipment_confidence")
     res["gemini_pre_escalation_evidence"] = res.get("cell_equipment_evidence")
     res["gemini_pre_escalation_gear"] = res.get("cell_gear_kind")
-    from_wide_rescue = classification_stage == "wide_aoi" or nearmap_tier in {
-        "naip_wide",
+    from_wide_rescue = classification_stage in {
         "wide_aoi",
-    }
+        "zoom",
+        "pin_recenter_rejected",
+    } or nearmap_tier in {"naip_wide", "wide_aoi"}
+    # Validated pin-recenter is NOT treated as a risky wide rescue.
+    if classification_stage == "pin_recenter":
+        from_wide_rescue = False
 
     # Claude escalation after imagery stages.
     if allow_claude_escalation:
@@ -389,10 +491,13 @@ def classify_site_imagery(
         res,
         views,
     )
+    confirm_views, used_crop = ac.build_cell_confirm_views(res, views)
+    if used_crop and verbose:
+        progress.step("dual-model on cell crop")
     res, dual_model, cell_agree = ac.confirm_rooftop_cell_with_claude(
         res,
         clients,
-        views,
+        confirm_views,
         already_escalated=bool(escalation_model),
         allow_soft_keep=True,
         from_wide_rescue=from_wide_rescue,
@@ -401,6 +506,7 @@ def classify_site_imagery(
         escalation_model = dual_model
         escalation_reason_str = escalation_reason_str or "rooftop_dual_model_cell"
     res["cell_models_agree"] = cell_agree
+    res = ac.align_site_evidence_with_cell(res)
 
     asset_lat = asset_lon = asset_offset_m = None
     box, box_view = res.get("asset_box_2d"), res.get("asset_view")

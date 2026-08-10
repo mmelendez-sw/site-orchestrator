@@ -50,19 +50,43 @@ def build_blank_site_type_query(
     stages: Sequence[str] = DEFAULT_STAGE_FILTER,
     owners: Sequence[str] = DEFAULT_OWNER_FILTER,
     fields: Sequence[str] = SF_QUERY_FIELDS,
+    carrier_like: str | None = "NFL",
 ) -> str:
-    """SOQL for blank Site_Type__c sites whose Carrier_Leasing_Source__c contains NFL."""
+    """SOQL for blank Site_Type__c sites in the enrichment queue.
+
+    `carrier_like` filters Carrier_Leasing_Source__c with LIKE '%value%'.
+    Pass None/"" to skip the carrier filter (e.g. non-NFL test batches).
+    """
+    field_list = ", ".join(fields)
+    clauses = [
+        "(Site_Type__c = null OR Site_Type__c = '')",
+        "LLM_Classified__c = true",
+        "Site_Latitude__c != null AND Site_Latitude__c != ''",
+        "Site_Longitude__c != null AND Site_Longitude__c != ''",
+        f"Stage__c IN ({_soql_in(stages)})",
+        f"Stage__c NOT IN ({_soql_in(EXCLUDED_STAGE_FILTER)})",
+        f"Owner__c IN ({_soql_in(owners)})",
+    ]
+    carrier = (carrier_like or "").strip()
+    if carrier:
+        escaped = carrier.replace("\\", "\\\\").replace("'", "\\'")
+        clauses.insert(1, f"Carrier_Leasing_Source__c LIKE '%{escaped}%'")
+    return f"SELECT {field_list} FROM {OBJECT_NAME} WHERE " + " AND ".join(clauses)
+
+
+def build_sites_by_ids_query(
+    ids: Sequence[str],
+    *,
+    fields: Sequence[str] = SF_QUERY_FIELDS,
+) -> str:
+    """SOQL for an explicit Site__c Id list (controlled test batches)."""
+    clean = [str(i).strip() for i in ids if str(i).strip()]
+    if not clean:
+        raise ValueError("build_sites_by_ids_query requires at least one Id")
     field_list = ", ".join(fields)
     return (
         f"SELECT {field_list} FROM {OBJECT_NAME} "
-        f"WHERE (Site_Type__c = null OR Site_Type__c = '') "
-        f"AND Carrier_Leasing_Source__c LIKE '%NFL%' "
-        f"AND LLM_Classified__c = true "
-        f"AND Site_Latitude__c != null AND Site_Latitude__c != '' "
-        f"AND Site_Longitude__c != null AND Site_Longitude__c != '' "
-        f"AND Stage__c IN ({_soql_in(stages)}) "
-        f"AND Stage__c NOT IN ({_soql_in(EXCLUDED_STAGE_FILTER)}) "
-        f"AND Owner__c IN ({_soql_in(owners)})"
+        f"WHERE Id IN ({_soql_in(clean)})"
     )
 
 
@@ -85,10 +109,30 @@ def query_blank_site_type_sites(
     *,
     stages: Sequence[str] = DEFAULT_STAGE_FILTER,
     owners: Sequence[str] = DEFAULT_OWNER_FILTER,
+    carrier_like: str | None = "NFL",
 ) -> list[dict[str, Any]]:
-    soql = build_blank_site_type_query(stages=stages, owners=owners)
+    soql = build_blank_site_type_query(
+        stages=stages, owners=owners, carrier_like=carrier_like
+    )
     logger.info("Salesforce SOQL: %s", soql)
     return query_all(client, soql)
+
+
+def query_sites_by_ids(
+    client: SalesforceClient,
+    ids: Sequence[str],
+) -> list[dict[str, Any]]:
+    """Fetch Site__c rows by Id, preserving the requested order."""
+    soql = build_sites_by_ids_query(ids)
+    logger.info("Salesforce SOQL: %s", soql)
+    rows = query_all(client, soql)
+    by_id = {str(r.get("Id") or ""): r for r in rows}
+    ordered: list[dict[str, Any]] = []
+    for sid in ids:
+        key = str(sid).strip()
+        if key in by_id:
+            ordered.append(by_id[key])
+    return ordered
 
 
 def parse_sf_lat_lng(row: dict[str, Any]) -> tuple[float, float] | None:

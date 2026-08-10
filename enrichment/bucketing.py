@@ -138,6 +138,45 @@ def _has_asset_box(classified: dict[str, Any]) -> bool:
     return bool(str(classified.get("asset_view") or "").strip())
 
 
+def _asset_view_is_nearmap_oblique(classified: dict[str, Any]) -> bool:
+    view = str(classified.get("asset_view") or "").strip().lower()
+    if not view or "naip" in view:
+        return False
+    if "oblique" in view:
+        return True
+    return any(d in view for d in ("north", "east", "south", "west"))
+
+
+def _rooftop_oblique_box_ok(classified: dict[str, Any]) -> bool:
+    """Rooftop SF writes require a compact box on a Nearmap oblique view."""
+    box = _parse_asset_box_2d(classified)
+    if not box:
+        return False
+    if not _asset_view_is_nearmap_oblique(classified):
+        return False
+    ymin, xmin, ymax, xmax = box
+    # Reject whole-roof / whole-facade boxes.
+    if (ymax - ymin) > 400 or (xmax - xmin) > 400:
+        return False
+    return True
+
+
+def _view_evidence_consistent(classified: dict[str, Any]) -> bool:
+    """Reject NAIP boxes when cell evidence cites a Nearmap oblique direction."""
+    evidence = str(classified.get("cell_equipment_evidence") or "").lower()
+    view = str(classified.get("asset_view") or "").lower()
+    if not evidence:
+        return True
+    directions = [d for d in ("north", "east", "south", "west") if d in evidence]
+    cites_oblique = "oblique" in evidence or bool(directions)
+    if cites_oblique and view.startswith("naip"):
+        return False
+    if directions and view and _asset_view_is_nearmap_oblique(classified):
+        if not any(d in view for d in directions):
+            return False
+    return True
+
+
 def _dual_model_cell_ok(classified: dict[str, Any]) -> bool:
     """Rooftops require Gemini+Claude agreement that cell gear is present."""
     agree = classified.get("cell_models_agree")
@@ -296,6 +335,10 @@ def bucket_classification(
             return _holdout(BUCKET_ROOFTOP, "rooftop_needs_dual_model_cell", classified)
         if not _has_asset_box(classified):
             return _holdout(BUCKET_ROOFTOP, "rooftop_needs_asset_box", classified)
+        if not _rooftop_oblique_box_ok(classified):
+            return _holdout(BUCKET_ROOFTOP, "rooftop_needs_oblique_asset_box", classified)
+        if not _view_evidence_consistent(classified):
+            return _holdout(BUCKET_ROOFTOP, "rooftop_view_evidence_mismatch", classified)
         if far_offset is not None:
             limit = _effective_max_asset_offset_m()
             return _holdout(

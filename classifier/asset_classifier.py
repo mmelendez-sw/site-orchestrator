@@ -926,6 +926,11 @@ def maybe_recheck_rooftop_cell_crop(
     if res.get("cell_equipment") is not True:
         return res
     box = res.get("asset_box_2d")
+    if isinstance(box, str):
+        try:
+            box = json.loads(box)
+        except json.JSONDecodeError:
+            box = None
     if not isinstance(box, (list, tuple)) or len(box) < 4:
         _step_done("cell crop recheck", "skipped (no asset box)")
         return res
@@ -934,23 +939,16 @@ def maybe_recheck_rooftop_cell_crop(
         _step_done("cell crop recheck", "skipped (invalid box)")
         return res
 
-    target_label = str(res.get("asset_view") or "").strip().lower()
-    source_img = None
-    source_label = None
-    for label, img in views:
-        if target_label and target_label in str(label).strip().lower():
-            source_img, source_label = img, label
-            break
-    if source_img is None:
-        for label, img in views:
-            if "vert" in str(label).lower() or "naip" in str(label).lower():
-                source_img, source_label = img, label
-                break
-    if source_img is None and views:
-        source_label, source_img = views[0]
-
-    if source_img is None:
+    picked = pick_view_for_asset_box(res, views)
+    if picked is None:
         _step_done("cell crop recheck", "skipped (no source image)")
+        return res
+    source_label, source_img = picked
+    # Do not silently crop NAIP when the model claimed an oblique box.
+    if asset_view_is_nearmap_oblique(res.get("asset_view")) and (
+        "naip" in str(source_label).lower()
+    ):
+        _step_done("cell crop recheck", "skipped (oblique box view missing)")
         return res
 
     crop = _crop_zoom(source_img, valid)
@@ -970,7 +968,7 @@ def maybe_recheck_rooftop_cell_crop(
         if recheck.get("cell_gear_kind"):
             res["cell_gear_kind"] = recheck.get("cell_gear_kind")
         normalize_model_result(res)
-        _step_done("cell crop recheck", "confirmed cellular")
+        _step_done("cell crop recheck", f"confirmed cellular on {source_label}")
         return res
 
     res["cell_equipment"] = new_cell
@@ -982,7 +980,7 @@ def maybe_recheck_rooftop_cell_crop(
         res["cell_gear_kind"] = recheck.get("cell_gear_kind")
     normalize_model_result(res)
     label = "downgraded to false" if new_cell is False else "downgraded to null"
-    _step_done("cell crop recheck", label)
+    _step_done("cell crop recheck", f"{label} on {source_label}")
     return res
 
 
@@ -1338,24 +1336,35 @@ def box_to_latlon_centered(
 def nearmap_full_blocks_rescue(
     res: dict, *, nearmap_tier: str, has_obliques: bool
 ) -> bool:
-    """True when full Nearmap+obliques already settled other / rooftop no-cell.
+    """True when full Nearmap+obliques already settled rooftop with no cell.
 
-    Later NAIP-wide / zoom stages must not resurrect a conflicting positive.
+    That means we are on the right building (HVAC-only). Do not let NAIP-wide /
+    zoom invent a conflicting positive.
+
+    `other` / `unclear` does NOT block rescue — the SF pin may be offset and a
+    nearby rooftop may still be recoverable via wide scout + Nearmap re-center.
     """
     if str(nearmap_tier or "").strip().lower() != "full" or not has_obliques:
         return False
     site = str(res.get("site_type") or "").strip().lower()
-    if site in {"other", "unclear"}:
+    return site == "rooftop" and res.get("cell_equipment") is False
+
+
+def asset_view_is_nearmap_oblique(asset_view: str | None) -> bool:
+    view = str(asset_view or "").strip().lower()
+    if not view or "naip" in view:
+        return False
+    if "oblique" in view:
         return True
-    if site == "rooftop" and res.get("cell_equipment") is False:
-        return True
-    return False
+    return any(d in view for d in ("north", "east", "south", "west"))
 
 
 def should_soft_keep_gemini_cell(res: dict, *, from_wide_rescue: bool) -> bool:
     """Allow Gemini cell=true to win a Claude veto when Nearmap+Gemini are strong.
 
-    Never soft-keep after a wide-AOI / NAIP-wide resurrection.
+    Requires full Nearmap obliques, high cell conf, telecom cues, and a compact
+    asset box drawn on a Nearmap oblique (not NAIP / whole-roof boxes).
+    Never soft-keep after an unvalidated wide-AOI resurrection.
     """
     if from_wide_rescue:
         return False
@@ -1363,6 +1372,21 @@ def should_soft_keep_gemini_cell(res: dict, *, from_wide_rescue: bool) -> bool:
         return False
     views = str(res.get("nearmap_views") or "").lower()
     if not any(d in views for d in ("north", "east", "south", "west")):
+        return False
+    if not asset_view_is_nearmap_oblique(res.get("asset_view")):
+        return False
+    box = res.get("asset_box_2d")
+    if isinstance(box, str):
+        try:
+            box = json.loads(box)
+        except json.JSONDecodeError:
+            box = None
+    valid = _valid_box(box) if box is not None else None
+    if not valid:
+        return False
+    ymin, xmin, ymax, xmax = valid
+    # Reject whole-roof / whole-building boxes (loose FP magnets).
+    if (ymax - ymin) > 400 or (xmax - xmin) > 400:
         return False
     conf = normalize_confidence(res.get("cell_equipment_confidence"))
     if conf is None or conf < 0.85:
@@ -1372,6 +1396,70 @@ def should_soft_keep_gemini_cell(res: dict, *, from_wide_rescue: bool) -> bool:
         for key in ("cell_equipment_evidence", "site_evidence")
     )
     return _text_has_telecom_cue(evidence)
+
+
+def align_site_evidence_with_cell(res: dict) -> dict:
+    """Keep site_evidence from claiming cellular gear when cell call is not true."""
+    if res.get("cell_equipment") is True:
+        return res
+    site_ev = str(res.get("site_evidence") or "")
+    if not site_ev:
+        return res
+    if _text_has_telecom_cue(site_ev):
+        res["site_evidence"] = (
+            "Host structure visible on imagery; cellular gear was not confirmed "
+            f"(final cell={res.get('cell_equipment')!r})."
+        )
+        _step_done("site evidence align", "cleared cellular claims (cell not true)")
+    return res
+
+
+def pick_view_for_asset_box(
+    res: dict, views: list
+) -> tuple[str, Image.Image] | None:
+    """Return (label, image) matching asset_view, preferring Nearmap obliques."""
+    if not views:
+        return None
+    target = str(res.get("asset_view") or "").strip().lower()
+    if target:
+        for label, img in views:
+            if target in str(label).strip().lower():
+                return label, img
+    # Prefer any Nearmap oblique over NAIP/vert fallbacks.
+    for label, img in views:
+        lower = str(label).lower()
+        if any(d in lower for d in ("north", "east", "south", "west")) or "oblique" in lower:
+            return label, img
+    for label, img in views:
+        if "vert" in str(label).lower() or "top-down" in str(label).lower():
+            if "naip" not in str(label).lower():
+                return label, img
+    return None
+
+
+def build_cell_confirm_views(res: dict, views: list) -> tuple[list, bool]:
+    """Crop the asset box for dual-model confirm when possible.
+
+    Returns (views_for_confirm, used_crop).
+    """
+    box = res.get("asset_box_2d")
+    if isinstance(box, str):
+        try:
+            box = json.loads(box)
+        except json.JSONDecodeError:
+            box = None
+    valid = _valid_box(box) if isinstance(box, (list, tuple)) else None
+    picked = pick_view_for_asset_box(res, views)
+    if not valid or picked is None:
+        return views, False
+    label, img = picked
+    # Rooftop cell confirm should not run on NAIP when an oblique box was claimed.
+    if asset_view_is_nearmap_oblique(res.get("asset_view")) and (
+        "naip" in str(label).lower()
+    ):
+        return views, False
+    crop = _crop_zoom(img, valid)
+    return [(f"cell crop ({label})", crop), (label, img)], True
 
 
 _nearmap_session = requests.Session()

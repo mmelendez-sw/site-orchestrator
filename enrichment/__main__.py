@@ -76,6 +76,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="Process at most N Salesforce sites",
     )
     parser.add_argument(
+        "--ids",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated Site__c Ids for a controlled test batch "
+            "(bypasses NFL / blank-Site_Type queue filters)"
+        ),
+    )
+    parser.add_argument(
+        "--carrier-like",
+        type=str,
+        default="NFL",
+        help=(
+            "Carrier_Leasing_Source__c LIKE filter (default: NFL). "
+            "Pass empty string to disable carrier filter."
+        ),
+    )
+    parser.add_argument(
         "--max-m",
         type=float,
         default=PROXIMITY_MAX_M,
@@ -193,7 +211,14 @@ def main(argv: list[str] | None = None) -> int:
 
     print("=== AUTHENTICATE SALESFORCE ===", flush=True)
     sf_client = SalesforceClient()
-    print("  ✓ authenticated", flush=True)
+    print("  authenticated", flush=True)
+
+    site_ids = None
+    if args.ids:
+        site_ids = [part.strip() for part in str(args.ids).split(",") if part.strip()]
+    carrier_like = args.carrier_like
+    if carrier_like is not None and str(carrier_like).strip() == "":
+        carrier_like = None
 
     summary = run_enrichment(
         sf_client=sf_client,
@@ -201,6 +226,8 @@ def main(argv: list[str] | None = None) -> int:
         limit=args.limit,
         max_m=args.max_m,
         skip_classify=args.skip_classify,
+        site_ids=site_ids,
+        carrier_like=carrier_like,
         verbose=args.verbose,
     )
     print(summary)
