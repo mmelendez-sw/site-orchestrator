@@ -216,10 +216,20 @@ def classify_site_imagery(
     nearmap_aoi_m = ac.NEARMAP_CHIP_M if nearmap_views else None
     stage_provider = primary_provider
 
-    # Wide Nearmap AOI when still other/unclear and no obliques.
     has_obliques = any(name != "Vert" for name in nearmap_views)
+    nearmap_blocks_rescue = ac.nearmap_full_blocks_rescue(
+        res, nearmap_tier=nearmap_tier, has_obliques=has_obliques
+    )
+    prior_nearmap_no_cell = bool(nearmap_blocks_rescue)
+    if nearmap_blocks_rescue and verbose:
+        progress.result(
+            "Nearmap full+obliques settled negative — skip wide/zoom rescue"
+        )
+
+    # Wide Nearmap AOI when still other/unclear and no obliques.
     if (
-        not ac.NAIP_ONLY
+        not nearmap_blocks_rescue
+        and not ac.NAIP_ONLY
         and ac.NEARMAP_API_KEY
         and res.get("site_type") in ("other", "unclear")
         and not has_obliques
@@ -254,9 +264,10 @@ def classify_site_imagery(
                     f"wide → {res.get('site_type')} conf={res.get('site_confidence')}"
                 )
 
-    # NAIP wide chip retry.
+    # NAIP wide chip retry — never overturn a settled Nearmap full+oblique negative.
     if (
-        ac.WIDE_AOI_STAGE
+        not nearmap_blocks_rescue
+        and ac.WIDE_AOI_STAGE
         and img is not None
         and res.get("site_type") in ("other", "unclear")
         and ac.NAIP_WIDE_CHIP_M > ac.CHIP_SIZE_M
@@ -301,8 +312,12 @@ def classify_site_imagery(
                         f"naip-wide → {res.get('site_type')} conf={res.get('site_confidence')}"
                     )
 
-    # Zoom stage.
-    if ac.ZOOM_STAGE and res.get("site_type") in ("other", "unclear"):
+    # Zoom stage — same Nearmap-final rule.
+    if (
+        not nearmap_blocks_rescue
+        and ac.ZOOM_STAGE
+        and res.get("site_type") in ("other", "unclear")
+    ):
         source_label, source_img = None, None
         if nearmap_views.get("Vert"):
             source_label, source_img = "Nearmap top-down", nearmap_views["Vert"]
@@ -334,6 +349,19 @@ def classify_site_imagery(
                         f"zoom → {res.get('site_type')} conf={res.get('site_confidence')}"
                     )
 
+    # Stamp imagery context before escalation / dual-model.
+    res["nearmap_tier"] = nearmap_tier
+    res["nearmap_views"] = ",".join(nearmap_views) if nearmap_views else None
+    res["classification_stage"] = classification_stage
+    res["gemini_pre_escalation_cell"] = res.get("cell_equipment")
+    res["gemini_pre_escalation_cell_conf"] = res.get("cell_equipment_confidence")
+    res["gemini_pre_escalation_evidence"] = res.get("cell_equipment_evidence")
+    res["gemini_pre_escalation_gear"] = res.get("cell_gear_kind")
+    from_wide_rescue = classification_stage == "wide_aoi" or nearmap_tier in {
+        "naip_wide",
+        "wide_aoi",
+    }
+
     # Claude escalation after imagery stages.
     if allow_claude_escalation:
         if verbose:
@@ -352,6 +380,7 @@ def classify_site_imagery(
         clients,
         res,
         views,
+        prior_nearmap_no_cell=prior_nearmap_no_cell,
     )
     # Magnified crop recheck before dual-model confirm.
     res = ac.maybe_recheck_rooftop_cell_crop(
@@ -365,6 +394,8 @@ def classify_site_imagery(
         clients,
         views,
         already_escalated=bool(escalation_model),
+        allow_soft_keep=True,
+        from_wide_rescue=from_wide_rescue,
     )
     if dual_model and not escalation_model:
         escalation_model = dual_model
@@ -373,8 +404,13 @@ def classify_site_imagery(
 
     asset_lat = asset_lon = asset_offset_m = None
     box, box_view = res.get("asset_box_2d"), res.get("asset_view")
-    if box and ac._is_naip_view(box_view) and naip_geo:
-        located = ac.box_to_latlon(naip_geo, box)
+    if box:
+        located = None
+        if ac._is_naip_view(box_view) and naip_geo:
+            located = ac.box_to_latlon(naip_geo, box)
+        elif box_view and "top-down" in str(box_view).lower():
+            chip_m = float(nearmap_aoi_m or ac.NEARMAP_CHIP_M)
+            located = ac.box_to_latlon_centered(lat, lon, chip_m, box)
         if located:
             asset_lat, asset_lon, asset_offset_m = located
 
@@ -397,6 +433,7 @@ def classify_site_imagery(
         "gemini_cell_equipment": res.get("gemini_cell_equipment"),
         "claude_cell_equipment": res.get("claude_cell_equipment"),
         "cell_models_agree": res.get("cell_models_agree"),
+        "dual_model_resolution": res.get("dual_model_resolution") or "",
         "asset_lat": asset_lat,
         "asset_lon": asset_lon,
         "asset_offset_m": (

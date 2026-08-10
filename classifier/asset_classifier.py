@@ -246,14 +246,21 @@ When site_type is not "tower", set tower_subtype to null.
 Set site_confidence to at most 0.6 unless two or more independent cues or \
 views corroborate the call.
 
-TASK 2 - locate the asset. Identify the exact asset (the tower structure and \
-its compound, or the host building's roof) and report:
+TASK 2 - locate the asset / cellular gear. Report:
 - asset_box_2d: [ymin, xmin, ymax, xmax], integers in 0-1000 normalized image \
-coordinates, drawn TIGHTLY around the asset ON THE FIRST IMAGE provided. If \
-the asset is not visible in the first image, box it on the view where it is \
-clearest instead.
-- asset_view: the exact label of the view the box was drawn on (e.g. "NAIP \
-top-down"). Set both fields to null only if no asset can be located at all.
+coordinates for ONE view only.
+- asset_view: the exact label of that same view (e.g. "Nearmap oblique (South)").
+Boxing rules (critical):
+- Draw the box TIGHTLY around the cellular hardware you are claiming \
+(sector panels, dishes, RRUs, parapet masts, facade mounts) — not the whole \
+building, whole roof, parking deck, or HVAC plant.
+- Prefer the Nearmap oblique where those antennas are clearest. Use Nearmap \
+top-down only when gear is unmistakable from above. Prefer NAIP only when no \
+Nearmap view shows the gear.
+- The box must match the view named in asset_view; never reuse one box across \
+views. Leave both fields null only if no asset/gear can be located.
+- Keep the box compact: typically well under ~25% of the image on each side \
+unless the tower compound truly fills more.
 
 TASK 3 - cell_equipment: is cellular telecom equipment visible on the located asset?
 - true: clear visible evidence of cellular gear; false: none visible; null: cannot \
@@ -284,7 +291,10 @@ Use none when cell_equipment is false; unclear only when you cannot tell.
 
 Field meanings: site_evidence and cell_equipment_evidence are one short \
 sentence each, citing the specific views and cues used. For cell_equipment true, \
-evidence must name the antenna/dish/mount cue — not "equipment on roof".
+evidence must name the antenna/dish/mount cue — not "equipment on roof". \
+site_evidence describes the host structure only; it must NOT claim cellular \
+gear unless cell_equipment is also true. If cell_equipment is false/null, \
+site_evidence must not say "cellular site" / "sector panels" / "antenna mounts".
 """
 
 TOWER_ONLY_CLASSIFICATION_PROMPT = """\
@@ -814,12 +824,16 @@ def _text_denies_telecom(text: str) -> bool:
 
 
 def maybe_recheck_rooftop_cell_false_positive(
-    provider: str, clients: dict, res: dict, views: list
+    provider: str, clients: dict, res: dict, views: list,
+    *, prior_nearmap_no_cell: bool = False,
 ) -> dict:
     """Downgrade rooftop cell=true only when telecom is explicitly ruled out.
 
     HVAC commonly coexists with cell gear — presence of mechanical plant alone
     must not clear a positive cell_equipment call.
+
+    When an earlier full Nearmap pass said no cell, never skip on keyword
+    "antenna cues" alone — force the FP recheck.
     """
     if str(res.get("site_type") or "").strip().lower() != "rooftop":
         return res
@@ -832,10 +846,17 @@ def maybe_recheck_rooftop_cell_false_positive(
         str(res.get(key) or "")
         for key in ("cell_equipment_evidence", "site_evidence")
     )
-    # Strong first-pass antenna call with no HVAC-only smell: skip extra pass.
-    if _text_has_telecom_cue(prior_evidence) and "hvac" not in prior_evidence.lower():
+    # Strong first-pass antenna call with no HVAC-only smell: skip extra pass
+    # unless Nearmap already contradicted cell gear.
+    if (
+        not prior_nearmap_no_cell
+        and _text_has_telecom_cue(prior_evidence)
+        and "hvac" not in prior_evidence.lower()
+    ):
         _step_done("cell FP recheck", "skipped (clear antenna cues)")
         return res
+    if prior_nearmap_no_cell:
+        _step_done("cell FP recheck", "forced (prior Nearmap no-cell)")
 
     recheck = classify_site(
         provider, clients, views, prompt=EQUIPMENT_FALSE_POSITIVE_RECHECK_PROMPT
@@ -966,30 +987,93 @@ def maybe_recheck_rooftop_cell_crop(
 
 
 def confirm_rooftop_cell_with_claude(
-    res: dict, clients: dict, views: list, *, already_escalated: bool
+    res: dict,
+    clients: dict,
+    views: list,
+    *,
+    already_escalated: bool,
+    allow_soft_keep: bool = True,
+    from_wide_rescue: bool = False,
 ) -> tuple[dict, str | None, bool]:
     """Require Claude agreement that rooftop cell gear is present.
 
     Returns (res, escalation_model_or_None, cell_models_agree).
+
+    When Claude vetoes but Nearmap obliques + strong Gemini cell agree (and the
+    positive did not come from a wide-AOI rescue), soft-keep Gemini so real
+    rooftops are not lost to a lone Claude false.
     """
-    if str(res.get("site_type") or "").strip().lower() != "rooftop":
+    site = str(res.get("site_type") or "").strip().lower()
+    if site != "rooftop":
         return res, None, False
+
+    def _apply_soft_keep(reason: str) -> tuple[dict, str | None, bool]:
+        res["cell_equipment"] = True
+        pre_conf = res.get("gemini_pre_escalation_cell_conf")
+        pre_ev = res.get("gemini_pre_escalation_evidence")
+        pre_gear = res.get("gemini_pre_escalation_gear")
+        if pre_conf is not None:
+            res["cell_equipment_confidence"] = pre_conf
+        elif res.get("cell_equipment_confidence") is None:
+            pass
+        if pre_ev:
+            res["cell_equipment_evidence"] = (
+                f"{pre_ev} | Claude veto soft-kept (Nearmap+Gemini)"
+            )
+        if pre_gear:
+            res["cell_gear_kind"] = pre_gear
+        res["gemini_cell_equipment"] = True
+        res["cell_models_agree"] = True
+        res["dual_model_resolution"] = "soft_keep_gemini"
+        normalize_model_result(res)
+        _step_done("dual-model cell", reason)
+        return res, "claude", True
+
+    def _soft_keep_candidate() -> dict:
+        trial = dict(res)
+        trial["cell_equipment"] = True
+        if res.get("gemini_pre_escalation_cell_conf") is not None:
+            trial["cell_equipment_confidence"] = res.get(
+                "gemini_pre_escalation_cell_conf"
+            )
+        if res.get("gemini_pre_escalation_evidence"):
+            trial["cell_equipment_evidence"] = res.get(
+                "gemini_pre_escalation_evidence"
+            )
+        return trial
+
     if res.get("cell_equipment") is not True:
+        res["claude_cell_equipment"] = res.get("cell_equipment")
+        res["gemini_cell_equipment"] = res.get("gemini_pre_escalation_cell")
+        if (
+            already_escalated
+            and allow_soft_keep
+            and res.get("gemini_pre_escalation_cell") is True
+            and should_soft_keep_gemini_cell(
+                _soft_keep_candidate(), from_wide_rescue=from_wide_rescue
+            )
+        ):
+            return _apply_soft_keep(
+                "disagree → soft-keep Gemini (Nearmap+Gemini)"
+            )
         res["cell_models_agree"] = False
-        res["gemini_cell_equipment"] = res.get("cell_equipment")
-        return res, None, False
+        return res, ("claude" if already_escalated else None), False
 
     gemini_cell = True
     res["gemini_cell_equipment"] = True
+    gemini_conf = res.get("cell_equipment_confidence")
+    gemini_evidence = res.get("cell_equipment_evidence")
+    gemini_gear = res.get("cell_gear_kind")
+    # Preserve Gemini snapshot for soft-keep if not already stamped.
+    res.setdefault("gemini_pre_escalation_cell", True)
+    res.setdefault("gemini_pre_escalation_cell_conf", gemini_conf)
+    res.setdefault("gemini_pre_escalation_evidence", gemini_evidence)
+    res.setdefault("gemini_pre_escalation_gear", gemini_gear)
 
     if already_escalated:
-        # Final res is already Claude's classification from escalation.
         agree = res.get("cell_equipment") is True
         res["claude_cell_equipment"] = res.get("cell_equipment")
         res["cell_models_agree"] = agree
-        if not agree:
-            # Keep Claude's negative call.
-            pass
         _step_done(
             "dual-model cell",
             "agree" if agree else "disagree (Claude negative)",
@@ -1013,7 +1097,6 @@ def confirm_rooftop_cell_with_claude(
     agree = gemini_cell and claude_cell
     res["cell_models_agree"] = agree
     if claude_cell:
-        # Prefer Claude evidence/confidence when confirming.
         if claude_res.get("cell_equipment_confidence") is not None:
             res["cell_equipment_confidence"] = claude_res.get(
                 "cell_equipment_confidence"
@@ -1023,7 +1106,20 @@ def confirm_rooftop_cell_with_claude(
         if claude_res.get("cell_gear_kind"):
             res["cell_gear_kind"] = claude_res.get("cell_gear_kind")
         res["cell_equipment"] = True
+        res["dual_model_resolution"] = "agree"
     else:
+        if allow_soft_keep and should_soft_keep_gemini_cell(
+            res, from_wide_rescue=from_wide_rescue
+        ):
+            if gemini_evidence or claude_res.get("cell_equipment_evidence"):
+                res["cell_equipment_evidence"] = (
+                    f"{gemini_evidence or ''} | Claude veto soft-kept "
+                    f"(Nearmap+Gemini); Claude: "
+                    f"{claude_res.get('cell_equipment_evidence') or 'cell=false'}"
+                ).strip(" |")
+            return _apply_soft_keep(
+                "disagree → soft-keep Gemini (Nearmap+Gemini)"
+            )
         res["cell_equipment"] = claude_res.get("cell_equipment")
         if claude_res.get("cell_equipment_evidence"):
             res["cell_equipment_evidence"] = claude_res.get("cell_equipment_evidence")
@@ -1033,6 +1129,7 @@ def confirm_rooftop_cell_with_claude(
             res["cell_equipment_confidence"] = claude_res.get(
                 "cell_equipment_confidence"
             )
+        res["dual_model_resolution"] = "claude_veto"
     normalize_model_result(res)
     _step_done("dual-model cell", "agree" if agree else "disagree")
     return res, "claude", agree
@@ -1207,6 +1304,74 @@ def box_to_latlon(geo: dict, box) -> tuple[float, float, float] | None:
     center_y = (geo["y_min"] + geo["y_max"]) / 2.0
     offset_m = math.hypot(x - center_x, y - center_y)
     return lat, lon, offset_m
+
+
+def box_to_latlon_centered(
+    lat: float, lon: float, chip_m: float, box
+) -> tuple[float, float, float] | None:
+    """Geocode a top-down chip box when the AOI is a square centered on lat/lon.
+
+    Used for Nearmap Vert (and similar) where we lack a projected CRS geo dict.
+    """
+    try:
+        ymin, xmin, ymax, xmax = (float(v) for v in box[:4])
+        side = float(chip_m)
+    except (TypeError, ValueError):
+        return None
+    if side <= 0:
+        return None
+    if not (0 <= ymin <= ymax <= 1000 and 0 <= xmin <= xmax <= 1000):
+        return None
+    cx = (xmin + xmax) / 2000.0
+    cy = (ymin + ymax) / 2000.0
+    east_m = (cx - 0.5) * side
+    south_m = (cy - 0.5) * side
+    dlat = -south_m / 111_320.0
+    cos_lat = math.cos(math.radians(lat))
+    if abs(cos_lat) < 1e-6:
+        return None
+    dlon = east_m / (111_320.0 * cos_lat)
+    offset_m = math.hypot(east_m, south_m)
+    return lat + dlat, lon + dlon, offset_m
+
+
+def nearmap_full_blocks_rescue(
+    res: dict, *, nearmap_tier: str, has_obliques: bool
+) -> bool:
+    """True when full Nearmap+obliques already settled other / rooftop no-cell.
+
+    Later NAIP-wide / zoom stages must not resurrect a conflicting positive.
+    """
+    if str(nearmap_tier or "").strip().lower() != "full" or not has_obliques:
+        return False
+    site = str(res.get("site_type") or "").strip().lower()
+    if site in {"other", "unclear"}:
+        return True
+    if site == "rooftop" and res.get("cell_equipment") is False:
+        return True
+    return False
+
+
+def should_soft_keep_gemini_cell(res: dict, *, from_wide_rescue: bool) -> bool:
+    """Allow Gemini cell=true to win a Claude veto when Nearmap+Gemini are strong.
+
+    Never soft-keep after a wide-AOI / NAIP-wide resurrection.
+    """
+    if from_wide_rescue:
+        return False
+    if str(res.get("nearmap_tier") or "").strip().lower() != "full":
+        return False
+    views = str(res.get("nearmap_views") or "").lower()
+    if not any(d in views for d in ("north", "east", "south", "west")):
+        return False
+    conf = normalize_confidence(res.get("cell_equipment_confidence"))
+    if conf is None or conf < 0.85:
+        return False
+    evidence = " ".join(
+        str(res.get(key) or "")
+        for key in ("cell_equipment_evidence", "site_evidence")
+    )
+    return _text_has_telecom_cue(evidence)
 
 
 _nearmap_session = requests.Session()
@@ -2785,7 +2950,15 @@ def main():
             # Wide-AOI fallback: rural sites often have vert-only Nearmap
             # coverage, and the asset may sit outside the narrow AOI entirely
             has_obliques = any(n != "Vert" for n in nearmap_views)
-            if (not NAIP_ONLY and NEARMAP_API_KEY
+            nearmap_blocks_rescue = nearmap_full_blocks_rescue(
+                res, nearmap_tier=nearmap_tier, has_obliques=has_obliques
+            )
+            if nearmap_blocks_rescue:
+                _step_done(
+                    "Nearmap settled",
+                    "full+obliques negative — skip wide/zoom rescue",
+                )
+            if (not nearmap_blocks_rescue and not NAIP_ONLY and NEARMAP_API_KEY
                     and res.get("site_type") in ("other", "unclear")
                     and not has_obliques):
                 try:
@@ -2809,7 +2982,7 @@ def main():
 
             # NAIP zoom-out: tower may sit just outside the 250 m frame (coords off).
             # One extra Gemini call — cheap catch for "tower exists but out of picture".
-            if (WIDE_AOI_STAGE and img is not None
+            if (not nearmap_blocks_rescue and WIDE_AOI_STAGE and img is not None
                     and res.get("site_type") in ("other", "unclear")
                     and NAIP_WIDE_CHIP_M > CHIP_SIZE_M):
                 try:
@@ -2848,7 +3021,8 @@ def main():
 
             # Two-stage zoom: scout suspicious regions, magnify, re-classify.
             force_zoom = label_hint == "stealth"
-            if ZOOM_STAGE and (force_zoom or res.get("site_type") in ("other", "unclear")):
+            if (not nearmap_blocks_rescue and ZOOM_STAGE
+                    and (force_zoom or res.get("site_type") in ("other", "unclear"))):
                 source_label, source_img = None, None
                 if nearmap_views.get("Vert"):
                     source_label, source_img = "Nearmap top-down", nearmap_views["Vert"]

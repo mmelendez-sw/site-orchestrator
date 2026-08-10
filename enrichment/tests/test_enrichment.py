@@ -218,13 +218,41 @@ class BucketTests(unittest.TestCase):
     def test_rooftop_needs_asset_box(self):
         decision = bucket_classification(
             match_source=MATCH_SOURCE_NONE,
-            classified=_rooftop_ok(asset_lat="", asset_lon=""),
+            classified=_rooftop_ok(asset_lat="", asset_lon="", asset_box_2d=""),
             db_lat=None,
             db_lng=None,
             sf_lat=43.0,
             sf_lng=-89.0,
         )
         self.assertEqual(decision["holdout_reason"], "rooftop_needs_asset_box")
+
+    def test_rooftop_nearmap_box_pin_is_candidate(self):
+        decision = bucket_classification(
+            match_source=MATCH_SOURCE_NONE,
+            classified=_rooftop_ok(
+                asset_lat="",
+                asset_lon="",
+                asset_box_2d="[200, 300, 500, 600]",
+                asset_view="Nearmap oblique (North)",
+            ),
+            db_lat=None,
+            db_lng=None,
+            sf_lat=43.0,
+            sf_lng=-89.0,
+        )
+        self.assertEqual(decision["bucket"], BUCKET_POTENTIAL_UPDATE)
+        self.assertEqual(decision["update_coord_source"], "nearmap_asset_box_pin")
+
+    def test_rooftop_unclear_gear_with_cues_ok(self):
+        decision = bucket_classification(
+            match_source=MATCH_SOURCE_NONE,
+            classified=_rooftop_ok(cell_gear_kind="unclear"),
+            db_lat=None,
+            db_lng=None,
+            sf_lat=43.0,
+            sf_lng=-89.0,
+        )
+        self.assertEqual(decision["bucket"], BUCKET_POTENTIAL_UPDATE)
 
     def test_rooftop_naip_only_forbidden(self):
         decision = bucket_classification(
@@ -423,6 +451,77 @@ class DuplicateFallbackTests(unittest.TestCase):
         )
         self.assertTrue(entry["success"])
         self.assertEqual(entry["payload"], {"LLM_Classified__c": False})
+
+
+class ReviewOverlayTests(unittest.TestCase):
+    def test_parse_asset_box_and_view_match(self):
+        from enrichment.review import chip_matches_asset_view, parse_asset_box
+
+        self.assertEqual(parse_asset_box("[100, 200, 300, 450]"), [100, 200, 300, 450])
+        self.assertIsNone(parse_asset_box("[900, 100, 100, 200]"))
+        self.assertTrue(
+            chip_matches_asset_view(
+                "a0Z_nearmap_north.jpg", "Nearmap oblique (North)"
+            )
+        )
+        self.assertFalse(
+            chip_matches_asset_view("a0Z_nearmap_vert.jpg", "Nearmap oblique (North)")
+        )
+
+
+class CoordinationHelperTests(unittest.TestCase):
+    def test_nearmap_full_blocks_rescue(self):
+        from classifier import asset_classifier as ac
+
+        self.assertTrue(
+            ac.nearmap_full_blocks_rescue(
+                {"site_type": "other", "cell_equipment": False},
+                nearmap_tier="full",
+                has_obliques=True,
+            )
+        )
+        self.assertTrue(
+            ac.nearmap_full_blocks_rescue(
+                {"site_type": "rooftop", "cell_equipment": False},
+                nearmap_tier="full",
+                has_obliques=True,
+            )
+        )
+        self.assertFalse(
+            ac.nearmap_full_blocks_rescue(
+                {"site_type": "rooftop", "cell_equipment": True},
+                nearmap_tier="full",
+                has_obliques=True,
+            )
+        )
+        self.assertFalse(
+            ac.nearmap_full_blocks_rescue(
+                {"site_type": "other"},
+                nearmap_tier="full",
+                has_obliques=False,
+            )
+        )
+
+    def test_soft_keep_gemini_requires_full_oblique_and_cues(self):
+        from classifier import asset_classifier as ac
+
+        base = {
+            "nearmap_tier": "full",
+            "nearmap_views": "Vert,North,East",
+            "cell_equipment_confidence": 0.9,
+            "cell_equipment_evidence": "North oblique shows sector panel antennas",
+            "site_evidence": "rooftop site",
+        }
+        self.assertTrue(
+            ac.should_soft_keep_gemini_cell(base, from_wide_rescue=False)
+        )
+        self.assertFalse(
+            ac.should_soft_keep_gemini_cell(base, from_wide_rescue=True)
+        )
+        weak = {**base, "nearmap_tier": "naip_wide"}
+        self.assertFalse(
+            ac.should_soft_keep_gemini_cell(weak, from_wide_rescue=False)
+        )
 
 
 if __name__ == "__main__":

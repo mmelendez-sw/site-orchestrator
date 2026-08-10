@@ -80,8 +80,9 @@ MIN_UPDATE_CONFIDENCE = 0.6
 MIN_ROOFTOP_CELL_CONFIDENCE = 0.75
 
 # Stricter bars when there is no FCC/TowerSource proximity hit.
-MIN_IMAGERY_ONLY_SITE_CONFIDENCE = 0.85
-MIN_IMAGERY_ONLY_CELL_CONFIDENCE = 0.85
+# Slightly below prior 0.85 so strong Nearmap rooftops are not lost on conf alone.
+MIN_IMAGERY_ONLY_SITE_CONFIDENCE = 0.80
+MIN_IMAGERY_ONLY_CELL_CONFIDENCE = 0.80
 
 # When Gemini cell conf is in this band, Claude confirmation is mandatory
 # before a rooftop SF write (also required whenever Gemini cell=true).

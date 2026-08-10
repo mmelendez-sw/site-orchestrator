@@ -73,14 +73,42 @@ def _telecom_evidence_cues(classified: dict[str, Any]) -> bool:
     return any(cue in text for cue in cues)
 
 
+def _parse_asset_box_2d(classified: dict[str, Any]) -> list[int] | None:
+    raw = classified.get("asset_box_2d")
+    if raw is None or raw == "":
+        return None
+    value: Any = raw
+    if isinstance(value, str):
+        import json
+
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return None
+    if not isinstance(value, (list, tuple)) or len(value) < 4:
+        return None
+    try:
+        ymin, xmin, ymax, xmax = (int(v) for v in value[:4])
+    except (TypeError, ValueError):
+        return None
+    if not (0 <= ymin < ymax <= 1000 and 0 <= xmin < xmax <= 1000):
+        return None
+    return [ymin, xmin, ymax, xmax]
+
+
 def _cell_gear_kind_ok(classified: dict[str, Any]) -> bool:
-    """Accept structured gear kinds that are not none/unclear/blank."""
+    """Accept structured gear kinds that are not none/blank.
+
+    `unclear` is allowed when free-text evidence still cites telecom gear.
+    """
     kind = str(classified.get("cell_gear_kind") or "").strip().lower()
     if not kind:
         # Older runs / models may omit the field — fall back to text cues.
         return _telecom_evidence_cues(classified)
-    if kind in {"none", "unclear"}:
+    if kind == "none":
         return False
+    if kind == "unclear":
+        return _telecom_evidence_cues(classified)
     return kind in CELL_GEAR_KINDS or kind.replace(" ", "_") in CELL_GEAR_KINDS
 
 
@@ -90,16 +118,24 @@ def _rooftop_oblique_imagery_ok(classified: dict[str, Any]) -> bool:
 
 
 def _has_asset_box(classified: dict[str, Any]) -> bool:
+    """True when we have geocoded coords or a valid model box on a named view."""
     try:
         lat = classified.get("asset_lat")
         lon = classified.get("asset_lon")
-        if lat is None or lon is None or str(lat).strip() == "" or str(lon).strip() == "":
-            return False
-        float(lat)
-        float(lon)
-        return True
+        if (
+            lat is not None
+            and lon is not None
+            and str(lat).strip() != ""
+            and str(lon).strip() != ""
+        ):
+            float(lat)
+            float(lon)
+            return True
     except (TypeError, ValueError):
+        pass
+    if not _parse_asset_box_2d(classified):
         return False
+    return bool(str(classified.get("asset_view") or "").strip())
 
 
 def _dual_model_cell_ok(classified: dict[str, Any]) -> bool:
@@ -333,10 +369,17 @@ def _resolve_update_coords(
     asset_lat = classified.get("asset_lat")
     asset_lon = classified.get("asset_lon")
     try:
-        if asset_lat is not None and asset_lon is not None:
+        if asset_lat is not None and asset_lon is not None and str(asset_lat).strip() != "":
             return float(asset_lat), float(asset_lon), "naip_asset_box"
     except (TypeError, ValueError):
         pass
+
+    # Nearmap (or other) box without geocode: pin is acceptable when the model
+    # drew an asset box on the pin-centered chip.
+    if require_asset_box and _parse_asset_box_2d(classified):
+        if sf_lat is not None and sf_lng is not None:
+            return sf_lat, sf_lng, "nearmap_asset_box_pin"
+        return None, None, "none"
 
     if require_asset_box:
         return None, None, "none"

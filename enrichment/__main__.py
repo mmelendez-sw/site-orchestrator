@@ -159,7 +159,7 @@ def main(argv: list[str] | None = None) -> int:
             logging.error("--rebuild-review requires --run-dir")
             return 1
         review_dir = write_review_package(run_dir)
-        print(f"Rebuilt review package → {review_dir}")
+        print(f"Rebuilt review package -> {review_dir}")
         return 0
 
     if args.apply_only:

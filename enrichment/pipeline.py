@@ -150,11 +150,18 @@ def run_enrichment(
             for r in detail_rows
             if r.get("bucket") in {BUCKET_ROOFTOP, BUCKET_OTHER}
         ]
+        rooftop_holdouts = [
+            r for r in detail_rows if r.get("bucket") == BUCKET_ROOFTOP
+        ]
         if verbose:
             progress.stage("4/4 WRITE CSVs", str(run_dir.name))
         write_csv(run_dir / CANDIDATE_CSV, candidates, CANDIDATE_COLUMNS)
         write_csv(run_dir / HOLDOUT_CSV, holdouts, HOLDOUT_COLUMNS)
-        review_dir = write_review_package(run_dir, candidates=candidates)
+        review_dir = write_review_package(
+            run_dir,
+            candidates=candidates,
+            rooftop_holdouts=rooftop_holdouts,
+        )
         if verbose:
             progress.result(
                 f"updates={len(candidates)} holdouts={len(holdouts)} total={len(detail_rows)}"
@@ -374,6 +381,7 @@ def _process_site(
     base["gemini_cell_equipment"] = classified.get("gemini_cell_equipment", "")
     base["claude_cell_equipment"] = classified.get("claude_cell_equipment", "")
     base["cell_models_agree"] = classified.get("cell_models_agree", "")
+    base["dual_model_resolution"] = classified.get("dual_model_resolution") or ""
     base["classification_stage"] = classified.get("classification_stage") or ""
     base["nearmap_tier"] = classified.get("nearmap_tier") or ""
     base["nearmap_views"] = classified.get("nearmap_views") or ""
@@ -384,6 +392,8 @@ def _process_site(
     base["asset_lat"] = classified.get("asset_lat") or ""
     base["asset_lon"] = classified.get("asset_lon") or ""
     base["asset_offset_m"] = classified.get("asset_offset_m") or ""
+    base["asset_box_2d"] = classified.get("asset_box_2d") or ""
+    base["asset_view"] = classified.get("asset_view") or ""
     if classified.get("error"):
         base["error"] = classified.get("error")
 
