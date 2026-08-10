@@ -97,6 +97,9 @@ ZOOM_STAGE = _env_flag("ZOOM_STAGE", default="1")
 WIDE_AOI_STAGE = _env_flag("WIDE_AOI_STAGE", default="1")
 TIER_CONF_HIGH = float(os.environ.get("TIER_CONF_HIGH", "0.75"))
 TIER_CONF_MEDIUM = float(os.environ.get("TIER_CONF_MEDIUM", "0.6"))
+# Rooftop cell_equipment_confidence bar for early-stop / Claude skip (matches
+# enrichment MIN_ROOFTOP_CELL_CONFIDENCE). Below this → keep fetching / escalate.
+ROOFTOP_CELL_CONF_MIN = float(os.environ.get("ROOFTOP_CELL_CONF_MIN", "0.75"))
 # Stale NAIP cannot early-stop Nearmap for rooftops (equipment may post-date the chip),
 # unless confidence is at/above this override (definitive NAIP-only identification).
 NAIP_MAX_AGE_YEARS = float(os.environ.get("NAIP_MAX_AGE_YEARS", "2"))
@@ -1339,15 +1342,50 @@ def site_confidence_band(res: dict) -> str:
     return "low"
 
 
+def _is_rooftop(res: dict) -> bool:
+    return str(res.get("site_type") or "").strip().lower() == "rooftop"
+
+
+def _rooftop_cell_confirmed(res: dict) -> bool:
+    """True when rooftop cell gear is true at/above ROOFTOP_CELL_CONF_MIN.
+
+    Missing cell_equipment_confidence still counts as confirmed when
+    cell_equipment is True (model sometimes omits the numeric field).
+    """
+    if res.get("cell_equipment") is not True:
+        return False
+    cell_conf = normalize_confidence(res.get("cell_equipment_confidence"))
+    if cell_conf is None:
+        return True
+    return cell_conf >= ROOFTOP_CELL_CONF_MIN
+
+
 def tier_confident_stop(res: dict) -> bool:
-    """True when tiered fetch can stop without pulling the next Nearmap tier."""
+    """True when tiered fetch can stop without pulling the next Nearmap tier.
+
+    Towers: medium+ site conf and cell_equipment decided (true or false).
+    Rooftops: medium+ site conf and confirmed cellular gear (true + conf bar).
+    cell=false/null on a rooftop must continue — facade/parapet gear is often
+    invisible on NAIP/Vert alone.
+    """
     if res.get("site_type") not in _positive_site_types():
         return False
     if site_confidence_band(res) == "low":
         return False
+    if _is_rooftop(res):
+        return _rooftop_cell_confirmed(res)
     if res.get("cell_equipment") is None:
         return False
     return True
+
+
+def rooftop_requires_nearmap_tiers(res: dict) -> bool:
+    """Rooftops always take Vert + obliques when Nearmap is available.
+
+    Even a strong NAIP/Vert cell=true call still pulls obliques so facade
+    mounts can raise (or challenge) cell confidence before SF write.
+    """
+    return _is_rooftop(res)
 
 
 def naip_age_blocks_early_stop(
@@ -1363,6 +1401,8 @@ def naip_age_blocks_early_stop(
     NAIP_MAX_AGE_YEARS continue to Nearmap, unless confidence is at/above
     NAIP_AGE_HIGH_CONF_OVERRIDE (definitive asset ID on NAIP alone).
     Early-stop still also requires tier_confident_stop (equipment decided).
+    Note: classify_with_tiers also forces Nearmap for all rooftops via
+    rooftop_requires_nearmap_tiers regardless of age.
     """
     if naip_age_years is None:
         return False
@@ -1373,7 +1413,7 @@ def naip_age_blocks_early_stop(
     limit = NAIP_MAX_AGE_YEARS if max_age_years is None else float(max_age_years)
     if age <= limit:
         return False
-    if str(res.get("site_type") or "").strip().lower() != "rooftop":
+    if not _is_rooftop(res):
         return False
     conf = normalize_confidence(res.get("site_confidence"))
     override = (
@@ -1388,8 +1428,14 @@ def naip_age_blocks_early_stop(
 
 def escalation_reason(res: dict) -> str | None:
     """Why a Gemini result should escalate to Claude; None if no escalation."""
-    # Definitive no-gear after Nearmap/Gemini — don't burn Claude credits.
-    if res.get("cell_equipment") is False:
+    # Rooftops: burn Claude when cellular gear is not yet confirmed at bar.
+    if _is_rooftop(res):
+        if res.get("cell_equipment") is not True:
+            return "rooftop_cell_unconfirmed"
+        if not _rooftop_cell_confirmed(res):
+            return "rooftop_low_cell_confidence"
+    elif res.get("cell_equipment") is False:
+        # Towers (and non-rooftop): definitive no-gear — skip Claude.
         return None
     if res.get("site_type") == "other":
         return "other_type"
@@ -1437,9 +1483,16 @@ def classify_with_tiers(lat: float, lon: float, img: Image.Image | None,
     res = classify_site(provider, clients, views, prompt=prompt)
     res = maybe_recheck_equipment(provider, clients, res, views, input_confidence)
     _step_done("classify (NAIP)", _brief_pass_result(res))
-    if tier_confident_stop(res) and not naip_age_blocks_early_stop(res, naip_age_years):
+    force_nearmap = rooftop_requires_nearmap_tiers(res)
+    age_blocks = naip_age_blocks_early_stop(res, naip_age_years)
+    if tier_confident_stop(res) and not age_blocks and not force_nearmap:
         return res, nearmap_views, nearmap_date, "naip_only", views
-    if tier_confident_stop(res) and naip_age_blocks_early_stop(res, naip_age_years):
+    if force_nearmap and NEARMAP_API_KEY:
+        _step_done(
+            "Nearmap required",
+            "rooftop — Vert+obliques for cellular confirmation",
+        )
+    elif tier_confident_stop(res) and age_blocks:
         _step_done(
             "Nearmap required",
             f"rooftop on NAIP age {naip_age_years}y > {NAIP_MAX_AGE_YEARS:g}y "
@@ -1462,7 +1515,8 @@ def classify_with_tiers(lat: float, lon: float, img: Image.Image | None,
     res = maybe_recheck_equipment(provider, clients, res, views, input_confidence)
     res = maybe_recheck_rooftop_cell_false_positive(provider, clients, res, views)
     _step_done("classify (Nearmap vert)", _brief_pass_result(res))
-    if tier_confident_stop(res):
+    # Rooftops always continue to obliques; towers may stop when confident.
+    if tier_confident_stop(res) and not rooftop_requires_nearmap_tiers(res):
         return res, nearmap_views, nearmap_date, "vert_only", views
 
     missing = [v for v in OBLIQUE_VIEWS if v not in nearmap_views]
