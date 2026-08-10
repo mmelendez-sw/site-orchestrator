@@ -221,12 +221,14 @@ Perform three tasks:
 
 TASK 1 - site_type. Search the ENTIRE extent of EVERY view - edges and corners \
 included, never just the center - and classify the site:
-- "tower": a tower (as defined above) is visible anywhere in the imagery. A \
-tower outranks nearby buildings - never call a site "rooftop" merely because a \
-large building is more prominent than a thin mast.
+- "tower": a PURPOSE-BUILT cellular/telecom tower is visible. Must show cell \
+platforms, sector racks, microwave dishes, or a fenced telecom compound — NOT \
+a wood utility pole, street light, traffic signal, power transmission lattice, \
+or tree. Power/transmission lattices and bare utility poles are "other".
 - "rooftop": no tower present, and a building roof hosts (or most plausibly \
 hosts) the equipment.
-- "other": neither applies (water tank, silo, bare field, etc.) - describe it.
+- "other": neither applies (water tank, silo, bare field, power lattice, \
+utility pole without cell racks, etc.) - describe it.
 - "unclear": image quality or ambiguity prevents a confident call.
 When site_type is "tower", also set tower_subtype to the best match:
 - "monopole": single thin pole, minimal footprint, no lattice faces
@@ -275,6 +277,10 @@ shaded parapets, or when it sits next to HVAC. In oblique views, inspect sunlit 
 AND shaded roof edges, corners, and mechanical zones before calling false. \
 Top-down-only HVAC clusters must never be called cellular by themselves — but \
 HVAC next to panel antennas is still cell_equipment=true.
+
+Also set cell_gear_kind to exactly one of:
+sector_panel | facade_mount | microwave | rru | parapet_mast | none | unclear
+Use none when cell_equipment is false; unclear only when you cannot tell.
 
 Field meanings: site_evidence and cell_equipment_evidence are one short \
 sentence each, citing the specific views and cues used. For cell_equipment true, \
@@ -413,8 +419,34 @@ cell_equipment_evidence (e.g. "no panel antennas or dishes; HVAC only").
 
 Set cell_equipment=null if resolution/angle cannot separate HVAC from antennas.
 
+Also set cell_gear_kind to sector_panel | facade_mount | microwave | rru | \
+parapet_mast | none | unclear.
+
 Return the same JSON schema. Evidence must state whether antennas/dishes are \
 present or absent — do not flip to false merely because HVAC is visible.
+"""
+
+ROOFTOP_CELL_CROP_RECHECK_PROMPT = """\
+You are inspecting a MAGNIFIED crop of a rooftop/facade region previously \
+flagged as having cellular equipment.
+
+Decide ONLY whether cellular telecom hardware is visible in this crop:
+- true: unmistakable sector panels, facade mounts, dishes, RRUs, or antenna masts
+- false: only HVAC, vents, pipes, drains, skylights, solar, or blank roof
+- null: still ambiguous at this crop resolution
+
+Set cell_gear_kind accordingly (sector_panel | facade_mount | microwave | rru | \
+parapet_mast | none | unclear). Prefer false over true when unsure.
+Return the same JSON schema.
+"""
+
+ROOFTOP_CELL_DUAL_CONFIRM_PROMPT = """\
+Independent confirmation pass: does this site show CLEAR cellular equipment on \
+a rooftop or facade (sector panels, facade mounts, dishes, RRUs, parapet masts)?
+
+Answer cell_equipment true only with unmistakable telecom hardware. HVAC-only \
+roofs are false. Set cell_gear_kind and cite the view in cell_equipment_evidence.
+Return the same JSON schema.
 """
 
 # Enforced via Claude tool input_schema so every reply parses into this shape.
@@ -439,6 +471,18 @@ RESPONSE_SCHEMA = {
         "cell_equipment": {"type": "boolean"},
         "cell_equipment_confidence": {"type": "number"},
         "cell_equipment_evidence": {"type": "string"},
+        "cell_gear_kind": {
+            "type": "string",
+            "enum": [
+                "sector_panel",
+                "facade_mount",
+                "microwave",
+                "rru",
+                "parapet_mast",
+                "none",
+                "unclear",
+            ],
+        },
     },
     "required": ["site_type", "site_confidence", "site_evidence"],
 }
@@ -468,6 +512,19 @@ GEMINI_RESPONSE_SCHEMA = {
         "cell_equipment": {"type": "BOOLEAN", "nullable": True},
         "cell_equipment_confidence": {"type": "NUMBER"},
         "cell_equipment_evidence": {"type": "STRING"},
+        "cell_gear_kind": {
+            "type": "STRING",
+            "enum": [
+                "sector_panel",
+                "facade_mount",
+                "microwave",
+                "rru",
+                "parapet_mast",
+                "none",
+                "unclear",
+            ],
+            "nullable": True,
+        },
     },
     "required": ["site_type", "site_confidence", "site_evidence"],
 }
@@ -650,6 +707,22 @@ def normalize_model_result(res: dict) -> dict:
         res["tower_subtype"] = None
     elif res.get("tower_subtype") in ("", "null"):
         res["tower_subtype"] = None
+    kind = str(res.get("cell_gear_kind") or "").strip().lower().replace(" ", "_")
+    allowed = {
+        "sector_panel",
+        "facade_mount",
+        "microwave",
+        "rru",
+        "parapet_mast",
+        "none",
+        "unclear",
+    }
+    if kind in allowed:
+        res["cell_gear_kind"] = kind
+    elif res.get("cell_equipment") is True:
+        res["cell_gear_kind"] = "unclear"
+    elif res.get("cell_equipment") is False:
+        res["cell_gear_kind"] = "none"
     return res
 
 
@@ -782,7 +855,20 @@ def maybe_recheck_rooftop_cell_false_positive(
         return res
 
     if new_cell is False and not _text_denies_telecom(recheck_evidence):
-        # Model saw HVAC but did not hard-deny antennas → keep coexistence true.
+        # Soft false: only keep coexistence true when the first pass already
+        # cited antennas/panels. Otherwise HVAC-only roofs stay false.
+        if not _text_has_telecom_cue(prior_evidence):
+            res["cell_equipment"] = False
+            if "cell_equipment_confidence" in recheck:
+                res["cell_equipment_confidence"] = recheck.get(
+                    "cell_equipment_confidence"
+                )
+            res["cell_equipment_evidence"] = recheck_evidence or (
+                "FP recheck: no prior antenna cues; soft-false treated as HVAC"
+            )
+            normalize_model_result(res)
+            _step_done("cell FP recheck", "downgraded to false (no prior antenna cues)")
+            return res
         if recheck_evidence:
             res["cell_equipment_evidence"] = (
                 f"{prior_evidence.strip()} | FP recheck kept true (coexistence): "
@@ -808,6 +894,148 @@ def maybe_recheck_rooftop_cell_false_positive(
     else:
         _step_done("cell FP recheck", "downgraded to null")
     return res
+
+
+def maybe_recheck_rooftop_cell_crop(
+    provider: str, clients: dict, res: dict, views: list
+) -> dict:
+    """Magnify the asset box and re-ask cell vs HVAC on the crop alone."""
+    if str(res.get("site_type") or "").strip().lower() != "rooftop":
+        return res
+    if res.get("cell_equipment") is not True:
+        return res
+    box = res.get("asset_box_2d")
+    if not isinstance(box, (list, tuple)) or len(box) < 4:
+        _step_done("cell crop recheck", "skipped (no asset box)")
+        return res
+    valid = _valid_box(box)
+    if not valid:
+        _step_done("cell crop recheck", "skipped (invalid box)")
+        return res
+
+    target_label = str(res.get("asset_view") or "").strip().lower()
+    source_img = None
+    source_label = None
+    for label, img in views:
+        if target_label and target_label in str(label).strip().lower():
+            source_img, source_label = img, label
+            break
+    if source_img is None:
+        for label, img in views:
+            if "vert" in str(label).lower() or "naip" in str(label).lower():
+                source_img, source_label = img, label
+                break
+    if source_img is None and views:
+        source_label, source_img = views[0]
+
+    if source_img is None:
+        _step_done("cell crop recheck", "skipped (no source image)")
+        return res
+
+    crop = _crop_zoom(source_img, valid)
+    crop_views = [(f"zoom crop ({source_label})", crop)]
+    recheck = classify_site(
+        provider, clients, crop_views, prompt=ROOFTOP_CELL_CROP_RECHECK_PROMPT
+    )
+    new_cell = recheck.get("cell_equipment")
+    if new_cell is True:
+        if recheck.get("cell_equipment_confidence") is not None:
+            res["cell_equipment_confidence"] = recheck.get("cell_equipment_confidence")
+        if recheck.get("cell_equipment_evidence"):
+            res["cell_equipment_evidence"] = (
+                f"{res.get('cell_equipment_evidence') or ''} | crop: "
+                f"{recheck.get('cell_equipment_evidence')}"
+            ).strip(" |")
+        if recheck.get("cell_gear_kind"):
+            res["cell_gear_kind"] = recheck.get("cell_gear_kind")
+        normalize_model_result(res)
+        _step_done("cell crop recheck", "confirmed cellular")
+        return res
+
+    res["cell_equipment"] = new_cell
+    if "cell_equipment_confidence" in recheck:
+        res["cell_equipment_confidence"] = recheck.get("cell_equipment_confidence")
+    if recheck.get("cell_equipment_evidence"):
+        res["cell_equipment_evidence"] = recheck.get("cell_equipment_evidence")
+    if recheck.get("cell_gear_kind"):
+        res["cell_gear_kind"] = recheck.get("cell_gear_kind")
+    normalize_model_result(res)
+    label = "downgraded to false" if new_cell is False else "downgraded to null"
+    _step_done("cell crop recheck", label)
+    return res
+
+
+def confirm_rooftop_cell_with_claude(
+    res: dict, clients: dict, views: list, *, already_escalated: bool
+) -> tuple[dict, str | None, bool]:
+    """Require Claude agreement that rooftop cell gear is present.
+
+    Returns (res, escalation_model_or_None, cell_models_agree).
+    """
+    if str(res.get("site_type") or "").strip().lower() != "rooftop":
+        return res, None, False
+    if res.get("cell_equipment") is not True:
+        res["cell_models_agree"] = False
+        res["gemini_cell_equipment"] = res.get("cell_equipment")
+        return res, None, False
+
+    gemini_cell = True
+    res["gemini_cell_equipment"] = True
+
+    if already_escalated:
+        # Final res is already Claude's classification from escalation.
+        agree = res.get("cell_equipment") is True
+        res["claude_cell_equipment"] = res.get("cell_equipment")
+        res["cell_models_agree"] = agree
+        if not agree:
+            # Keep Claude's negative call.
+            pass
+        _step_done(
+            "dual-model cell",
+            "agree" if agree else "disagree (Claude negative)",
+        )
+        return res, "claude", agree
+
+    if "claude" not in clients or clients.get("claude") is None:
+        res["cell_models_agree"] = False
+        _step_done("dual-model cell", "skipped (no Claude client)")
+        return res, None, False
+
+    claude_res = classify_site(
+        "claude",
+        clients,
+        views,
+        prompt=ROOFTOP_CELL_DUAL_CONFIRM_PROMPT,
+        claude_model=CLAUDE_ESCALATION_MODEL,
+    )
+    claude_cell = claude_res.get("cell_equipment") is True
+    res["claude_cell_equipment"] = claude_res.get("cell_equipment")
+    agree = gemini_cell and claude_cell
+    res["cell_models_agree"] = agree
+    if claude_cell:
+        # Prefer Claude evidence/confidence when confirming.
+        if claude_res.get("cell_equipment_confidence") is not None:
+            res["cell_equipment_confidence"] = claude_res.get(
+                "cell_equipment_confidence"
+            )
+        if claude_res.get("cell_equipment_evidence"):
+            res["cell_equipment_evidence"] = claude_res.get("cell_equipment_evidence")
+        if claude_res.get("cell_gear_kind"):
+            res["cell_gear_kind"] = claude_res.get("cell_gear_kind")
+        res["cell_equipment"] = True
+    else:
+        res["cell_equipment"] = claude_res.get("cell_equipment")
+        if claude_res.get("cell_equipment_evidence"):
+            res["cell_equipment_evidence"] = claude_res.get("cell_equipment_evidence")
+        if claude_res.get("cell_gear_kind"):
+            res["cell_gear_kind"] = claude_res.get("cell_gear_kind")
+        if "cell_equipment_confidence" in claude_res:
+            res["cell_equipment_confidence"] = claude_res.get(
+                "cell_equipment_confidence"
+            )
+    normalize_model_result(res)
+    _step_done("dual-model cell", "agree" if agree else "disagree")
+    return res, "claude", agree
 
 
 # ----------------------------- geocoding ------------------------------------

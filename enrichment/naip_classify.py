@@ -353,6 +353,23 @@ def classify_site_imagery(
         res,
         views,
     )
+    # Magnified crop recheck before dual-model confirm.
+    res = ac.maybe_recheck_rooftop_cell_crop(
+        primary_provider if not escalation_model else "claude",
+        clients,
+        res,
+        views,
+    )
+    res, dual_model, cell_agree = ac.confirm_rooftop_cell_with_claude(
+        res,
+        clients,
+        views,
+        already_escalated=bool(escalation_model),
+    )
+    if dual_model and not escalation_model:
+        escalation_model = dual_model
+        escalation_reason_str = escalation_reason_str or "rooftop_dual_model_cell"
+    res["cell_models_agree"] = cell_agree
 
     asset_lat = asset_lon = asset_offset_m = None
     box, box_view = res.get("asset_box_2d"), res.get("asset_view")
@@ -376,6 +393,10 @@ def classify_site_imagery(
         "cell_equipment": res.get("cell_equipment"),
         "cell_equipment_confidence": res.get("cell_equipment_confidence"),
         "cell_equipment_evidence": res.get("cell_equipment_evidence"),
+        "cell_gear_kind": res.get("cell_gear_kind"),
+        "gemini_cell_equipment": res.get("gemini_cell_equipment"),
+        "claude_cell_equipment": res.get("claude_cell_equipment"),
+        "cell_models_agree": res.get("cell_models_agree"),
         "asset_lat": asset_lat,
         "asset_lon": asset_lon,
         "asset_offset_m": (

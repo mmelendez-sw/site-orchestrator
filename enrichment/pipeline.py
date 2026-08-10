@@ -24,6 +24,7 @@ from enrichment.constants import (
     HOLDOUT_CSV,
     MATCH_SOURCE_NONE,
     PROXIMITY_MAX_M,
+    REVIEW_DIR_NAME,
 )
 from enrichment.mssql import connect_mssql, describe_match, find_proximity_hit
 from enrichment.naip_classify import classify_site_imagery
@@ -33,6 +34,7 @@ from enrichment.outputs import (
     HOLDOUT_COLUMNS,
     write_csv,
 )
+from enrichment.review import load_approved_ids, write_review_package
 from enrichment import progress
 from enrichment.sf_ops import (
     apply_updates_idempotent,
@@ -152,13 +154,16 @@ def run_enrichment(
             progress.stage("4/4 WRITE CSVs", str(run_dir.name))
         write_csv(run_dir / CANDIDATE_CSV, candidates, CANDIDATE_COLUMNS)
         write_csv(run_dir / HOLDOUT_CSV, holdouts, HOLDOUT_COLUMNS)
+        review_dir = write_review_package(run_dir, candidates=candidates)
         if verbose:
             progress.result(
                 f"updates={len(candidates)} holdouts={len(holdouts)} total={len(detail_rows)}"
             )
+            progress.result(f"review package → {review_dir}")
 
         summary = {
             "run_dir": str(run_dir),
+            "review_dir": str(review_dir),
             "total": len(detail_rows),
             "db_hits": sum(
                 1 for r in detail_rows if r.get("match_source") not in ("", MATCH_SOURCE_NONE)
@@ -192,6 +197,11 @@ def run_enrichment(
         )
         if verbose:
             progress.dump_summary(summary)
+            if candidates:
+                progress.step(
+                    "Next: open review/index.html, approve true cell sites, then:\n"
+                    f"  python -m enrichment --apply-reviewed --run-dir {run_dir}"
+                )
         return summary
     finally:
         if own_sql:
@@ -235,6 +245,13 @@ def _process_site(
         "naip_tower_subtype": "",
         "naip_site_confidence": "",
         "naip_cell_equipment": "",
+        "cell_equipment_confidence": "",
+        "cell_equipment_evidence": "",
+        "cell_gear_kind": "",
+        "site_evidence": "",
+        "gemini_cell_equipment": "",
+        "claude_cell_equipment": "",
+        "cell_models_agree": "",
         "classification_stage": "",
         "nearmap_tier": "",
         "nearmap_views": "",
@@ -348,6 +365,15 @@ def _process_site(
     base["naip_tower_subtype"] = classified.get("tower_subtype") or ""
     base["naip_site_confidence"] = classified.get("site_confidence") or ""
     base["naip_cell_equipment"] = classified.get("cell_equipment")
+    base["cell_equipment_confidence"] = (
+        classified.get("cell_equipment_confidence") or ""
+    )
+    base["cell_equipment_evidence"] = classified.get("cell_equipment_evidence") or ""
+    base["cell_gear_kind"] = classified.get("cell_gear_kind") or ""
+    base["site_evidence"] = classified.get("site_evidence") or ""
+    base["gemini_cell_equipment"] = classified.get("gemini_cell_equipment", "")
+    base["claude_cell_equipment"] = classified.get("claude_cell_equipment", "")
+    base["cell_models_agree"] = classified.get("cell_models_agree", "")
     base["classification_stage"] = classified.get("classification_stage") or ""
     base["nearmap_tier"] = classified.get("nearmap_tier") or ""
     base["nearmap_views"] = classified.get("nearmap_views") or ""
