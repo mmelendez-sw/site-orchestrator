@@ -436,7 +436,7 @@ def apply_candidate_csv(
         for r in results
         if r.get("success") and is_enrichment_payload(r.get("payload"))
     )
-    llm_classified = sum(
+    dequeued = sum(
         1
         for r in results
         if r.get("success") and not is_enrichment_payload(r.get("payload"))
@@ -445,7 +445,7 @@ def apply_candidate_csv(
     summary = {
         "total": len(results),
         "success": tower_updated,
-        "llm_classified": llm_classified,
+        "dequeued_holdouts": dequeued,
         "failed": failed,
         "apply": apply,
         "log": str(log_path),

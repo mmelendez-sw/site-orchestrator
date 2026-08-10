@@ -103,8 +103,9 @@ def parse_sf_lat_lng(row: dict[str, Any]) -> tuple[float, float] | None:
 
 
 # Fallback when Site_Duplicate_Rule blocks enrichment field writes.
+# LLM_Classified=false removes the site from the blank-Site_Type enrichment queue.
 DUPLICATE_FALLBACK_PAYLOAD = {
-    "LLM_Classified__c": True,
+    "LLM_Classified__c": False,
     "Test_Batch_Flag__c": True,
 }
 
@@ -179,22 +180,31 @@ def apply_one_update(
 ) -> dict[str, Any]:
     """Update a single enrichment candidate row; never raises.
 
+    Eligible tower/rooftop writes keep LLM_Classified__c=true.
+    Holdouts (no site fields) set LLM_Classified__c=false so they leave the
+    blank-Site_Type + LLM_Classified=true enrichment queue.
+
     On DUPLICATES_DETECTED for an enrichment payload, retries once with
-    LLM_Classified__c + Test_Batch_Flag__c only so the site leaves the queue.
+    LLM_Classified__c=false + Test_Batch_Flag__c so the site still dequeues.
     """
     from enrichment import progress
 
     sf_id = str(row.get("Id") or row.get("sf_id") or "").strip()
     payload = row.get("payload")
     if not isinstance(payload, dict):
-        payload = build_update_payload(
+        site_fields = build_update_payload(
             latitude=_optional_float(row.get("update_lat")),
             longitude=_optional_float(row.get("update_lng")),
             site_type=(row.get("update_site_type") or None) or None,
             verified_site=_optional_bool(row.get("update_verified_site")),
-            verified_site_source=(row.get("update_verified_site_source") or None) or None,
-            llm_classified=True,
+            verified_site_source=(row.get("update_verified_site_source") or None)
+            or None,
         )
+        # Enrichment writes stay classified; holdouts dequeue from the queue.
+        payload = {
+            **site_fields,
+            "LLM_Classified__c": is_enrichment_payload(site_fields),
+        }
     entry = {
         "Id": sf_id,
         "success": False,
@@ -243,13 +253,13 @@ def apply_one_update(
                 entry["payload"] = fallback
                 entry["error"] = f"fallback after DUPLICATES_DETECTED: {exc}"
                 logger.warning(
-                    "enrichment blocked by duplicate for %s — wrote LLM/Test_Batch only",
+                    "enrichment blocked by duplicate for %s — dequeued LLM/Test_Batch only",
                     sf_id,
                 )
                 if verbose:
                     progress.warn(
                         "SF duplicate blocked enrichment — "
-                        "wrote LLM-classified + Test_Batch_Flag only"
+                        "dequeued (LLM_Classified=false + Test_Batch_Flag)"
                     )
                 return entry
             except Exception as fallback_exc:  # noqa: BLE001
@@ -282,15 +292,15 @@ def _format_apply_result(
     dry_run: bool,
     status: str = "",
 ) -> str:
-    """Human-readable apply line: enrichment details, or LLM-only flag."""
+    """Human-readable apply line: enrichment details, or holdout dequeue."""
     prefix = "SF dry-run OK (not written)" if dry_run else "SF updated"
     if status == "updated_llm_after_duplicate":
         return (
             f"{prefix} | duplicate fallback | "
-            "LLM-classified + Test_Batch_Flag (no site fields written)"
+            "dequeued (LLM_Classified=false + Test_Batch_Flag)"
         )
     if not is_enrichment_payload(payload):
-        return f"{prefix} | LLM-classified only (no site fields written)"
+        return f"{prefix} | dequeued (LLM_Classified=false, no site fields written)"
 
     site_type = payload.get("Site_Type__c") or "—"
     verified = payload.get("Verified_Site_Source__c") or "—"

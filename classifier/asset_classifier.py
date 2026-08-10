@@ -254,19 +254,24 @@ TASK 3 - cell_equipment: is cellular telecom equipment visible on the located as
 - true: clear visible evidence of cellular gear; false: none visible; null: cannot \
 assess (resolution or viewing angle insufficient). Prefer null over true when unsure.
 TRUE only for cellular/telecom hardware, for example:
-- Panel / sector antennas (flat vertical rectangles on frames, often ~3 sectors)
+- Panel / sector antennas (flat vertical rectangles on frames, often ~3 sectors) \
+on the roof, parapet, or building facade / wall (side-mounted)
 - Microwave / backhaul dishes, RRUs, cable trays feeding antenna mounts
 - Short masts or poles on the parapet carrying antennas
+- Rooftop or wall-mounted radio panels / sector frames (not HVAC condensers)
 - Telecom equipment cabinets clearly paired with antenna mounts (not alone)
-FALSE / NOT cellular (very common false positives — do not mark true):
-- HVAC condensers, chillers, air handlers, cooling towers
-- Roof vents, pipes, stacks, drains, skylights, access hatches
-- Solar panels, satellite TV dishes for building use, water tanks
-- Random dark rectangles in neat rows across a roof (typical multi-zone HVAC)
+FALSE / NOT cellular when they are the ONLY roof objects (HVAC and cell often \
+coexist — do not call false just because condensers/vents are also present):
+- HVAC condensers, chillers, air handlers, cooling towers alone
+- Roof vents, pipes, stacks, drains, skylights, access hatches alone
+- Solar panels, satellite TV dishes for building use, water tanks alone
+- Random dark rectangles in neat rows across a roof (typical multi-zone HVAC) \
+with no parapet sector frames, dishes, or antenna masts elsewhere on the roof
 On rooftops, gear is often missed when it sits in **building shadow** or along \
-shaded parapets. In oblique views, inspect sunlit AND shaded roof edges, corners, \
-and mechanical zones before calling false. Top-down-only HVAC clusters must never \
-be called cellular.
+shaded parapets, or when it sits next to HVAC. In oblique views, inspect sunlit \
+AND shaded roof edges, corners, and mechanical zones before calling false. \
+Top-down-only HVAC clusters must never be called cellular by themselves — but \
+HVAC next to panel antennas is still cell_equipment=true.
 
 Field meanings: site_evidence and cell_equipment_evidence are one short \
 sentence each, citing the specific views and cues used. For cell_equipment true, \
@@ -370,9 +375,9 @@ You are re-checking ONLY for visible cellular equipment at a trusted site. \
 The first pass called cell_equipment false, but the data source expects gear \
 here.
 
-Re-examine every view - especially Nearmap obliques and shaded roof areas:
-- Thin rectangular panel antennas on parapets or short masts
-- Sector frames at roof corners (often three sectors)
+Re-examine every view - especially Nearmap obliques and shaded roof/facade areas:
+- Thin rectangular panel antennas on parapets, short masts, or building walls
+- Sector frames at roof corners (often three sectors) or facade mounts
 - Microwave dishes, RRUs, cable trays, telecom cabinets paired with mounts
 
 Do NOT flip to true for HVAC condensers, vents, pipes, skylights, drains, or \
@@ -383,22 +388,30 @@ set cell_equipment true and explain which view shows the antenna/dish/mount.
 """
 
 EQUIPMENT_FALSE_POSITIVE_RECHECK_PROMPT = """\
-You previously set cell_equipment=true on a rooftop. Perform a STRICT \
-false-positive check against ordinary building mechanicals.
+You previously set cell_equipment=true on a rooftop. Re-check carefully.
 
-Confirm TRUE only if you see unmistakable cellular/telecom hardware \
-(panel/sector antennas, microwave dishes, RRUs, parapet masts with antennas, \
-telecom cabinets feeding antenna mounts).
+IMPORTANT: HVAC and cellular gear VERY OFTEN share the same roof. Seeing \
+condensers, vents, pipes, or mechanical screens does NOT mean there is no \
+cellular equipment. Look past the HVAC plant for telecom hardware.
 
-Set cell_equipment=false when the objects are HVAC, vents, pipes, skylights, \
-drains, solar, or other non-telecom roof plant — including neat rows of dark \
-rectangles typical of multi-zone condensers.
+Keep cell_equipment=true when ANY of these are visible on the roof OR building \
+sides/facades (edges, corners, parapets, walls, and behind/beside HVAC) — use \
+oblique views for side-mounted gear:
+- Panel / sector antennas (flat vertical rectangles on frames, often ~3 sectors)
+- Wall- or facade-mounted radio panels / sector frames
+- Microwave / backhaul dishes, RRUs, cable trays to antenna mounts
+- Short masts or poles carrying antennas
+- Telecom cabinets clearly feeding antenna mounts
 
-Set cell_equipment=null if top-down resolution cannot distinguish HVAC from \
-antennas and no oblique view confirms antennas.
+Set cell_equipment=false ONLY when you can rule out telecom hardware and the \
+visible objects are explained entirely by ordinary mechanicals (HVAC-only, \
+vents, drains, skylights, solar for building use). Say so explicitly in \
+cell_equipment_evidence (e.g. "no panel antennas or dishes; HVAC only").
 
-Return the same JSON schema. Update cell_equipment_evidence to cite the \
-decisive cue (or why it is HVAC / ambiguous).
+Set cell_equipment=null if resolution/angle cannot separate HVAC from antennas.
+
+Return the same JSON schema. Evidence must state whether antennas/dishes are \
+present or absent — do not flip to false merely because HVAC is visible.
 """
 
 # Enforced via Claude tool input_schema so every reply parses into this shape.
@@ -684,20 +697,76 @@ def maybe_recheck_equipment(provider: str, clients: dict, res: dict, views: list
     return res
 
 
+def _text_has_telecom_cue(text: str) -> bool:
+    lowered = (text or "").lower()
+    cues = (
+        "antenna",
+        "sector",
+        "rru",
+        "microwave",
+        "backhaul",
+        "panel",
+        "parapet mast",
+        "radio",
+        "telecom",
+    )
+    return any(cue in lowered for cue in cues)
+
+
+def _text_denies_telecom(text: str) -> bool:
+    """True when evidence explicitly rules out cellular hardware (not just HVAC)."""
+    lowered = (text or "").lower()
+    deny_phrases = (
+        "no sector",
+        "no panel",
+        "no antenna",
+        "no cellular",
+        "no telecom",
+        "no microwave",
+        "no rru",
+        "hvac only",
+        "only hvac",
+        "mechanicals only",
+        "no evidence of panel",
+        "no identifiable cellular",
+        "rather than cellular",
+        "not cellular",
+        "none of the components match",
+        "without any distinct",
+    )
+    return any(phrase in lowered for phrase in deny_phrases)
+
+
 def maybe_recheck_rooftop_cell_false_positive(
     provider: str, clients: dict, res: dict, views: list
 ) -> dict:
-    """Downgrade rooftop cell_equipment=true when HVAC is more likely."""
+    """Downgrade rooftop cell=true only when telecom is explicitly ruled out.
+
+    HVAC commonly coexists with cell gear — presence of mechanical plant alone
+    must not clear a positive cell_equipment call.
+    """
     if str(res.get("site_type") or "").strip().lower() != "rooftop":
         return res
     if res.get("cell_equipment") is not True:
         return res
     if not views:
         return res
+
+    prior_evidence = " ".join(
+        str(res.get(key) or "")
+        for key in ("cell_equipment_evidence", "site_evidence")
+    )
+    # Strong first-pass antenna call with no HVAC-only smell: skip extra pass.
+    if _text_has_telecom_cue(prior_evidence) and "hvac" not in prior_evidence.lower():
+        _step_done("cell FP recheck", "skipped (clear antenna cues)")
+        return res
+
     recheck = classify_site(
         provider, clients, views, prompt=EQUIPMENT_FALSE_POSITIVE_RECHECK_PROMPT
     )
     new_cell = recheck.get("cell_equipment")
+    recheck_evidence = str(recheck.get("cell_equipment_evidence") or "")
+
     if new_cell is True:
         res["cell_equipment_confidence"] = recheck.get(
             "cell_equipment_confidence", res.get("cell_equipment_confidence")
@@ -708,14 +777,33 @@ def maybe_recheck_rooftop_cell_false_positive(
         normalize_model_result(res)
         _step_done("cell FP recheck", "confirmed cellular")
         return res
-    res["cell_equipment"] = new_cell  # false or null
+
+    if new_cell is False and not _text_denies_telecom(recheck_evidence):
+        # Model saw HVAC but did not hard-deny antennas → keep coexistence true.
+        if recheck_evidence:
+            res["cell_equipment_evidence"] = (
+                f"{prior_evidence.strip()} | FP recheck kept true (coexistence): "
+                f"{recheck_evidence}"
+            ).strip(" |")
+        normalize_model_result(res)
+        _step_done("cell FP recheck", "kept true (HVAC+cell coexistence)")
+        return res
+
+    if new_cell is None and _text_has_telecom_cue(prior_evidence):
+        # Ambiguous second pass should not erase a prior antenna citation.
+        _step_done("cell FP recheck", "kept true (prior antenna cues)")
+        return res
+
+    res["cell_equipment"] = new_cell  # false with hard deny, or null
     if "cell_equipment_confidence" in recheck:
         res["cell_equipment_confidence"] = recheck.get("cell_equipment_confidence")
-    if recheck.get("cell_equipment_evidence"):
-        res["cell_equipment_evidence"] = recheck.get("cell_equipment_evidence")
+    if recheck_evidence:
+        res["cell_equipment_evidence"] = recheck_evidence
     normalize_model_result(res)
-    label = "downgraded to false" if new_cell is False else "downgraded to null"
-    _step_done("cell FP recheck", label)
+    if new_cell is False:
+        _step_done("cell FP recheck", "downgraded to false")
+    else:
+        _step_done("cell FP recheck", "downgraded to null")
     return res
 
 

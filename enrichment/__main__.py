@@ -1,7 +1,8 @@
 """CLI: python -m enrichment.
 
 With --apply, processed sites are collected first and updated at run end.
-Every processed site is marked LLM-classified; eligible sites also get enrichment fields.
+Eligible tower/rooftop sites get enrichment fields + LLM_Classified=true.
+Holdouts are dequeued with LLM_Classified=false (blank Site Type stays blank).
 Each Salesforce update remains isolated so one failure does not stop the rest.
 """
 
@@ -77,8 +78,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--apply",
         action="store_true",
         help=(
-            "Mark every processed Salesforce row LLM-classified and update eligible sites "
-            "after enrichment completes"
+            "Write enrichment fields for eligible sites (LLM_Classified=true); "
+            "dequeue holdouts with LLM_Classified=false after enrichment completes"
         ),
     )
     parser.add_argument(

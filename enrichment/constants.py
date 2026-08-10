@@ -4,9 +4,11 @@ from __future__ import annotations
 
 PROXIMITY_MAX_M = 25.0
 
-# The imagery model reports where it thinks the asset is. If that lands farther
-# than this from the point we classified, it described a different site.
-MAX_ASSET_OFFSET_M = PROXIMITY_MAX_M
+# Imagery asset-box snap radius from the SF/classify pin. Effective max is
+# MAX_ASSET_OFFSET_M + ASSET_OFFSET_LEEWAY_M. Beyond that: rooftops hold out
+# (no SF update); towers still update. Independent of PROXIMITY_MAX_M.
+MAX_ASSET_OFFSET_M = 75.0
+ASSET_OFFSET_LEEWAY_M = 10.0
 
 # Degrees buffer used for SQL bbox prefilter (~25–30 m at mid-latitudes).
 BBOX_BUFFER_DEG = 0.0003

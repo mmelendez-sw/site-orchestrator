@@ -10,6 +10,7 @@ from salesforce.site_type_mapping import (
 )
 
 from enrichment.constants import (
+    ASSET_OFFSET_LEEWAY_M,
     BUCKET_OTHER,
     BUCKET_POTENTIAL_UPDATE,
     BUCKET_ROOFTOP,
@@ -41,16 +42,21 @@ def _rooftop_cell_confidence_ok(classified: dict[str, Any]) -> bool:
     return _confidence_ok(raw, MIN_ROOFTOP_CELL_CONFIDENCE)
 
 
+def _effective_max_asset_offset_m() -> float:
+    return MAX_ASSET_OFFSET_M + ASSET_OFFSET_LEEWAY_M
+
+
 def _asset_offset_too_far(
     classified: dict[str, Any],
-    maximum: float = MAX_ASSET_OFFSET_M,
+    maximum: float | None = None,
 ) -> float | None:
-    """Return the offset when the model's asset sits beyond the match radius."""
+    """Return the offset when the model's asset sits beyond snap radius + leeway."""
+    limit = _effective_max_asset_offset_m() if maximum is None else maximum
     try:
         offset = float(classified.get("asset_offset_m"))
     except (TypeError, ValueError):
         return None
-    return offset if offset > maximum else None
+    return offset if offset > limit else None
 
 
 def verified_source_for_match(
@@ -115,8 +121,8 @@ def bucket_classification(
     - tower or rooftop (medium/high conf) → potential_update
       (rooftop requires confirmed cell_equipment; maps to Site_Type__c = Rooftop)
     - rooftop without cell gear / low conf → holdout as potential_rooftop
-    - tower asset located beyond MAX_ASSET_OFFSET_M → holdout
-      (rooftops still update Site Type; far boxes fall back to the SF pin)
+    - rooftop asset beyond MAX_ASSET_OFFSET_M + leeway → holdout (no SF update)
+    - towers still update even when the asset box is farther than that radius
     - DB hit coords preferred for lat/lng; else NAIP asset box; else SF pin
     - DB hits verify as FCC/TowerSource; imagery-only hits verify as NearMap
       when Nearmap was used, else NAIP
@@ -130,12 +136,6 @@ def bucket_classification(
         return _holdout(BUCKET_OTHER, holdout_reason, classified)
 
     far_offset = _asset_offset_too_far(classified)
-    if far_offset is not None and site_type_raw != "rooftop":
-        return _holdout(
-            BUCKET_OTHER,
-            f"asset_offset_{far_offset:g}m_exceeds_{MAX_ASSET_OFFSET_M:g}m",
-            classified,
-        )
 
     if site_type_raw in {"other", "unclear"}:
         return _holdout(BUCKET_OTHER, site_type_raw, classified)
@@ -156,18 +156,21 @@ def bucket_classification(
         return _holdout(BUCKET_ROOFTOP, "rooftop_low_cell_confidence", classified)
 
     if site_type_raw == "rooftop" and far_offset is not None:
-        if sf_lat is None or sf_lng is None:
-            return _holdout(BUCKET_SKIP, "missing_coordinates", classified)
-        update_lat, update_lng, coord_source = sf_lat, sf_lng, "sf_pin"
-    else:
-        update_lat, update_lng, coord_source = _resolve_update_coords(
-            match_source=match_source,
-            classified=classified,
-            db_lat=db_lat,
-            db_lng=db_lng,
-            sf_lat=sf_lat,
-            sf_lng=sf_lng,
+        limit = _effective_max_asset_offset_m()
+        return _holdout(
+            BUCKET_ROOFTOP,
+            f"asset_offset_{far_offset:g}m_exceeds_{limit:g}m",
+            classified,
         )
+
+    update_lat, update_lng, coord_source = _resolve_update_coords(
+        match_source=match_source,
+        classified=classified,
+        db_lat=db_lat,
+        db_lng=db_lng,
+        sf_lat=sf_lat,
+        sf_lng=sf_lng,
+    )
     if update_lat is None or update_lng is None:
         return _holdout(BUCKET_SKIP, "missing_coordinates", classified)
 

@@ -310,7 +310,7 @@ class BucketTests(unittest.TestCase):
             "TowerSource",
         )
 
-    def test_distant_asset_box_is_held_out(self):
+    def test_distant_tower_asset_box_still_updates(self):
         decision = bucket_classification(
             match_source=MATCH_SOURCE_FCC,
             classified={
@@ -327,9 +327,56 @@ class BucketTests(unittest.TestCase):
             sf_lat=45.131453,
             sf_lng=-93.269147,
         )
-        self.assertEqual(decision["bucket"], BUCKET_OTHER)
-        self.assertIn("asset_offset_149m", decision["holdout_reason"])
+        self.assertEqual(decision["bucket"], BUCKET_POTENTIAL_UPDATE)
+        self.assertEqual(decision["update_site_type"], "Monopole")
+        self.assertEqual(decision["update_lat"], 45.131417)
+        self.assertEqual(decision["update_lng"], -93.269111)
+
+    def test_distant_rooftop_asset_box_is_held_out(self):
+        decision = bucket_classification(
+            match_source=MATCH_SOURCE_NONE,
+            classified={
+                "site_type": "rooftop",
+                "site_confidence": 0.9,
+                "cell_equipment": True,
+                "cell_equipment_confidence": 0.85,
+                "asset_lat": 43.001,
+                "asset_lon": -89.001,
+                "asset_offset_m": 117.5,
+                "nearmap_tier": "naip_only",
+            },
+            db_lat=None,
+            db_lng=None,
+            sf_lat=43.0,
+            sf_lng=-89.0,
+        )
+        self.assertEqual(decision["bucket"], BUCKET_ROOFTOP)
+        self.assertIn("asset_offset_117.5m_exceeds_85m", decision["holdout_reason"])
         self.assertEqual(decision["update_site_type"], "")
+
+    def test_rooftop_within_offset_leeway_snaps(self):
+        decision = bucket_classification(
+            match_source=MATCH_SOURCE_NONE,
+            classified={
+                "site_type": "rooftop",
+                "site_confidence": 0.9,
+                "cell_equipment": True,
+                "cell_equipment_confidence": 0.85,
+                "asset_lat": 43.0007,
+                "asset_lon": -89.0007,
+                "asset_offset_m": 80.0,
+                "nearmap_tier": "vert_only",
+                "nearmap_views": "Vert",
+            },
+            db_lat=None,
+            db_lng=None,
+            sf_lat=43.0,
+            sf_lng=-89.0,
+        )
+        self.assertEqual(decision["bucket"], BUCKET_POTENTIAL_UPDATE)
+        self.assertEqual(decision["update_lat"], 43.0007)
+        self.assertEqual(decision["update_lng"], -89.0007)
+        self.assertEqual(decision["update_coord_source"], "naip_asset_box")
 
     def test_nearby_asset_box_still_updates(self):
         decision = bucket_classification(
@@ -561,14 +608,14 @@ class DuplicateFallbackTests(unittest.TestCase):
         self.assertEqual(entry["status"], "updated_llm_after_duplicate")
         self.assertEqual(
             entry["payload"],
-            {"LLM_Classified__c": True, "Test_Batch_Flag__c": True},
+            {"LLM_Classified__c": False, "Test_Batch_Flag__c": True},
         )
         self.assertIn("DUPLICATES_DETECTED", entry["error"])
         self.assertEqual(len(site.calls), 2)
         self.assertIn("Site_Type__c", site.calls[0][1])
         self.assertEqual(
             site.calls[1][1],
-            {"LLM_Classified__c": True, "Test_Batch_Flag__c": True},
+            {"LLM_Classified__c": False, "Test_Batch_Flag__c": True},
         )
 
     def test_non_duplicate_failure_does_not_fallback(self):
@@ -601,6 +648,26 @@ class DuplicateFallbackTests(unittest.TestCase):
         self.assertEqual(entry["status"], "failed")
         self.assertEqual(len(site.calls), 1)
 
+    def test_holdout_dequeues_with_llm_classified_false(self):
+        from enrichment.sf_ops import apply_one_update
+
+        site = _FakeSiteSObject()
+        entry = apply_one_update(
+            _FakeClient(site),
+            {
+                "Id": "a0ZTEST000000004",
+                "naip_site_type": "rooftop",
+                "update_lat": "",
+                "update_lng": "",
+                "update_site_type": "",
+            },
+            dry_run=False,
+            verbose=False,
+        )
+        self.assertTrue(entry["success"])
+        self.assertEqual(entry["payload"], {"LLM_Classified__c": False})
+        self.assertEqual(site.calls[0][1], {"LLM_Classified__c": False})
+
     def test_llm_only_duplicate_does_not_retry(self):
         from enrichment.sf_ops import apply_one_update
 
@@ -610,7 +677,7 @@ class DuplicateFallbackTests(unittest.TestCase):
             {
                 "Id": "a0ZTEST000000003",
                 "naip_site_type": "other",
-                "payload": {"LLM_Classified__c": True},
+                "payload": {"LLM_Classified__c": False},
             },
             dry_run=False,
             verbose=False,
