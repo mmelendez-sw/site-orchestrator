@@ -9,6 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
+from enrichment.audit import write_spot_audit_package
 from enrichment.bucketing import (
     bucket_classification,
     imagery_bucket,
@@ -22,9 +23,11 @@ from enrichment.constants import (
     CANDIDATE_CSV,
     DETAIL_CSV,
     HOLDOUT_CSV,
+    HOLDOUT_TRIAGE_MD,
     MATCH_SOURCE_NONE,
     PROXIMITY_MAX_M,
     REVIEW_DIR_NAME,
+    SPOT_AUDIT_HTML,
 )
 from enrichment.mssql import connect_mssql, describe_match, find_proximity_hit
 from enrichment.naip_classify import classify_site_imagery
@@ -34,6 +37,7 @@ from enrichment.outputs import (
     HOLDOUT_COLUMNS,
     write_csv,
 )
+from enrichment.pin_address import reconcile_pin_to_address
 from enrichment.review import load_approved_ids, write_review_package
 from enrichment import progress
 from enrichment.sf_ops import (
@@ -43,6 +47,8 @@ from enrichment.sf_ops import (
     query_blank_site_type_sites,
     query_sites_by_ids,
 )
+from enrichment.triage import write_holdout_triage
+
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +71,7 @@ def run_enrichment(
     sites: list[dict[str, Any]] | None = None,
     site_ids: list[str] | None = None,
     carrier_like: str | None = "NFL",
+    states: list[str] | None = None,
     verbose: bool = True,
 ) -> dict[str, Any]:
     """Run proximity + NAIP enrichment and write candidate/holdout CSVs."""
@@ -99,13 +106,15 @@ def run_enrichment(
                     )
                 sites = query_sites_by_ids(sf_client, site_ids)
             else:
+                state_label = ",".join(states) if states else "all"
                 if verbose:
                     progress.stage(
                         "2/4 QUERY SALESFORCE",
-                        f"blank Site_Type | carrier_like={carrier_like!r}",
+                        f"blank Site_Type | carrier_like={carrier_like!r} | "
+                        f"states={state_label}",
                     )
                 sites = query_blank_site_type_sites(
-                    sf_client, carrier_like=carrier_like
+                    sf_client, carrier_like=carrier_like, states=states
                 )
             if verbose:
                 progress.result(f"{len(sites)} site(s)")
@@ -178,11 +187,18 @@ def run_enrichment(
             candidates=candidates,
             rooftop_holdouts=rooftop_holdouts,
         )
+        triage = write_holdout_triage(run_dir, detail_rows)
+        audit_dir = write_spot_audit_package(run_dir, candidates)
         if verbose:
             progress.result(
                 f"updates={len(candidates)} holdouts={len(holdouts)} total={len(detail_rows)}"
             )
             progress.result(f"review package → {review_dir}")
+            progress.result(
+                f"holdout triage → {run_dir / HOLDOUT_TRIAGE_MD} "
+                f"(focus={len(triage.get('weekly_focus') or [])})"
+            )
+            progress.result(f"spot audit → {audit_dir / SPOT_AUDIT_HTML}")
 
         summary = {
             "run_dir": str(run_dir),
@@ -192,8 +208,14 @@ def run_enrichment(
                 1 for r in detail_rows if r.get("match_source") not in ("", MATCH_SOURCE_NONE)
             ),
             "potential_updates": len(candidates),
+            "db_backed_candidates": triage.get("db_backed_candidates", 0),
+            "imagery_only_candidates": triage.get("imagery_only_candidates", 0),
             "holdout_rooftop": sum(1 for r in holdouts if r.get("bucket") == BUCKET_ROOFTOP),
             "holdout_other": sum(1 for r in holdouts if r.get("bucket") == BUCKET_OTHER),
+            "holdout_triage_focus": [
+                f"{x.get('reason')}={x.get('count')}"
+                for x in (triage.get("weekly_focus") or [])
+            ],
             "errors": sum(1 for r in detail_rows if r.get("error")),
             "imagery_naip_only": sum(
                 1 for r in detail_rows if r.get("imagery_used") == "naip"
@@ -222,8 +244,12 @@ def run_enrichment(
             progress.dump_summary(summary)
             if candidates:
                 progress.step(
-                    "Next: open review/index.html, approve true cell sites, then:\n"
-                    f"  python -m enrichment --apply-reviewed --run-dir {run_dir}"
+                    "Next (review path): open review/index.html, then "
+                    f"--apply-reviewed --run-dir {run_dir}\n"
+                    "Or re-run with --apply --dequeue-holdouts to auto-push "
+                    "Claude hard-agree candidates.\n"
+                    f"Spot-audit sample: {audit_dir / SPOT_AUDIT_HTML}\n"
+                    f"Holdout triage: {run_dir / HOLDOUT_TRIAGE_MD}"
                 )
         return summary
     finally:
@@ -259,11 +285,22 @@ def _process_site(
         "Carrier_Leasing_Source__c": site.get("Carrier_Leasing_Source__c") or "",
         "match_source": MATCH_SOURCE_NONE,
         "match_distance_m": "",
+        "match_selection_reason": "",
+        "match_candidate_count": "",
+        "match_runner_up_gap_m": "",
         "match_record_id": "",
         "match_asr_number": "",
         "match_asset_type": "",
         "classify_lat": "",
         "classify_lng": "",
+        "classify_coord_source": "",
+        "address_query": "",
+        "address_lat": "",
+        "address_lng": "",
+        "address_geocode_source": "",
+        "address_matched": "",
+        "pin_address_offset_m": "",
+        "pin_address_mismatch": "",
         "naip_site_type": "",
         "naip_tower_subtype": "",
         "naip_site_confidence": "",
@@ -285,6 +322,7 @@ def _process_site(
         "asset_lat": "",
         "asset_lon": "",
         "asset_offset_m": "",
+        "asset_coord_source": "",
         "bucket": BUCKET_OTHER,
         "holdout_reason": "",
         "update_lat": "",
@@ -311,9 +349,52 @@ def _process_site(
     base["sf_lng"] = sf_lng
     if verbose:
         progress.step(f"SF pin: {sf_lat:.6f}, {sf_lng:.6f}")
+        progress.stage("PIN↔ADDRESS")
+    recon = reconcile_pin_to_address(site, sf_lat, sf_lng)
+    base["address_query"] = recon.get("address_query") or ""
+    base["address_lat"] = recon.get("address_lat") if recon.get("address_lat") != "" else ""
+    base["address_lng"] = recon.get("address_lng") if recon.get("address_lng") != "" else ""
+    base["address_geocode_source"] = recon.get("address_geocode_source") or ""
+    base["address_matched"] = recon.get("address_matched") or ""
+    base["pin_address_offset_m"] = (
+        recon.get("pin_address_offset_m")
+        if recon.get("pin_address_offset_m") != ""
+        else ""
+    )
+    base["pin_address_mismatch"] = bool(recon.get("pin_address_mismatch"))
+    if verbose:
+        if base["pin_address_offset_m"] != "":
+            flag = "MISMATCH → classify at address" if base["pin_address_mismatch"] else "ok"
+            progress.result(
+                f"pin↔address {base['pin_address_offset_m']} m "
+                f"({recon.get('address_geocode_source') or '—'}) · {flag}"
+            )
+        else:
+            progress.result(
+                f"address geocode skipped ({recon.get('address_geocode_source') or '—'})"
+            )
+
+    if verbose:
         progress.stage("PROXIMITY", f"≤{max_m:g} m")
+    addr_lat = (
+        float(recon["address_lat"])
+        if recon.get("address_lat") not in ("", None)
+        else None
+    )
+    addr_lng = (
+        float(recon["address_lng"])
+        if recon.get("address_lng") not in ("", None)
+        else None
+    )
     try:
-        hit = find_proximity_hit(cursor, sf_lat, sf_lng, max_m=max_m)
+        hit = find_proximity_hit(
+            cursor,
+            sf_lat,
+            sf_lng,
+            max_m=max_m,
+            address_lat=addr_lat,
+            address_lng=addr_lng,
+        )
     except Exception as exc:  # noqa: BLE001
         if verbose:
             progress.warn(f"SQL proximity failed: {exc}")
@@ -324,18 +405,45 @@ def _process_site(
     if hit is not None:
         base["match_source"] = describe_match(hit)
         base["match_distance_m"] = round(hit.distance_m, 2)
+        base["match_selection_reason"] = hit.selection_reason or ""
+        base["match_candidate_count"] = (
+            hit.candidate_count if hit.candidate_count is not None else ""
+        )
+        base["match_runner_up_gap_m"] = (
+            hit.runner_up_gap_m if hit.runner_up_gap_m is not None else ""
+        )
         base["match_record_id"] = hit.record_id or ""
         base["match_asr_number"] = hit.asr_number or ""
         base["match_asset_type"] = hit.asset_type or ""
         classify_lat, classify_lng = hit.latitude, hit.longitude
         db_lat, db_lng = hit.latitude, hit.longitude
+        base["classify_coord_source"] = f"db:{base['match_source']}"
         if verbose:
-            progress.result(f"{base['match_source']} @ {hit.distance_m:.1f} m")
+            reason = hit.selection_reason or "nearest"
+            progress.result(
+                f"{base['match_source']} @ {hit.distance_m:.1f} m ({reason})"
+            )
     else:
-        classify_lat, classify_lng = sf_lat, sf_lng
         db_lat = db_lng = None
-        if verbose:
-            progress.result("no DB hit → classify on SF pin")
+        # Pin far from geocoded address → pull Nearmap/NAIP on the address
+        # (building rooftop), not the parking-lot / ROW pin.
+        if (
+            base["pin_address_mismatch"]
+            and recon.get("address_lat") != ""
+            and recon.get("address_lng") != ""
+        ):
+            classify_lat = float(recon["address_lat"])
+            classify_lng = float(recon["address_lng"])
+            base["classify_coord_source"] = "geocoded_address"
+            if verbose:
+                progress.result(
+                    "no DB hit · pin/address mismatch → classify on geocoded address"
+                )
+        else:
+            classify_lat, classify_lng = sf_lat, sf_lng
+            base["classify_coord_source"] = "sf_pin"
+            if verbose:
+                progress.result("no DB hit → classify on SF pin")
 
     base["classify_lat"] = classify_lat
     base["classify_lng"] = classify_lng
@@ -360,22 +468,40 @@ def _process_site(
 
     if verbose:
         progress.stage("CLASSIFY")
+    classify_kwargs = {
+        "site_id": sf_id,
+        "lat": float(classify_lat),
+        "lon": float(classify_lng),
+        "chip_dir": chip_dir,
+        "verbose": verbose,
+        "pin_lat": float(sf_lat),
+        "pin_lon": float(sf_lng),
+        "pin_address_offset_m": (
+            float(base["pin_address_offset_m"])
+            if base["pin_address_offset_m"] != ""
+            else None
+        ),
+        "pin_address_mismatch": bool(base["pin_address_mismatch"]),
+    }
     try:
-        classified = classify_fn(
-            site_id=sf_id,
-            lat=float(classify_lat),
-            lon=float(classify_lng),
-            chip_dir=chip_dir,
-            verbose=verbose,
-        )
+        classified = classify_fn(**classify_kwargs)
     except TypeError:
-        # Test doubles may not accept verbose=
-        classified = classify_fn(
-            site_id=sf_id,
-            lat=float(classify_lat),
-            lon=float(classify_lng),
-            chip_dir=chip_dir,
-        )
+        # Test doubles / older classify_fn may not accept pin_* kwargs.
+        try:
+            classified = classify_fn(
+                site_id=sf_id,
+                lat=float(classify_lat),
+                lon=float(classify_lng),
+                chip_dir=chip_dir,
+                verbose=verbose,
+            )
+        except TypeError:
+            classified = classify_fn(
+                site_id=sf_id,
+                lat=float(classify_lat),
+                lon=float(classify_lng),
+                chip_dir=chip_dir,
+            )
     except Exception as exc:  # noqa: BLE001
         if verbose:
             progress.warn(f"classify failed: {exc}")
@@ -408,6 +534,7 @@ def _process_site(
     base["asset_lat"] = classified.get("asset_lat") or ""
     base["asset_lon"] = classified.get("asset_lon") or ""
     base["asset_offset_m"] = classified.get("asset_offset_m") or ""
+    base["asset_coord_source"] = classified.get("asset_coord_source") or ""
     base["asset_box_2d"] = classified.get("asset_box_2d") or ""
     base["asset_view"] = classified.get("asset_view") or ""
     if classified.get("error"):

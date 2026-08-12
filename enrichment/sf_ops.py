@@ -51,11 +51,13 @@ def build_blank_site_type_query(
     owners: Sequence[str] = DEFAULT_OWNER_FILTER,
     fields: Sequence[str] = SF_QUERY_FIELDS,
     carrier_like: str | None = "NFL",
+    states: Sequence[str] | None = None,
 ) -> str:
     """SOQL for blank Site_Type__c sites in the enrichment queue.
 
     `carrier_like` filters Carrier_Leasing_Source__c with LIKE '%value%'.
     Pass None/"" to skip the carrier filter (e.g. non-NFL test batches).
+    `states` filters Site_State__c IN (...); pass None/empty for all states.
     """
     field_list = ", ".join(fields)
     clauses = [
@@ -72,6 +74,11 @@ def build_blank_site_type_query(
     if carrier:
         escaped = carrier.replace("\\", "\\\\").replace("'", "\\'")
         clauses.insert(1, f"Carrier_Leasing_Source__c LIKE '%{escaped}%'")
+    clean_states = [
+        str(s).strip().upper() for s in (states or []) if str(s).strip()
+    ]
+    if clean_states:
+        clauses.append(f"Site_State__c IN ({_soql_in(clean_states)})")
     return f"SELECT {field_list} FROM {OBJECT_NAME} WHERE " + " AND ".join(clauses)
 
 
@@ -111,9 +118,13 @@ def query_blank_site_type_sites(
     stages: Sequence[str] = DEFAULT_STAGE_FILTER,
     owners: Sequence[str] = DEFAULT_OWNER_FILTER,
     carrier_like: str | None = "NFL",
+    states: Sequence[str] | None = None,
 ) -> list[dict[str, Any]]:
     soql = build_blank_site_type_query(
-        stages=stages, owners=owners, carrier_like=carrier_like
+        stages=stages,
+        owners=owners,
+        carrier_like=carrier_like,
+        states=states,
     )
     logger.info("Salesforce SOQL: %s", soql)
     return query_all(client, soql)

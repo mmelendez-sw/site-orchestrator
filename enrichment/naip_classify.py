@@ -66,11 +66,18 @@ def classify_site_imagery(
     chip_dir: Path | None = None,
     input_confidence: str = "medium",
     verbose: bool = True,
+    pin_lat: float | None = None,
+    pin_lon: float | None = None,
+    pin_address_offset_m: float | None = None,
+    pin_address_mismatch: bool = False,
 ) -> dict[str, Any]:
     """Classify one coordinate with the full Nearmap + bifurcated AI stack.
 
     Same strategy as `classifier.asset_classifier` main loop for a single pin:
     NAIP → (optional) Nearmap vert/obliques → wide AOI / zoom → Claude escalate.
+
+    When pin_address_mismatch is set, also save a pin-centered Nearmap Vert chip
+    (`{id}_pin_nearmap_vert.jpg`) so review can compare address vs SF pin.
     """
     from enrichment import progress
     from classifier import asset_classifier as ac
@@ -98,6 +105,37 @@ def classify_site_imagery(
     img, naip_meta, naip_geo = ac.fetch_chip(lat, lon)
     img_date = (naip_meta or {}).get("image_date")
     naip_chip_m = (naip_meta or {}).get("naip_chip_m") or ac.CHIP_SIZE_M
+
+    # Pin↔address mismatch: classify is centered on the geocoded address; still
+    # save a pin-centered Vert chip for human reconciliation in review.
+    if (
+        pin_address_mismatch
+        and pin_lat is not None
+        and pin_lon is not None
+        and chip_dir is not None
+        and not ac.NAIP_ONLY
+        and ac.NEARMAP_API_KEY
+        and (
+            abs(float(pin_lat) - float(lat)) > 1e-6
+            or abs(float(pin_lon) - float(lon)) > 1e-6
+        )
+    ):
+        try:
+            if verbose:
+                progress.step(
+                    "pin Vert chip "
+                    f"(pin↔address {pin_address_offset_m or '?'} m)"
+                )
+            pin_views, _ = ac.fetch_nearmap_views(
+                float(pin_lat), float(pin_lon), views=["Vert"]
+            )
+            pin_vert = pin_views.get("Vert")
+            if pin_vert is not None:
+                pin_path = chip_dir / f"{site_id}_pin_nearmap_vert.jpg"
+                pin_vert.save(pin_path, quality=90)
+        except Exception as exc:  # noqa: BLE001
+            if verbose:
+                progress.warn(f"pin Vert chip failed: {exc}")
 
     nearmap_views: dict = {}
     nearmap_date = None
@@ -483,6 +521,7 @@ def classify_site_imagery(
             )
 
     # Final HVAC false-positive guard for rooftop cell=true.
+    res = ac.gate_weak_rooftop_cell_claim(res)
     res = ac.maybe_recheck_rooftop_cell_false_positive(
         primary_provider if not escalation_model else "claude",
         clients,
@@ -490,9 +529,13 @@ def classify_site_imagery(
         views,
         prior_nearmap_no_cell=prior_nearmap_no_cell,
     )
+    res = ac.gate_weak_rooftop_cell_claim(res)
+    res = ac.gate_weak_stealth_tower_claim(res)
     # Repair missing/invalid boxes before crop + dual-model.
     box_provider = primary_provider if not escalation_model else "claude"
     res = ac.maybe_repair_rooftop_asset_box(box_provider, clients, res, views)
+    res = ac.gate_weak_rooftop_cell_claim(res)
+    res = ac.gate_weak_stealth_tower_claim(res)
     # Magnified crop recheck before dual-model confirm.
     res = ac.maybe_recheck_rooftop_cell_crop(
         box_provider,
@@ -518,8 +561,10 @@ def classify_site_imagery(
         clients,
         confirm_views,
         already_escalated=bool(escalation_model),
-        allow_soft_keep=True,
+        allow_soft_keep=False,
         from_wide_rescue=from_wide_rescue,
+        used_crop=used_crop,
+        allow_gemini_solo=False,
     )
     if dual_model and not escalation_model:
         escalation_model = dual_model
@@ -534,16 +579,19 @@ def classify_site_imagery(
     res = ac.align_site_evidence_with_cell(res)
 
     asset_lat = asset_lon = asset_offset_m = None
+    asset_coord_source = None
     box, box_view = res.get("asset_box_2d"), res.get("asset_view")
     if box:
-        located = None
-        if ac._is_naip_view(box_view) and naip_geo:
-            located = ac.box_to_latlon(naip_geo, box)
-        elif box_view and "top-down" in str(box_view).lower():
-            chip_m = float(nearmap_aoi_m or ac.NEARMAP_CHIP_M)
-            located = ac.box_to_latlon_centered(lat, lon, chip_m, box)
+        located = ac.locate_asset_box_latlon(
+            lat=lat,
+            lon=lon,
+            box=box,
+            box_view=box_view,
+            naip_geo=naip_geo,
+            nearmap_aoi_m=nearmap_aoi_m,
+        )
         if located:
-            asset_lat, asset_lon, asset_offset_m = located
+            asset_lat, asset_lon, asset_offset_m, asset_coord_source = located
 
     delay = ac.GEMINI_DELAY_S if primary_provider == "gemini" else ac.API_DELAY_S
     if verbose and delay:
@@ -570,6 +618,7 @@ def classify_site_imagery(
         "asset_offset_m": (
             round(asset_offset_m, 1) if asset_offset_m is not None else None
         ),
+        "asset_coord_source": asset_coord_source or "",
         "asset_box_2d": json.dumps(box) if box else None,
         "asset_view": box_view,
         "classification_stage": classification_stage,

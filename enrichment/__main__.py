@@ -1,15 +1,18 @@
 """CLI: python -m enrichment.
 
-Default flow (golden / high-precision):
-  1) Classify → write CSVs + review/ package (no Salesforce site-field writes)
-  2) Open review/index.html, approve true cellular sites
-  3) python -m enrichment --apply-reviewed --run-dir <run>
+Auto-apply (airtight) flow:
+  python -m enrichment --states CA,MA,FL,NV --apply --dequeue-holdouts
 
---apply alone no longer auto-pushes enrichment fields after classify.
-Use --apply-reviewed (optionally --approve-all) to push after human review.
-Holdouts are dequeued only when applying reviewed candidates (or with
---dequeue-holdouts on apply-reviewed). Dequeue sets LLM_Classified__c=false
-and LLM_Holdout__c=true; successful Site Type writes clear the holdout flag.
+Only Claude hard-agree candidates are pushed. Imagery-only also requires
+agree_crop / agree_localize. Soft-keep and Gemini-solo never write. Holdouts
+dequeue (LLM_Classified=false, LLM_Holdout=true) for later reconciliation.
+
+Each run writes review/, spot_audit.html (~10% sample), and holdout_triage.md.
+
+Optional human review still available:
+  1) Classify without --apply → review/ package
+  2) python -m enrichment --apply-reviewed --run-dir <run>
+  3) python -m enrichment --triage --run-dir <run>
 """
 
 from __future__ import annotations
@@ -27,11 +30,14 @@ if str(ROOT) not in sys.path:
 
 load_dotenv(ROOT / ".env")
 
+from enrichment.audit import write_spot_audit_package  # noqa: E402
 from enrichment.constants import (  # noqa: E402
     CANDIDATE_CSV,
     DETAIL_CSV,
+    HOLDOUT_TRIAGE_MD,
     PROXIMITY_MAX_M,
     REVIEW_DIR_NAME,
+    SPOT_AUDIT_HTML,
 )
 from enrichment.pipeline import (  # noqa: E402
     apply_candidate_csv,
@@ -39,6 +45,7 @@ from enrichment.pipeline import (  # noqa: E402
     run_enrichment,
 )
 from enrichment.review import load_approved_ids, write_review_package  # noqa: E402
+from enrichment.triage import write_holdout_triage  # noqa: E402
 from salesforce.sf_client import SalesforceClient  # noqa: E402
 
 
@@ -58,10 +65,10 @@ def _quiet_third_party_loggers() -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Enrich blank Site_Type__c Salesforce sites (Carrier_Leasing_Source__c "
-            "LIKE '%NFL%') via FCC/TowerSource proximity and full imagery "
-            "classification. Writes a review/ package; Salesforce site-field "
-            "pushes require --apply-reviewed after human approval."
+            "Enrich blank Site_Type__c Salesforce sites via FCC/TowerSource "
+            "proximity and full imagery classification. Use --apply to "
+            "auto-push airtight Claude-agreed candidates; holdouts dequeue "
+            "with --dequeue-holdouts for later reconciliation."
         )
     )
     parser.add_argument(
@@ -95,10 +102,19 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--states",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated Site_State__c values (e.g. CA,FL,NV,MA). "
+            "Default: no state filter."
+        ),
+    )
+    parser.add_argument(
         "--max-m",
         type=float,
         default=PROXIMITY_MAX_M,
-        help="Proximity radius in meters (default: 25)",
+        help=f"Proximity radius in meters (default: {PROXIMITY_MAX_M:g})",
     )
     parser.add_argument(
         "--skip-classify",
@@ -109,9 +125,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--apply",
         action="store_true",
         help=(
-            "DEPRECATED for auto-push after classify. Use --apply-reviewed after "
-            "opening review/index.html. If passed alone with classify, enrichment "
-            "still runs and only builds the review package."
+            "After classify, auto-push potential_update candidates to Salesforce "
+            "(Claude hard-agree only). Pair with --dequeue-holdouts to clear "
+            "non-candidates from the enrichment queue."
         ),
     )
     parser.add_argument(
@@ -125,20 +141,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--approve-all",
         action="store_true",
-        help="With --apply-reviewed: treat every candidate as approved",
+        help="With --apply-reviewed: treat every ready candidate as approved",
     )
     parser.add_argument(
         "--dequeue-holdouts",
         action="store_true",
         help=(
-            "With --apply-reviewed: also dequeue non-candidate rows from "
-            "enrichment_detail.csv (LLM_Classified=false, LLM_Holdout=true)"
+            "With --apply or --apply-reviewed: dequeue non-candidate rows "
+            "(LLM_Classified__c=false, LLM_Holdout__c=true)"
         ),
     )
     parser.add_argument(
         "--rebuild-review",
         action="store_true",
         help="Rebuild review/ from an existing run-dir candidates CSV and exit",
+    )
+    parser.add_argument(
+        "--triage",
+        action="store_true",
+        help="Rebuild holdout_triage.json/.md (+ spot audit) for --run-dir and exit",
     )
     parser.add_argument(
         "--candidates",
@@ -178,7 +199,22 @@ def main(argv: list[str] | None = None) -> int:
             logging.error("--rebuild-review requires --run-dir")
             return 1
         review_dir = write_review_package(run_dir)
+        write_spot_audit_package(run_dir)
+        write_holdout_triage(run_dir)
         print(f"Rebuilt review package -> {review_dir}")
+        return 0
+
+    if args.triage:
+        if not args.run_dir:
+            logging.error("--triage requires --run-dir")
+            return 1
+        report = write_holdout_triage(run_dir)
+        audit = write_spot_audit_package(run_dir)
+        print(
+            f"Triage → {run_dir / HOLDOUT_TRIAGE_MD} | "
+            f"focus={report.get('weekly_focus')} | "
+            f"spot audit → {audit / SPOT_AUDIT_HTML}"
+        )
         return 0
 
     if args.apply_only:
@@ -199,16 +235,11 @@ def main(argv: list[str] | None = None) -> int:
             verbose=args.verbose,
         )
 
+    mode = "auto-apply" if args.apply else "review-first"
     print(
-        f"ENRICHMENT | limit={args.limit} | review-first | {run_dir}",
+        f"ENRICHMENT | limit={args.limit} | {mode} | {run_dir}",
         flush=True,
     )
-    if args.apply:
-        print(
-            "NOTE: --apply no longer auto-pushes Site Type. "
-            "Classify will build review/; push with --apply-reviewed.",
-            flush=True,
-        )
 
     print("=== AUTHENTICATE SALESFORCE ===", flush=True)
     sf_client = SalesforceClient()
@@ -220,6 +251,13 @@ def main(argv: list[str] | None = None) -> int:
     carrier_like = args.carrier_like
     if carrier_like is not None and str(carrier_like).strip() == "":
         carrier_like = None
+    states = None
+    if args.states:
+        states = [
+            part.strip().upper()
+            for part in str(args.states).split(",")
+            if part.strip()
+        ] or None
 
     summary = run_enrichment(
         sf_client=sf_client,
@@ -229,13 +267,61 @@ def main(argv: list[str] | None = None) -> int:
         skip_classify=args.skip_classify,
         site_ids=site_ids,
         carrier_like=carrier_like,
+        states=states,
         verbose=args.verbose,
     )
     print(summary)
+
+    if args.apply:
+        import csv
+
+        detail_csv = run_dir / DETAIL_CSV
+        with detail_csv.open(encoding="utf-8-sig", newline="") as handle:
+            all_rows = list(csv.DictReader(handle))
+        candidates = [
+            r for r in all_rows if r.get("bucket") == "potential_update"
+        ]
+        holdouts: list[dict] = []
+        if args.dequeue_holdouts:
+            holdouts = [
+                r for r in all_rows if r.get("bucket") != "potential_update"
+            ]
+        print(
+            f"\nAUTO-APPLY | candidates={len(candidates)} | "
+            f"dequeue_holdouts={len(holdouts)} | {run_dir}",
+            flush=True,
+        )
+        if not candidates and not holdouts:
+            print("Nothing to push or dequeue.", flush=True)
+            return 0
+        apply_summary = apply_candidate_csv(
+            sf_client=sf_client,
+            candidate_csv=_write_temp_apply_csv(
+                run_dir, candidates + holdouts
+            ),
+            run_dir=run_dir,
+            apply=True,
+            verbose=args.verbose,
+        )
+        write_spot_audit_package(
+            run_dir,
+            candidates,
+            applied_ids=[r.get("Id") for r in candidates],
+        )
+        print(apply_summary, flush=True)
+        print(
+            f"Spot-audit after apply → "
+            f"{(run_dir / REVIEW_DIR_NAME / SPOT_AUDIT_HTML).resolve()}",
+            flush=True,
+        )
+        return 0 if apply_summary.get("failed", 0) == 0 else 2
+
     print(
         f"\nReview candidates: {(run_dir / REVIEW_DIR_NAME / 'index.html').resolve()}\n"
         f"After approving, push:\n"
-        f"  python -m enrichment --apply-reviewed --run-dir {run_dir}\n",
+        f"  python -m enrichment --apply-reviewed --run-dir {run_dir}\n"
+        f"Or auto-apply next time:\n"
+        f"  python -m enrichment --states CA,MA,FL,NV --apply --dequeue-holdouts\n",
         flush=True,
     )
     return 0
@@ -306,14 +392,24 @@ def _apply_reviewed(
         apply=True,
         verbose=verbose,
     )
+    write_spot_audit_package(
+        run_dir,
+        candidates,
+        applied_ids=[r.get("Id") for r in candidates],
+    )
     print(summary)
+    print(
+        f"Spot-audit after apply → "
+        f"{(run_dir / REVIEW_DIR_NAME / SPOT_AUDIT_HTML).resolve()}",
+        flush=True,
+    )
     return 0 if summary.get("failed", 0) == 0 else 2
 
 
 def _write_temp_apply_csv(run_dir: Path, rows: list[dict]) -> Path:
     import csv
 
-    path = run_dir / "review" / "_approved_apply_batch.csv"
+    path = run_dir / "review" / "_apply_batch.csv"
     path.parent.mkdir(parents=True, exist_ok=True)
     if not rows:
         path.write_text("", encoding="utf-8")

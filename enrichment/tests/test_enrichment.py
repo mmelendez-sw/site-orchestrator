@@ -33,6 +33,7 @@ def _rooftop_ok(**overrides):
         "cell_equipment_evidence": "North oblique shows sector panel antennas",
         "cell_gear_kind": "sector_panel",
         "cell_models_agree": True,
+        "dual_model_resolution": "agree_crop",
         "escalation_model": "claude",
         "asset_lat": 43.0005,
         "asset_lon": -89.0005,
@@ -159,6 +160,84 @@ class MssqlHelperTests(unittest.TestCase):
         hit = find_proximity_hit(cursor, 43.0, -89.0, max_m=200)
         self.assertIsNotNone(hit)
         self.assertEqual(hit.asr_number, "B")
+        self.assertEqual(hit.selection_reason, "confident_pin")
+
+    def test_extended_unique_nearest_accepted(self):
+        """Sunset-style: lone tower ~350 m away is OK; cluster is not."""
+        from enrichment.mssql import ProximityHit, select_proximity_hit
+
+        lone = select_proximity_hit(
+            [
+                ProximityHit(
+                    source=MATCH_SOURCE_TOWERSOURCE,
+                    distance_m=386.0,
+                    latitude=36.06019,
+                    longitude=-115.04861,
+                    record_id="880978",
+                    distance_to_pin_m=386.0,
+                )
+            ],
+            confident_m=25,
+            ambiguity_gap_m=75,
+        )
+        self.assertIsNotNone(lone)
+        self.assertEqual(lone.selection_reason, "unique_nearest_extended")
+
+        ambiguous = select_proximity_hit(
+            [
+                ProximityHit(
+                    source=MATCH_SOURCE_TOWERSOURCE,
+                    distance_m=200.0,
+                    latitude=36.06,
+                    longitude=-115.05,
+                    record_id="1",
+                    distance_to_pin_m=200.0,
+                ),
+                ProximityHit(
+                    source=MATCH_SOURCE_FCC,
+                    distance_m=220.0,
+                    latitude=36.061,
+                    longitude=-115.05,
+                    record_id="2",
+                    distance_to_pin_m=220.0,
+                ),
+            ],
+            confident_m=25,
+            ambiguity_gap_m=75,
+        )
+        self.assertIsNone(ambiguous)
+
+    def test_address_affinity_prefers_tower_near_geocode(self):
+        from enrichment.mssql import ProximityHit, select_proximity_hit
+
+        hit = select_proximity_hit(
+            [
+                ProximityHit(
+                    source=MATCH_SOURCE_TOWERSOURCE,
+                    distance_m=40.0,
+                    latitude=36.06,
+                    longitude=-115.05,
+                    record_id="near_addr",
+                    distance_to_pin_m=120.0,
+                    distance_to_address_m=40.0,
+                ),
+                ProximityHit(
+                    source=MATCH_SOURCE_FCC,
+                    distance_m=90.0,
+                    latitude=36.061,
+                    longitude=-115.051,
+                    record_id="near_pin",
+                    distance_to_pin_m=90.0,
+                    distance_to_address_m=150.0,
+                ),
+            ],
+            confident_m=25,
+            ambiguity_gap_m=75,
+            address_affinity_m=80,
+        )
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit.record_id, "near_addr")
+        self.assertEqual(hit.selection_reason, "address_affinity")
 
 
 class BucketTests(unittest.TestCase):
@@ -249,6 +328,27 @@ class BucketTests(unittest.TestCase):
         self.assertEqual(decision["bucket"], BUCKET_POTENTIAL_UPDATE)
         self.assertEqual(decision["update_coord_source"], "nearmap_asset_box_pin")
 
+    def test_rooftop_oblique_geocode_updates_coords(self):
+        decision = bucket_classification(
+            match_source=MATCH_SOURCE_NONE,
+            classified=_rooftop_ok(
+                asset_lat=43.001,
+                asset_lon=-89.002,
+                asset_coord_source="nearmap_oblique_box",
+                asset_offset_m=35.0,
+                asset_box_2d="[220, 310, 360, 420]",
+                asset_view="Nearmap oblique (North)",
+            ),
+            db_lat=None,
+            db_lng=None,
+            sf_lat=43.0,
+            sf_lng=-89.0,
+        )
+        self.assertEqual(decision["bucket"], BUCKET_POTENTIAL_UPDATE)
+        self.assertEqual(decision["update_lat"], 43.001)
+        self.assertEqual(decision["update_lng"], -89.002)
+        self.assertEqual(decision["update_coord_source"], "nearmap_oblique_box")
+
     def test_rooftop_naip_box_held_out(self):
         decision = bucket_classification(
             match_source=MATCH_SOURCE_NONE,
@@ -262,6 +362,254 @@ class BucketTests(unittest.TestCase):
             sf_lng=-89.0,
         )
         self.assertEqual(decision["holdout_reason"], "rooftop_needs_oblique_asset_box")
+
+    def test_rooftop_dual_agree_allows_vert_box_and_078_conf(self):
+        """Southeast Financial-style: crop agree + Vert box + conf 0.78."""
+        decision = bucket_classification(
+            match_source=MATCH_SOURCE_NONE,
+            classified=_rooftop_ok(
+                cell_equipment_confidence=0.78,
+                dual_model_resolution="agree_crop",
+                cell_models_agree=True,
+                asset_view="Nearmap top-down",
+                asset_box_2d="[476, 526, 632, 589]",
+                asset_lat=25.7722,
+                asset_lon=-80.1876,
+                asset_offset_m=7.9,
+                asset_coord_source="nearmap_vert_box",
+                cell_equipment_evidence=(
+                    "Nearmap top-down shows sector panels and microwave dishes "
+                    "on a rooftop telecom frame"
+                ),
+            ),
+            db_lat=None,
+            db_lng=None,
+            sf_lat=25.77225,
+            sf_lng=-80.18767,
+        )
+        self.assertEqual(decision["bucket"], BUCKET_POTENTIAL_UPDATE)
+        self.assertEqual(decision["update_site_type"], "Rooftop")
+
+    def test_imagery_only_bare_agree_held_out(self):
+        decision = bucket_classification(
+            match_source=MATCH_SOURCE_NONE,
+            classified=_rooftop_ok(dual_model_resolution="agree"),
+            db_lat=None,
+            db_lng=None,
+            sf_lat=43.0,
+            sf_lng=-89.0,
+        )
+        self.assertEqual(
+            decision["holdout_reason"],
+            "imagery_only_needs_crop_or_localize_agree",
+        )
+
+    def test_db_hit_bare_agree_uses_db_coords(self):
+        decision = bucket_classification(
+            match_source=MATCH_SOURCE_FCC,
+            classified=_rooftop_ok(dual_model_resolution="agree"),
+            db_lat=43.01,
+            db_lng=-89.01,
+            sf_lat=43.0,
+            sf_lng=-89.0,
+        )
+        self.assertEqual(decision["bucket"], BUCKET_POTENTIAL_UPDATE)
+        self.assertTrue(str(decision["update_coord_source"]).startswith("db:"))
+        self.assertEqual(decision["update_lat"], 43.01)
+
+    def test_rooftop_gemini_strong_solo_is_held_out_for_sf(self):
+        """Auto-apply airtight: Gemini solo skip is not enough for SF write."""
+        decision = bucket_classification(
+            match_source=MATCH_SOURCE_NONE,
+            classified=_rooftop_ok(
+                cell_equipment_confidence=0.92,
+                dual_model_resolution="gemini_strong_solo",
+                cell_models_agree=True,
+                escalation_model="gemini_strong_solo",
+                asset_view="Nearmap oblique (North)",
+                asset_box_2d="[220, 310, 360, 420]",
+            ),
+            db_lat=None,
+            db_lng=None,
+            sf_lat=43.0,
+            sf_lng=-89.0,
+        )
+        self.assertEqual(decision["holdout_reason"], "rooftop_needs_dual_model_cell")
+
+    def test_rooftop_soft_keep_is_held_out_for_sf(self):
+        """Auto-apply airtight: soft-keep Gemini never unlocks SF writes."""
+        decision = bucket_classification(
+            match_source=MATCH_SOURCE_NONE,
+            classified=_rooftop_ok(
+                cell_equipment_confidence=0.9,
+                dual_model_resolution="soft_keep_gemini",
+                cell_models_agree=True,
+                asset_view="Nearmap oblique (North)",
+                asset_box_2d="[220, 310, 360, 420]",
+                cell_equipment_evidence="Gemini claimed sector panels; Claude veto soft-kept",
+            ),
+            db_lat=None,
+            db_lng=None,
+            sf_lat=43.0,
+            sf_lng=-89.0,
+        )
+        self.assertEqual(decision["holdout_reason"], "rooftop_needs_dual_model_cell")
+
+    def test_rooftop_soft_keep_does_not_relax_vert_box(self):
+        decision = bucket_classification(
+            match_source=MATCH_SOURCE_NONE,
+            classified=_rooftop_ok(
+                cell_equipment_confidence=0.9,
+                dual_model_resolution="soft_keep_gemini",
+                cell_models_agree=True,
+                asset_view="Nearmap top-down",
+                asset_box_2d="[476, 526, 632, 589]",
+                cell_equipment_evidence="Gemini claimed sector panels on Vert",
+            ),
+            db_lat=None,
+            db_lng=None,
+            sf_lat=43.0,
+            sf_lng=-89.0,
+        )
+        # Soft-keep fails hard-agree before Vert-box localization is considered.
+        self.assertEqual(decision["holdout_reason"], "rooftop_needs_dual_model_cell")
+
+    def test_rooftop_disagree_stays_held_out(self):
+        decision = bucket_classification(
+            match_source=MATCH_SOURCE_NONE,
+            classified=_rooftop_ok(
+                cell_models_agree=False,
+                dual_model_resolution="claude_veto",
+                claude_cell_equipment=False,
+            ),
+            db_lat=None,
+            db_lng=None,
+            sf_lat=43.0,
+            sf_lng=-89.0,
+        )
+        self.assertEqual(decision["holdout_reason"], "rooftop_needs_dual_model_cell")
+
+
+class ReviewSectionTests(unittest.TestCase):
+    def test_classify_review_sections(self):
+        from enrichment.review import (
+            REVIEW_SECTION_CONTENTION,
+            REVIEW_SECTION_NO_CELL,
+            REVIEW_SECTION_READY,
+            classify_review_section,
+        )
+
+        self.assertEqual(
+            classify_review_section({"bucket": "potential_update"}),
+            REVIEW_SECTION_READY,
+        )
+        self.assertEqual(
+            classify_review_section(
+                {
+                    "bucket": "potential_rooftop",
+                    "holdout_reason": "rooftop_needs_dual_model_cell",
+                    "gemini_cell_equipment": True,
+                    "claude_cell_equipment": False,
+                    "cell_models_agree": False,
+                    "naip_cell_equipment": False,
+                }
+            ),
+            REVIEW_SECTION_CONTENTION,
+        )
+        self.assertEqual(
+            classify_review_section(
+                {
+                    "bucket": "potential_rooftop",
+                    "holdout_reason": "rooftop_no_cell_equipment",
+                    "naip_cell_equipment": False,
+                    "gemini_cell_equipment": False,
+                }
+            ),
+            REVIEW_SECTION_NO_CELL,
+        )
+        self.assertEqual(
+            classify_review_section(
+                {
+                    "bucket": "other_or_else",
+                    "holdout_reason": "other",
+                    "naip_site_type": "other",
+                    "naip_cell_equipment": False,
+                }
+            ),
+            REVIEW_SECTION_NO_CELL,
+        )
+
+    def test_cell_verdict_labels(self):
+        from enrichment.review import (
+            REVIEW_SECTION_CONTENTION,
+            REVIEW_SECTION_NO_CELL,
+            REVIEW_SECTION_READY,
+            cell_verdict_for_row,
+        )
+
+        yes_cls, yes_label, _ = cell_verdict_for_row(
+            {"review_section": REVIEW_SECTION_READY}
+        )
+        self.assertEqual(yes_cls, "verdict-cell-yes")
+        self.assertIn("CELL EQUIPMENT", yes_label)
+        self.assertNotIn("NO", yes_label)
+
+        no_cls, no_label, _ = cell_verdict_for_row(
+            {"review_section": REVIEW_SECTION_NO_CELL}
+        )
+        self.assertEqual(no_cls, "verdict-cell-no")
+        self.assertIn("NO CELL", no_label)
+
+        unclear_cls, unclear_label, _ = cell_verdict_for_row(
+            {"review_section": REVIEW_SECTION_CONTENTION}
+        )
+        self.assertEqual(unclear_cls, "verdict-cell-unclear")
+        self.assertIn("UNCERTAIN", unclear_label)
+
+    def test_index_html_verdict_banners(self):
+        from enrichment.review import _render_index_html
+        from pathlib import Path
+
+        html_out = _render_index_html(
+            run_dir=Path("runs/fake"),
+            rows=[
+                {
+                    "Id": "a1",
+                    "review_section": "ready",
+                    "naip_cell_equipment": True,
+                    "asset_box_2d": "[100,100,200,200]",
+                    "asset_view": "Nearmap oblique (North)",
+                    "chip_links": "site_nearmap_north.jpg",
+                },
+                {
+                    "Id": "a2",
+                    "review_section": "contention",
+                    "naip_cell_equipment": True,
+                    "asset_box_2d": "[100,100,200,200]",
+                    "asset_view": "Nearmap oblique (North)",
+                    "chip_links": "site_nearmap_north.jpg",
+                },
+                {
+                    "Id": "a3",
+                    "review_section": "no_cell",
+                    "naip_cell_equipment": False,
+                    "asset_box_2d": "[100,100,200,200]",
+                    "asset_view": "Nearmap oblique (North)",
+                    "chip_links": "site_nearmap_north.jpg",
+                },
+            ],
+        )
+        self.assertIn("verdict-cell-yes", html_out)
+        self.assertIn("verdict-cell-unclear", html_out)
+        self.assertIn("verdict-cell-no", html_out)
+        self.assertIn("CELL EQUIPMENT — ready to approve", html_out)
+        self.assertIn("NO CELL EQUIPMENT", html_out)
+        self.assertIn("asset-box-confirmed", html_out)
+        self.assertIn("asset-box-untrusted", html_out)
+        # no_cell must not draw a model box overlay
+        no_cell_start = html_out.find('data-id="a3"')
+        no_cell_chunk = html_out[no_cell_start : no_cell_start + 2500]
+        self.assertNotIn("asset-box", no_cell_chunk)
 
     def test_rooftop_view_evidence_mismatch_held_out(self):
         decision = bucket_classification(
@@ -316,6 +664,76 @@ class BucketTests(unittest.TestCase):
         )
         self.assertEqual(decision["holdout_reason"], "tower_naip_only_forbidden")
 
+    def test_imagery_only_tower_vert_only_held_out(self):
+        """Green Valley-style: Vert-only tower must not be Ready."""
+        decision = bucket_classification(
+            match_source=MATCH_SOURCE_NONE,
+            classified={
+                "site_type": "tower",
+                "tower_subtype": "monopole",
+                "site_confidence": 0.9,
+                "cell_equipment": True,
+                "cell_equipment_confidence": 0.8,
+                "cell_equipment_evidence": "Nearmap top-down shows triangular platform",
+                "nearmap_tier": "vert_only",
+                "nearmap_views": "Vert",
+                "asset_box_2d": "[188, 151, 584, 442]",
+                "asset_view": "Nearmap top-down",
+                "cell_models_agree": False,
+            },
+            db_lat=None,
+            db_lng=None,
+            sf_lat=36.0255,
+            sf_lng=-115.0852,
+        )
+        self.assertEqual(decision["holdout_reason"], "tower_needs_nearmap_obliques")
+
+    def test_imagery_only_tower_needs_dual_model(self):
+        decision = bucket_classification(
+            match_source=MATCH_SOURCE_NONE,
+            classified={
+                "site_type": "tower",
+                "tower_subtype": "monopole",
+                "site_confidence": 0.9,
+                "cell_equipment": True,
+                "cell_equipment_confidence": 0.9,
+                "cell_equipment_evidence": "North oblique shows sector panels on monopole",
+                "nearmap_tier": "full",
+                "nearmap_views": "Vert,North,East,South,West",
+                "asset_box_2d": "[220, 310, 360, 420]",
+                "asset_view": "Nearmap oblique (North)",
+                "cell_models_agree": False,
+                "escalation_model": "",
+            },
+            db_lat=None,
+            db_lng=None,
+            sf_lat=36.0255,
+            sf_lng=-115.0852,
+        )
+        self.assertEqual(decision["holdout_reason"], "tower_needs_dual_model_cell")
+
+    def test_pin_address_format_and_mismatch_flag(self):
+        from enrichment.pin_address import (
+            PIN_ADDRESS_MISMATCH_M,
+            format_site_geocode_query,
+        )
+        from dedupe.spatial import haversine_meters
+
+        q = format_site_geocode_query(
+            {
+                "Site_Street__c": "100 N Green Valley Pkwy",
+                "Site_City__c": "Henderson",
+                "Site_State__c": "NV",
+                "Site_Zip_Code__c": "89074",
+            }
+        )
+        self.assertIn("Green Valley", q)
+        self.assertIn("Henderson", q)
+        # Sanity: ~50m threshold is the default knobs use.
+        self.assertGreaterEqual(PIN_ADDRESS_MISMATCH_M, 40)
+        d = haversine_meters(36.0255335, -115.0851761, 36.0260, -115.0852)
+        self.assertGreater(d, 0)
+
     def test_tower_without_cell_equipment_is_held_out(self):
         decision = bucket_classification(
             match_source=MATCH_SOURCE_NONE,
@@ -342,8 +760,15 @@ class BucketTests(unittest.TestCase):
                 "tower_subtype": "monopole",
                 "site_confidence": 0.85,
                 "cell_equipment": True,
-                "nearmap_tier": "vert_only",
-                "nearmap_views": "Vert",
+                "cell_equipment_confidence": 0.9,
+                "cell_equipment_evidence": "North oblique shows sector panels on monopole",
+                "nearmap_tier": "full",
+                "nearmap_views": "Vert,North,East,South,West",
+                "asset_box_2d": "[220, 310, 360, 420]",
+                "asset_view": "Nearmap oblique (North)",
+                "cell_models_agree": True,
+                "dual_model_resolution": "agree",
+                "escalation_model": "claude",
             },
             db_lat=43.01,
             db_lng=-89.01,
@@ -408,6 +833,11 @@ class SoqlTests(unittest.TestCase):
         self.assertIn("Id IN ('a0Z1', 'a0Z2')", soql)
         self.assertNotIn("Carrier_Leasing_Source__c LIKE", soql)
         self.assertNotIn("LLM_Classified__c =", soql)
+
+    def test_blank_site_type_query_states_filter(self):
+        soql = build_blank_site_type_query(states=["CA", "fl", "NV", "MA"])
+        self.assertIn("Site_State__c IN ('CA', 'FL', 'NV', 'MA')", soql)
+        self.assertIn("Carrier_Leasing_Source__c LIKE '%NFL%'", soql)
 
 
 class PayloadTests(unittest.TestCase):
@@ -686,6 +1116,234 @@ class CoordinationHelperTests(unittest.TestCase):
         }
         kept = ac.enforce_rooftop_cell_requires_box(ok)
         self.assertTrue(kept["cell_equipment"])
+
+    def test_locate_asset_box_from_nearmap_oblique(self):
+        from classifier import asset_classifier as ac
+
+        located = ac.locate_asset_box_latlon(
+            lat=40.0,
+            lon=-74.0,
+            box=[200, 700, 300, 800],
+            box_view="Nearmap oblique (North)",
+            nearmap_aoi_m=100,
+        )
+        self.assertIsNotNone(located)
+        alat, alon, offset_m, source = located
+        self.assertEqual(source, "nearmap_oblique_box")
+        self.assertGreater(offset_m, 0)
+        # Box is east of center → longitude should increase (northern hemisphere).
+        self.assertGreater(alon, -74.0)
+        self.assertNotEqual((alat, alon), (40.0, -74.0))
+
+    def test_gate_weak_rooftop_cell_claim(self):
+        from classifier import asset_classifier as ac
+
+        weak = {
+            "site_type": "rooftop",
+            "cell_equipment": True,
+            "cell_equipment_confidence": 0.9,
+            "cell_equipment_evidence": "equipment on roof",
+            "site_evidence": "commercial building",
+            "asset_view": "Nearmap Vert (top-down)",
+            "asset_box_2d": [100, 100, 400, 400],
+        }
+        gated = ac.gate_weak_rooftop_cell_claim(dict(weak))
+        self.assertIsNone(gated["cell_equipment"])
+        self.assertIsNone(gated.get("asset_box_2d"))
+
+        strong = {
+            "site_type": "rooftop",
+            "cell_equipment": True,
+            "cell_equipment_confidence": 0.9,
+            "cell_equipment_evidence": "North oblique shows sector panel antennas",
+            "site_evidence": "rooftop on commercial building",
+            "asset_view": "Nearmap oblique (North)",
+            "asset_box_2d": [220, 310, 360, 420],
+        }
+        kept = ac.gate_weak_rooftop_cell_claim(dict(strong))
+        self.assertTrue(kept["cell_equipment"])
+        self.assertEqual(kept["asset_box_2d"], [220, 310, 360, 420])
+
+    def test_gemini_strong_solo_requires_high_conf_oblique(self):
+        from classifier import asset_classifier as ac
+
+        base = {
+            "site_type": "rooftop",
+            "cell_equipment": True,
+            "cell_equipment_confidence": 0.92,
+            "cell_equipment_evidence": "North oblique shows sector panel antennas",
+            "site_evidence": "rooftop on commercial building",
+            "asset_view": "Nearmap oblique (North)",
+            "asset_box_2d": [220, 310, 360, 420],
+            "nearmap_tier": "full",
+            "nearmap_views": "North,East,South,West,Vert",
+        }
+        self.assertTrue(
+            ac.should_trust_gemini_cell_solo(base, from_wide_rescue=False)
+        )
+        weak = dict(base, cell_equipment_confidence=0.86)
+        self.assertFalse(
+            ac.should_trust_gemini_cell_solo(weak, from_wide_rescue=False)
+        )
+        self.assertFalse(
+            ac.should_trust_gemini_cell_solo(base, from_wide_rescue=True)
+        )
+
+    def test_box_iou_overlap(self):
+        from classifier import asset_classifier as ac
+
+        a = [100, 100, 300, 300]
+        b = [200, 200, 400, 400]
+        self.assertGreater(ac.box_iou(a, b), 0.1)
+        self.assertEqual(ac.box_iou(a, [500, 500, 600, 600]), 0.0)
+        self.assertAlmostEqual(ac.box_iou(a, a), 1.0)
+
+    def test_gate_weak_stealth_tower_claim(self):
+        from classifier import asset_classifier as ac
+
+        weak = {
+            "site_type": "tower",
+            "tower_subtype": "stealth",
+            "cell_equipment": True,
+            "cell_equipment_confidence": 0.9,
+            "site_evidence": (
+                "A faux-building steeple/tower structure is located in the "
+                "parking lot between commercial buildings"
+            ),
+            "cell_equipment_evidence": (
+                "The tall stealth tower likely conceals sector antennas, "
+                "as is typical for this type of architectural telecom asset."
+            ),
+        }
+        gated = ac.gate_weak_stealth_tower_claim(dict(weak))
+        self.assertEqual(gated["tower_subtype"], "other_tower")
+        self.assertIsNone(gated["cell_equipment"])
+
+        strong = {
+            "site_type": "tower",
+            "tower_subtype": "stealth",
+            "cell_equipment": True,
+            "cell_equipment_confidence": 0.9,
+            "site_evidence": "A palm-tree stealth monopole (monopalm) is visible",
+            "cell_equipment_evidence": (
+                "Nearmap oblique views show sector panel antennas mounted "
+                "beneath the faux-palm fronds of the stealth monopole."
+            ),
+        }
+        kept = ac.gate_weak_stealth_tower_claim(dict(strong))
+        self.assertEqual(kept["tower_subtype"], "stealth")
+        self.assertTrue(kept["cell_equipment"])
+
+
+class GoldenRegressionTests(unittest.TestCase):
+    def test_all_golden_cases(self):
+        from enrichment.tests.golden_cases import GOLDEN_CASES
+
+        for (
+            name,
+            match_source,
+            classified,
+            db_lat,
+            db_lng,
+            sf_lat,
+            sf_lng,
+            expect,
+        ) in GOLDEN_CASES:
+            with self.subTest(name=name):
+                decision = bucket_classification(
+                    match_source=match_source,
+                    classified=classified,
+                    db_lat=db_lat,
+                    db_lng=db_lng,
+                    sf_lat=sf_lat,
+                    sf_lng=sf_lng,
+                )
+                if "bucket" in expect:
+                    self.assertEqual(decision["bucket"], expect["bucket"], name)
+                if "holdout_reason" in expect:
+                    self.assertEqual(
+                        decision["holdout_reason"], expect["holdout_reason"], name
+                    )
+                if "holdout_reason_contains" in expect:
+                    self.assertIn(
+                        expect["holdout_reason_contains"],
+                        str(decision.get("holdout_reason") or ""),
+                        name,
+                    )
+                if "coord_prefix" in expect:
+                    self.assertTrue(
+                        str(decision.get("update_coord_source") or "").startswith(
+                            expect["coord_prefix"]
+                        ),
+                        name,
+                    )
+
+
+class AuditTriageTests(unittest.TestCase):
+    def test_spot_audit_prefers_imagery_only(self):
+        from enrichment.audit import select_spot_audit_sample
+
+        rows = [
+            {
+                "Id": f"db{i:02d}",
+                "bucket": BUCKET_POTENTIAL_UPDATE,
+                "match_source": MATCH_SOURCE_FCC,
+            }
+            for i in range(10)
+        ] + [
+            {
+                "Id": f"img{i:02d}",
+                "bucket": BUCKET_POTENTIAL_UPDATE,
+                "match_source": MATCH_SOURCE_NONE,
+            }
+            for i in range(5)
+        ]
+        sample = select_spot_audit_sample(rows, rate=0.2, min_n=3, max_n=5)
+        self.assertGreaterEqual(len(sample), 3)
+        self.assertLessEqual(len(sample), 5)
+        self.assertTrue(
+            any(r["Id"].startswith("img") for r in sample),
+            "imagery-only should appear in small audit sample",
+        )
+
+    def test_holdout_triage_weekly_focus(self):
+        from enrichment.triage import build_holdout_triage
+
+        rows = [
+            {
+                "Id": "a",
+                "bucket": BUCKET_ROOFTOP,
+                "holdout_reason": "rooftop_needs_dual_model_cell",
+                "match_source": MATCH_SOURCE_NONE,
+            },
+            {
+                "Id": "b",
+                "bucket": BUCKET_ROOFTOP,
+                "holdout_reason": "rooftop_needs_dual_model_cell",
+                "match_source": MATCH_SOURCE_NONE,
+            },
+            {
+                "Id": "c",
+                "bucket": BUCKET_OTHER,
+                "holdout_reason": "tower_needs_nearmap_obliques",
+                "match_source": MATCH_SOURCE_NONE,
+            },
+            {
+                "Id": "d",
+                "bucket": BUCKET_POTENTIAL_UPDATE,
+                "holdout_reason": "",
+                "match_source": MATCH_SOURCE_FCC,
+            },
+        ]
+        report = build_holdout_triage(rows, top_n=2)
+        self.assertEqual(report["candidates"], 1)
+        self.assertEqual(report["db_backed_candidates"], 1)
+        self.assertEqual(report["holdouts"], 3)
+        self.assertEqual(len(report["weekly_focus"]), 2)
+        self.assertEqual(
+            report["weekly_focus"][0]["reason"],
+            "rooftop_needs_dual_model_cell",
+        )
 
 
 if __name__ == "__main__":

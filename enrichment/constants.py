@@ -2,7 +2,20 @@
 
 from __future__ import annotations
 
-PROXIMITY_MAX_M = 25.0
+import os
+
+PROXIMITY_MAX_M = float(os.environ.get("PROXIMITY_MAX_M", "500"))
+
+# Hits within this of the SF pin (or geocoded address) are accepted without
+# uniqueness checks — same spirit as the old 25 m default.
+PROXIMITY_CONFIDENT_M = float(os.environ.get("PROXIMITY_CONFIDENT_M", "25"))
+
+# Extended-range (confident..max) hits must beat the runner-up by this gap, or
+# sit within ADDRESS_AFFINITY_M of the geocoded address, to avoid wrong neighbors.
+PROXIMITY_AMBIGUITY_GAP_M = float(os.environ.get("PROXIMITY_AMBIGUITY_GAP_M", "75"))
+PROXIMITY_ADDRESS_AFFINITY_M = float(
+    os.environ.get("PROXIMITY_ADDRESS_AFFINITY_M", "80")
+)
 
 # Imagery asset-box snap radius from the SF/classify pin. Effective max is
 # MAX_ASSET_OFFSET_M + ASSET_OFFSET_LEEWAY_M. Beyond that: rooftops hold out;
@@ -12,6 +25,7 @@ MAX_ASSET_OFFSET_M = 75.0
 ASSET_OFFSET_LEEWAY_M = 10.0
 
 # Degrees buffer used for SQL bbox prefilter (~25–30 m at mid-latitudes).
+# Actual fetch buffer scales with PROXIMITY_MAX_M in mssql._buffer_deg_for_radius.
 BBOX_BUFFER_DEG = 0.0003
 
 FCC_TABLE = "dbo.FCCTowerData"
@@ -74,6 +88,15 @@ APPLY_LOG_CSV = "sf_update_apply_log.csv"
 REVIEW_DIR_NAME = "review"
 REVIEW_MANIFEST_CSV = "review_manifest.csv"
 REVIEW_INDEX_HTML = "index.html"
+SPOT_AUDIT_HTML = "spot_audit.html"
+SPOT_AUDIT_CSV = "spot_audit.csv"
+HOLDOUT_TRIAGE_JSON = "holdout_triage.json"
+HOLDOUT_TRIAGE_MD = "holdout_triage.md"
+
+# Post-apply / post-classify spot check of ready candidates (deterministic sample).
+SPOT_AUDIT_RATE = float(os.environ.get("SPOT_AUDIT_RATE", "0.10"))
+SPOT_AUDIT_MIN = int(os.environ.get("SPOT_AUDIT_MIN", "3"))
+SPOT_AUDIT_MAX = int(os.environ.get("SPOT_AUDIT_MAX", "25"))
 
 # Medium/high confidence required for automatic update candidacy (DB hits).
 MIN_UPDATE_CONFIDENCE = 0.6

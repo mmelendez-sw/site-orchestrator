@@ -151,20 +151,6 @@ def _asset_view_is_nearmap_oblique(classified: dict[str, Any]) -> bool:
     return any(d in view for d in ("north", "east", "south", "west"))
 
 
-def _rooftop_oblique_box_ok(classified: dict[str, Any]) -> bool:
-    """Rooftop SF writes require a compact box on a Nearmap oblique view."""
-    box = _parse_asset_box_2d(classified)
-    if not box:
-        return False
-    if not _asset_view_is_nearmap_oblique(classified):
-        return False
-    ymin, xmin, ymax, xmax = box
-    # Reject whole-roof / whole-facade boxes.
-    if (ymax - ymin) > 400 or (xmax - xmin) > 400:
-        return False
-    return True
-
-
 def _view_evidence_consistent(classified: dict[str, Any]) -> bool:
     """Reject NAIP boxes when cell evidence cites a Nearmap oblique direction."""
     evidence = str(classified.get("cell_equipment_evidence") or "").lower()
@@ -182,7 +168,16 @@ def _view_evidence_consistent(classified: dict[str, Any]) -> bool:
 
 
 def _dual_model_cell_ok(classified: dict[str, Any]) -> bool:
-    """Rooftops require Gemini+Claude agreement that cell gear is present."""
+    """True when Gemini+Claude agreed cell gear is present (not Gemini-solo)."""
+    resolution = str(classified.get("dual_model_resolution") or "").strip().lower()
+    if resolution in {
+        "gemini_strong_solo",
+        "soft_keep_gemini",
+        "claude_veto",
+        "box_required",
+        "first_pass_gate",
+    }:
+        return False
     agree = classified.get("cell_models_agree")
     if isinstance(agree, bool):
         return agree
@@ -195,6 +190,108 @@ def _dual_model_cell_ok(classified: dict[str, Any]) -> bool:
     if not str(classified.get("escalation_model") or "").strip():
         return False
     return cell_equipment_confirmed(classified.get("cell_equipment"))
+
+
+def _dual_model_hard_agree(classified: dict[str, Any]) -> bool:
+    """True only for real Gemini+Claude agree on cell gear.
+
+    Soft-keep and Gemini-solo must not unlock Salesforce writes — those are the
+    HVAC / wrong-neighbor FP paths. Auto-apply requires an explicit Claude
+    confirm resolution (agree / agree_crop / agree_localize).
+    """
+    if not cell_equipment_confirmed(classified.get("cell_equipment")):
+        return False
+    if not _dual_model_cell_ok(classified):
+        return False
+    resolution = str(classified.get("dual_model_resolution") or "").strip().lower()
+    if resolution not in {"agree", "agree_crop", "agree_localize"}:
+        return False
+    esc = str(classified.get("escalation_model") or "").strip().lower()
+    return esc == "claude"
+
+
+def _dual_model_localized_agree(classified: dict[str, Any]) -> bool:
+    """Crop or localize Claude confirm — required for imagery-only SF writes.
+
+    Bare ``agree`` (full-scene / already-escalated) is allowed for DB-backed
+    hits where FCC/TowerSource already anchors the site. Imagery-only must
+    prove the boxed region, not just a scene-level yes.
+    """
+    if not _dual_model_hard_agree(classified):
+        return False
+    resolution = str(classified.get("dual_model_resolution") or "").strip().lower()
+    return resolution in {"agree_crop", "agree_localize"}
+
+
+def _asset_view_is_nearmap_vert(classified: dict[str, Any]) -> bool:
+    view = str(classified.get("asset_view") or "").strip().lower()
+    if not view or "naip" in view:
+        return False
+    if "oblique" in view:
+        return False
+    if any(d in view for d in ("north", "east", "south", "west")):
+        return False
+    return "top-down" in view or "vert" in view
+
+
+def _compact_asset_box(classified: dict[str, Any]) -> list[int] | None:
+    box = _parse_asset_box_2d(classified)
+    if not box:
+        return None
+    ymin, xmin, ymax, xmax = box
+    if (ymax - ymin) > 400 or (xmax - xmin) > 400:
+        return None
+    return box
+
+
+def _rooftop_oblique_box_ok(classified: dict[str, Any]) -> bool:
+    """Compact box on a Nearmap oblique view."""
+    if not _compact_asset_box(classified):
+        return False
+    return _asset_view_is_nearmap_oblique(classified)
+
+
+def _rooftop_vert_box_dual_agree_ok(
+    classified: dict[str, Any],
+    *,
+    require_localized: bool = False,
+) -> bool:
+    """Allow compact Nearmap Vert box when Claude agrees on cell gear.
+
+    Oblique imagery must still have been fetched (full Nearmap). This recovers
+    true positives like Southeast Financial Center where gear is clearest from
+    Vert, without letting Gemini-only HVAC FPs through.
+
+    Imagery-only writes pass ``require_localized=True`` so bare scene-level
+    ``agree`` cannot unlock a Vert-box candidate.
+    """
+    agree_ok = (
+        _dual_model_localized_agree(classified)
+        if require_localized
+        else _dual_model_hard_agree(classified)
+    )
+    if not agree_ok:
+        return False
+    if not _rooftop_oblique_imagery_ok(classified):
+        return False
+    if not _asset_view_is_nearmap_vert(classified):
+        return False
+    if not _compact_asset_box(classified):
+        return False
+    return _telecom_evidence_cues(classified)
+
+
+def _rooftop_localization_box_ok(
+    classified: dict[str, Any],
+    *,
+    require_localized: bool = False,
+) -> bool:
+    """Rooftop SF writes need a compact localization box on Nearmap imagery."""
+    if _rooftop_oblique_box_ok(classified):
+        return True
+    return _rooftop_vert_box_dual_agree_ok(
+        classified, require_localized=require_localized
+    )
 
 
 def _effective_max_asset_offset_m() -> float:
@@ -274,9 +371,12 @@ def bucket_classification(
     - cell_equipment must be confirmed true (towers and rooftops)
     - rooftops need Nearmap obliques, dual-model cell agreement, asset box,
       telecom evidence / cell_gear_kind, and cell conf ≥ bar
+    - DB hits may use bare Claude ``agree``; imagery-only requires
+      ``agree_crop`` or ``agree_localize`` (boxed-region proof)
     - imagery-only (no DB hit) uses stricter site/cell confidence bars
     - NAIP-only imagery never writes rooftop or tower Site Type
     - rooftops never verify as NAIP
+    - update coords prefer FCC/TowerSource when present
     """
     site_type_raw = str(classified.get("site_type") or "").strip().lower()
     error = classified.get("error")
@@ -317,6 +417,28 @@ def bucket_classification(
     ):
         return _holdout(BUCKET_OTHER, "tower_no_cell_equipment", classified)
 
+    # Imagery-only towers: Vert-only + Gemini-alone is how nearby rooftop/pole
+    # false positives reach Ready (e.g. Green Valley Pkwy pin offset).
+    if site_type_raw == "tower" and imagery_only:
+        if not _rooftop_oblique_imagery_ok(classified):
+            return _holdout(BUCKET_OTHER, "tower_needs_nearmap_obliques", classified)
+        if not _has_asset_box(classified):
+            return _holdout(BUCKET_OTHER, "tower_needs_asset_box", classified)
+
+    # Auto-apply airtight: every tower write needs Claude hard-agree (not solo/soft-keep).
+    if site_type_raw == "tower" and not _dual_model_hard_agree(classified):
+        return _holdout(BUCKET_OTHER, "tower_needs_dual_model_cell", classified)
+
+    # Imagery-only is the exception path: require boxed crop/localize confirm.
+    if site_type_raw == "tower" and imagery_only and not _dual_model_localized_agree(
+        classified
+    ):
+        return _holdout(
+            BUCKET_OTHER,
+            "imagery_only_needs_crop_or_localize_agree",
+            classified,
+        )
+
     sf_site_type = map_site_type_for_upload(classified)
     if not sf_site_type:
         if site_type_raw == "rooftop":
@@ -324,22 +446,33 @@ def bucket_classification(
         return _holdout(BUCKET_OTHER, "unmapped_site_type", classified)
 
     if site_type_raw == "rooftop":
-        cell_min = (
-            MIN_IMAGERY_ONLY_CELL_CONFIDENCE
-            if imagery_only
-            else MIN_ROOFTOP_CELL_CONFIDENCE
-        )
+        # Imagery-only uses a higher cell-conf floor unless Gemini+Claude hard-agree.
+        if imagery_only and _dual_model_hard_agree(classified):
+            cell_min = MIN_ROOFTOP_CELL_CONFIDENCE
+        elif imagery_only:
+            cell_min = MIN_IMAGERY_ONLY_CELL_CONFIDENCE
+        else:
+            cell_min = MIN_ROOFTOP_CELL_CONFIDENCE
         if not _rooftop_cell_confidence_ok(classified, minimum=cell_min):
             return _holdout(BUCKET_ROOFTOP, "rooftop_low_cell_confidence", classified)
         if not _cell_gear_kind_ok(classified):
             return _holdout(BUCKET_ROOFTOP, "rooftop_no_telecom_evidence", classified)
         if not _rooftop_oblique_imagery_ok(classified):
             return _holdout(BUCKET_ROOFTOP, "rooftop_needs_nearmap_obliques", classified)
-        if not _dual_model_cell_ok(classified):
+        # Auto-apply airtight: Claude hard-agree required (crop/localize agree).
+        if not _dual_model_hard_agree(classified):
             return _holdout(BUCKET_ROOFTOP, "rooftop_needs_dual_model_cell", classified)
+        if imagery_only and not _dual_model_localized_agree(classified):
+            return _holdout(
+                BUCKET_ROOFTOP,
+                "imagery_only_needs_crop_or_localize_agree",
+                classified,
+            )
         if not _has_asset_box(classified):
             return _holdout(BUCKET_ROOFTOP, "rooftop_needs_asset_box", classified)
-        if not _rooftop_oblique_box_ok(classified):
+        if not _rooftop_localization_box_ok(
+            classified, require_localized=imagery_only
+        ):
             return _holdout(BUCKET_ROOFTOP, "rooftop_needs_oblique_asset_box", classified)
         if not _view_evidence_consistent(classified):
             return _holdout(BUCKET_ROOFTOP, "rooftop_view_evidence_mismatch", classified)
@@ -410,6 +543,10 @@ def _resolve_update_coords(
     sf_lng: float | None,
     require_asset_box: bool = False,
 ) -> tuple[float | None, float | None, str]:
+    """Prefer FCC/TowerSource coords whenever a proximity hit exists.
+
+    Imagery asset-box snaps are the exception path (imagery-only sites).
+    """
     if match_source != MATCH_SOURCE_NONE and db_lat is not None and db_lng is not None:
         return db_lat, db_lng, f"db:{match_source}"
 
@@ -417,7 +554,10 @@ def _resolve_update_coords(
     asset_lon = classified.get("asset_lon")
     try:
         if asset_lat is not None and asset_lon is not None and str(asset_lat).strip() != "":
-            return float(asset_lat), float(asset_lon), "naip_asset_box"
+            source = str(classified.get("asset_coord_source") or "").strip()
+            if not source:
+                source = "asset_box"
+            return float(asset_lat), float(asset_lon), source
     except (TypeError, ValueError):
         pass
 

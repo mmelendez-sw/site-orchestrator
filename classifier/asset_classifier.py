@@ -107,6 +107,14 @@ NAIP_AGE_HIGH_CONF_OVERRIDE = float(os.environ.get("NAIP_AGE_HIGH_CONF_OVERRIDE"
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 CLAUDE_ESCALATION_MODEL = os.environ.get(
     "CLAUDE_ESCALATION_MODEL", "claude-sonnet-4-6")
+# Thinking tokens for Gemini vision calls. Empty/auto: 1024 for non-lite
+# Gemini 2.5/3.x, 0 for *-lite* (keeps Flash-Lite cheap/fast).
+GEMINI_THINKING_BUDGET_ENV = os.environ.get("GEMINI_THINKING_BUDGET", "").strip()
+# Soft-keep / solo-trust cell confidence floors.
+GEMINI_SOFT_KEEP_CELL_CONF = float(os.environ.get("GEMINI_SOFT_KEEP_CELL_CONF", "0.85"))
+GEMINI_SOLO_CELL_CONF = float(os.environ.get("GEMINI_SOLO_CELL_CONF", "0.90"))
+# Min IoU between Gemini and Claude boxes on localize dual-confirm.
+GEMINI_CLAUDE_BOX_IOU = float(os.environ.get("GEMINI_CLAUDE_BOX_IOU", "0.20"))
 OBLIQUE_VIEWS = ["North", "East", "South", "West"]
 
 # ----------------------------- configuration --------------------------------
@@ -242,8 +250,13 @@ When site_type is "tower", also set tower_subtype to the best match:
 - "monopole": single thin pole, minimal footprint, no lattice faces
 - "guyed": guy wires or anchor pads visible from above or oblique
 - "self_support": lattice or solid self-supporting tower legs
-- "stealth": church steeple, clock tower, faux-building tower cap, or \
-faux-building monopole disguised as architecture
+- "stealth": ONLY a purpose-built disguised telecom mast — e.g. monopalm \
+(faux palm), monopine (faux pine), slim flagpole/canister shroud, or a \
+freestanding faux-steeple mast with visible antenna bays/slots. Do NOT use \
+stealth for ordinary church steeples, cupolas, elevator penthouses, \
+decorative parking-lot towers, building corners, or architecture that merely \
+"could" hide antennas. If unsure, use other_tower or unclear — never guess \
+stealth.
 - "water_tower": elevated tank on legs
 - "silo": agricultural/industrial silo hosting antennas
 - "flagpole": flagpole-style slim mast
@@ -251,6 +264,9 @@ faux-building monopole disguised as architecture
 - "other_tower": tower present but subtype unclear
 - "unclear": tower confirmed but subtype not discernible
 When site_type is not "tower", set tower_subtype to null.
+Never set cell_equipment=true on a stealth call from "likely conceals" or \
+"typical for stealth" alone — you must see antenna panels, dishes, RRUs, or \
+clear shroud/bay hardware.
 Set site_confidence to at most 0.6 unless two or more independent cues or \
 views corroborate the call.
 
@@ -281,6 +297,11 @@ on the roof, parapet, or building facade / wall (side-mounted)
 - Short masts or poles on the parapet carrying antennas
 - Rooftop or wall-mounted radio panels / sector frames (not HVAC condensers)
 - Telecom equipment cabinets clearly paired with antenna mounts (not alone)
+Default when unsure: cell_equipment=null (not true). Do not mark cell_equipment \
+true from Nearmap Vert / top-down alone unless sector panels or dishes are \
+unmistakable; prefer an oblique confirmation. Never set cell_equipment=true \
+and never draw asset_box_2d around HVAC condensers, chillers, vents, or \
+generic mechanical clusters.
 FALSE / NOT cellular when they are the ONLY roof objects (HVAC and cell often \
 coexist — do not call false just because condensers/vents are also present):
 - HVAC condensers, chillers, air handlers, cooling towers alone
@@ -465,6 +486,31 @@ a rooftop or facade (sector panels, facade mounts, dishes, RRUs, parapet masts)?
 
 Answer cell_equipment true only with unmistakable telecom hardware. HVAC-only \
 roofs are false. Set cell_gear_kind and cite the view in cell_equipment_evidence.
+Return the same JSON schema.
+"""
+
+ROOFTOP_CELL_CROP_CONFIRM_PROMPT = """\
+You are checking ONE magnified crop that another model already boxed as cellular \
+gear (plus the source view for context).
+
+Question: is the boxed region CLEAR cellular/telecom hardware?
+TRUE only for sector panels, facade mounts, microwave dishes, RRUs, or parapet \
+masts. FALSE for HVAC condensers/chillers, vents, pipes, skylights, solar, water \
+tanks, or generic mechanical clusters.
+
+Do not invent a different roof location. Leave asset_box_2d null — the prior box \
+is fixed; only vote cell_equipment true/false for THIS crop. Prefer false when \
+unsure. Set cell_gear_kind accordingly and cite crop cues in cell_equipment_evidence.
+Return the same JSON schema.
+"""
+
+ROOFTOP_CELL_LOCALIZE_CONFIRM_PROMPT = """\
+Independent localization pass (no trusted prior crop): does this rooftop/facade \
+show CLEAR cellular equipment?
+
+If cell_equipment=true you MUST draw your own tight asset_box_2d on the Nearmap \
+oblique where the gear is clearest, and set asset_view to that exact view label. \
+Never box HVAC alone. Prefer false / null box when unsure.
 Return the same JSON schema.
 """
 
@@ -861,8 +907,8 @@ def maybe_recheck_rooftop_cell_false_positive(
     HVAC commonly coexists with cell gear — presence of mechanical plant alone
     must not clear a positive cell_equipment call.
 
-    When an earlier full Nearmap pass said no cell, never skip on keyword
-    "antenna cues" alone — force the FP recheck.
+    Always re-check rooftop cell=true: Gemini often self-cites "antenna/sector"
+    on HVAC, so keyword skip is unsafe.
     """
     if str(res.get("site_type") or "").strip().lower() != "rooftop":
         return res
@@ -875,15 +921,6 @@ def maybe_recheck_rooftop_cell_false_positive(
         str(res.get(key) or "")
         for key in ("cell_equipment_evidence", "site_evidence")
     )
-    # Strong first-pass antenna call with no HVAC-only smell: skip extra pass
-    # unless Nearmap already contradicted cell gear.
-    if (
-        not prior_nearmap_no_cell
-        and _text_has_telecom_cue(prior_evidence)
-        and "hvac" not in prior_evidence.lower()
-    ):
-        _step_done("cell FP recheck", "skipped (clear antenna cues)")
-        return res
     if prior_nearmap_no_cell:
         _step_done("cell FP recheck", "forced (prior Nearmap no-cell)")
 
@@ -906,18 +943,27 @@ def maybe_recheck_rooftop_cell_false_positive(
 
     if new_cell is False and not _text_denies_telecom(recheck_evidence):
         # Soft false: only keep coexistence true when the first pass already
-        # cited antennas/panels. Otherwise HVAC-only roofs stay false.
-        if not _text_has_telecom_cue(prior_evidence):
+        # cited antennas/panels AND we have a compact Nearmap oblique box.
+        # Self-authored Gemini "sector" prose alone is not enough.
+        if not (
+            _text_has_telecom_cue(prior_evidence)
+            and has_locked_oblique_asset_box(res)
+        ):
             res["cell_equipment"] = False
             if "cell_equipment_confidence" in recheck:
                 res["cell_equipment_confidence"] = recheck.get(
                     "cell_equipment_confidence"
                 )
             res["cell_equipment_evidence"] = recheck_evidence or (
-                "FP recheck: no prior antenna cues; soft-false treated as HVAC"
+                "FP recheck: no locked oblique box; soft-false treated as HVAC"
             )
+            res["asset_box_2d"] = None
+            res["asset_view"] = None
             normalize_model_result(res)
-            _step_done("cell FP recheck", "downgraded to false (no prior antenna cues)")
+            _step_done(
+                "cell FP recheck",
+                "downgraded to false (no locked oblique box)",
+            )
             return res
         if recheck_evidence:
             res["cell_equipment_evidence"] = (
@@ -928,9 +974,12 @@ def maybe_recheck_rooftop_cell_false_positive(
         _step_done("cell FP recheck", "kept true (HVAC+cell coexistence)")
         return res
 
-    if new_cell is None and _text_has_telecom_cue(prior_evidence):
-        # Ambiguous second pass should not erase a prior antenna citation.
-        _step_done("cell FP recheck", "kept true (prior antenna cues)")
+    if new_cell is None and _text_has_telecom_cue(prior_evidence) and (
+        has_locked_oblique_asset_box(res)
+    ):
+        # Ambiguous second pass should not erase a prior antenna citation
+        # when we already locked an oblique gear box.
+        _step_done("cell FP recheck", "kept true (prior antenna cues + oblique box)")
         return res
 
     res["cell_equipment"] = new_cell  # false with hard deny, or null
@@ -938,11 +987,137 @@ def maybe_recheck_rooftop_cell_false_positive(
         res["cell_equipment_confidence"] = recheck.get("cell_equipment_confidence")
     if recheck_evidence:
         res["cell_equipment_evidence"] = recheck_evidence
+    if new_cell is not True:
+        # Drop misleading HVAC boxes when cell is no longer confirmed.
+        if not has_locked_oblique_asset_box(res):
+            res["asset_box_2d"] = None
+            res["asset_view"] = None
     normalize_model_result(res)
     if new_cell is False:
         _step_done("cell FP recheck", "downgraded to false")
     else:
         _step_done("cell FP recheck", "downgraded to null")
+    return res
+
+
+def gate_weak_stealth_tower_claim(res: dict) -> dict:
+    """Demote speculative stealth tower calls (common Gemini false positive).
+
+    Stealth requires a purpose-built disguise (monopalm/monopine/canister) plus
+    real telecom cues — not "likely conceals" on ordinary architecture.
+    """
+    if str(res.get("site_type") or "").strip().lower() != "tower":
+        return res
+    subtype = str(res.get("tower_subtype") or "").strip().lower()
+    if subtype != "stealth":
+        return res
+
+    evidence = " ".join(
+        str(res.get(key) or "")
+        for key in ("cell_equipment_evidence", "site_evidence")
+    ).lower()
+    strong_form = any(
+        cue in evidence
+        for cue in (
+            "monopalm",
+            "mono-palm",
+            "monopine",
+            "mono-pine",
+            "faux palm",
+            "faux-pine",
+            "faux pine",
+            "palm frond",
+            "pine frond",
+            "canister",
+            "antenna bay",
+            "antenna bays",
+            "stealth canister",
+            "pine-needle",
+            "pine needle",
+        )
+    )
+    speculative = any(
+        phrase in evidence
+        for phrase in (
+            "likely conceal",
+            "likely hides",
+            "typical for",
+            "as is typical",
+            "probably conceal",
+            "appears to conceal",
+            "may conceal",
+            "could conceal",
+        )
+    )
+    has_cues = _text_has_telecom_cue(evidence)
+
+    if strong_form and has_cues and not speculative:
+        return res
+
+    prior = str(res.get("site_evidence") or "").strip()
+    res["tower_subtype"] = "other_tower"
+    note = "stealth gate: speculative or weak disguise cues"
+    if speculative or not strong_form:
+        # Do not keep cell=true on architecture-as-stealth guesses.
+        if res.get("cell_equipment") is True and (speculative or not has_cues):
+            res["cell_equipment"] = None
+            res["cell_gear_kind"] = "unclear"
+            res["cell_equipment_evidence"] = (
+                f"{res.get('cell_equipment_evidence') or ''} | {note}"
+            ).strip(" |")
+    res["site_evidence"] = f"{prior} | {note}".strip(" |")
+    normalize_model_result(res)
+    _step_done("stealth gate", note)
+    return res
+
+
+def gate_weak_rooftop_cell_claim(res: dict) -> dict:
+    """Downgrade untrustworthy rooftop cell=true claims before crop/dual-model.
+
+    Requires telecom evidence cues and a compact Nearmap localization box.
+    Oblique boxes are preferred; Vert-only true needs high conf + cues.
+    Clears misleading HVAC boxes when the claim is demoted.
+    """
+    if str(res.get("site_type") or "").strip().lower() != "rooftop":
+        return res
+    if res.get("cell_equipment") is not True:
+        return res
+
+    evidence = " ".join(
+        str(res.get(key) or "")
+        for key in ("cell_equipment_evidence", "site_evidence")
+    )
+    has_cues = _text_has_telecom_cue(evidence)
+    oblique_box = has_locked_oblique_asset_box(res)
+    valid = get_valid_asset_box(res)
+    view = str(res.get("asset_view") or "").strip().lower()
+    vert_box = bool(valid) and (
+        "top-down" in view or ("vert" in view and "oblique" not in view)
+    )
+    conf = normalize_confidence(res.get("cell_equipment_confidence")) or 0.0
+
+    if oblique_box and has_cues:
+        return res
+    if vert_box and has_cues and conf >= 0.85:
+        return res
+
+    prior = str(res.get("cell_equipment_evidence") or "").strip()
+    reason_bits = []
+    if not has_cues:
+        reason_bits.append("no telecom cues")
+    if not oblique_box and not vert_box:
+        reason_bits.append("no usable Nearmap box")
+    elif vert_box and conf < 0.85:
+        reason_bits.append("Vert box needs conf>=0.85 or oblique")
+    note = "first-pass gate: " + (", ".join(reason_bits) or "weak cell claim")
+    res["cell_equipment"] = None
+    res["cell_equipment_evidence"] = f"{prior} | {note}".strip(" |")
+    res["cell_gear_kind"] = "unclear"
+    res["asset_box_2d"] = None
+    res["asset_view"] = None
+    res["dual_model_resolution"] = res.get("dual_model_resolution") or "first_pass_gate"
+    normalize_model_result(res)
+    _step_done("first-pass cell gate", note)
     return res
 
 
@@ -1144,6 +1319,28 @@ def enforce_rooftop_cell_requires_box(res: dict, views: list | None = None) -> d
     return res
 
 
+def box_iou(box_a: list[int] | None, box_b: list[int] | None) -> float:
+    """Intersection-over-union for [ymin, xmin, ymax, xmax] boxes in 0-1000 space."""
+    a = coerce_asset_box(box_a)
+    b = coerce_asset_box(box_b)
+    if not a or not b:
+        return 0.0
+    ay0, ax0, ay1, ax1 = a
+    by0, bx0, by1, bx1 = b
+    iy0, ix0 = max(ay0, by0), max(ax0, bx0)
+    iy1, ix1 = min(ay1, by1), min(ax1, bx1)
+    iw, ih = max(0, ix1 - ix0), max(0, iy1 - iy0)
+    inter = iw * ih
+    if inter <= 0:
+        return 0.0
+    area_a = max(0, ax1 - ax0) * max(0, ay1 - ay0)
+    area_b = max(0, bx1 - bx0) * max(0, by1 - by0)
+    union = area_a + area_b - inter
+    if union <= 0:
+        return 0.0
+    return inter / union
+
+
 def confirm_rooftop_cell_with_claude(
     res: dict,
     clients: dict,
@@ -1152,17 +1349,21 @@ def confirm_rooftop_cell_with_claude(
     already_escalated: bool,
     allow_soft_keep: bool = True,
     from_wide_rescue: bool = False,
+    used_crop: bool = False,
+    allow_gemini_solo: bool = True,
 ) -> tuple[dict, str | None, bool]:
-    """Require Claude agreement that rooftop cell gear is present.
+    """Tiered Claude check for rooftop/tower cell=true.
 
-    Returns (res, escalation_model_or_None, cell_models_agree).
+    1) Strong Gemini (optional) → skip Claude when allow_gemini_solo.
+    2) usable Gemini crop → Claude votes true/false on THAT box only.
+       Crop veto is authoritative (no soft-keep of the same HVAC box).
+    3) No crop → Claude localizes; cell=true requires Claude box + IoU.
 
-    When Claude vetoes but Nearmap obliques + strong Gemini cell agree (and the
-    positive did not come from a wide-AOI rescue), soft-keep Gemini so real
-    rooftops are not lost to a lone Claude false.
+    Enrichment auto-apply should pass allow_soft_keep=False and
+    allow_gemini_solo=False so only Claude hard-agree reaches Salesforce.
     """
     site = str(res.get("site_type") or "").strip().lower()
-    if site != "rooftop":
+    if site not in {"rooftop", "tower"}:
         return res, None, False
 
     def _apply_soft_keep(reason: str) -> tuple[dict, str | None, bool]:
@@ -1200,6 +1401,45 @@ def confirm_rooftop_cell_with_claude(
             )
         return trial
 
+    def _apply_claude_veto(claude_res: dict, *, reason: str) -> tuple[dict, str | None, bool]:
+        # Crop veto: never soft-keep the same boxed region Claude rejected.
+        can_soft = (
+            allow_soft_keep
+            and not used_crop
+            and should_soft_keep_gemini_cell(
+                res, from_wide_rescue=from_wide_rescue
+            )
+        )
+        if can_soft:
+            if gemini_evidence or claude_res.get("cell_equipment_evidence"):
+                res["cell_equipment_evidence"] = (
+                    f"{gemini_evidence or ''} | Claude veto soft-kept "
+                    f"(Nearmap+Gemini); Claude: "
+                    f"{claude_res.get('cell_equipment_evidence') or 'cell=false'}"
+                ).strip(" |")
+            return _apply_soft_keep(
+                "disagree → soft-keep Gemini (Nearmap+Gemini)"
+            )
+        res["cell_equipment"] = claude_res.get("cell_equipment")
+        if claude_res.get("cell_equipment_evidence"):
+            res["cell_equipment_evidence"] = claude_res.get(
+                "cell_equipment_evidence"
+            )
+        if claude_res.get("cell_gear_kind"):
+            res["cell_gear_kind"] = claude_res.get("cell_gear_kind")
+        if "cell_equipment_confidence" in claude_res:
+            res["cell_equipment_confidence"] = claude_res.get(
+                "cell_equipment_confidence"
+            )
+        if not has_locked_oblique_asset_box(res):
+            res["asset_box_2d"] = None
+            res["asset_view"] = None
+        res["dual_model_resolution"] = "claude_veto"
+        res["cell_models_agree"] = False
+        normalize_model_result(res)
+        _step_done("dual-model cell", reason)
+        return res, "claude", False
+
     if res.get("cell_equipment") is not True:
         res["claude_cell_equipment"] = res.get("cell_equipment")
         res["gemini_cell_equipment"] = res.get("gemini_pre_escalation_cell")
@@ -1222,6 +1462,8 @@ def confirm_rooftop_cell_with_claude(
     gemini_conf = res.get("cell_equipment_confidence")
     gemini_evidence = res.get("cell_equipment_evidence")
     gemini_gear = res.get("cell_gear_kind")
+    gemini_box = get_valid_asset_box(res)
+    gemini_view = str(res.get("asset_view") or "").strip()
     # Preserve Gemini snapshot for soft-keep if not already stamped.
     res.setdefault("gemini_pre_escalation_cell", True)
     res.setdefault("gemini_pre_escalation_cell_conf", gemini_conf)
@@ -1232,65 +1474,131 @@ def confirm_rooftop_cell_with_claude(
         agree = res.get("cell_equipment") is True
         res["claude_cell_equipment"] = res.get("cell_equipment")
         res["cell_models_agree"] = agree
+        if agree:
+            res["dual_model_resolution"] = res.get("dual_model_resolution") or "agree"
         _step_done(
             "dual-model cell",
             "agree" if agree else "disagree (Claude negative)",
         )
         return res, "claude", agree
 
+    if allow_gemini_solo and should_trust_gemini_cell_solo(
+        res, from_wide_rescue=from_wide_rescue
+    ):
+        res["claude_cell_equipment"] = None
+        res["cell_models_agree"] = True
+        res["dual_model_resolution"] = "gemini_strong_solo"
+        normalize_model_result(res)
+        _step_done(
+            "dual-model cell",
+            f"skipped Claude (Gemini solo conf>={GEMINI_SOLO_CELL_CONF:g})",
+        )
+        return res, "gemini_strong_solo", True
+
     if "claude" not in clients or clients.get("claude") is None:
         res["cell_models_agree"] = False
         _step_done("dual-model cell", "skipped (no Claude client)")
         return res, None, False
 
+    if used_crop:
+        prompt = ROOFTOP_CELL_CROP_CONFIRM_PROMPT
+        mode = "crop_check"
+    else:
+        prompt = ROOFTOP_CELL_LOCALIZE_CONFIRM_PROMPT
+        mode = "localize_iou"
+
     claude_res = classify_site(
         "claude",
         clients,
         views,
-        prompt=ROOFTOP_CELL_DUAL_CONFIRM_PROMPT,
+        prompt=prompt,
         claude_model=CLAUDE_ESCALATION_MODEL,
     )
     claude_cell = claude_res.get("cell_equipment") is True
     res["claude_cell_equipment"] = claude_res.get("cell_equipment")
-    agree = gemini_cell and claude_cell
-    res["cell_models_agree"] = agree
-    if claude_cell:
+    res["claude_dual_mode"] = mode
+
+    if not claude_cell:
+        return _apply_claude_veto(
+            claude_res,
+            reason=(
+                "crop veto (HVAC/not cell)"
+                if used_crop
+                else "localize veto"
+            ),
+        )
+
+    # Claude says true.
+    if used_crop:
+        # Keep Gemini's box/coords; Claude only confirmed the crop contents.
         if claude_res.get("cell_equipment_confidence") is not None:
             res["cell_equipment_confidence"] = claude_res.get(
                 "cell_equipment_confidence"
             )
         if claude_res.get("cell_equipment_evidence"):
-            res["cell_equipment_evidence"] = claude_res.get("cell_equipment_evidence")
+            res["cell_equipment_evidence"] = claude_res.get(
+                "cell_equipment_evidence"
+            )
         if claude_res.get("cell_gear_kind"):
             res["cell_gear_kind"] = claude_res.get("cell_gear_kind")
         res["cell_equipment"] = True
-        res["dual_model_resolution"] = "agree"
-    else:
-        if allow_soft_keep and should_soft_keep_gemini_cell(
-            res, from_wide_rescue=from_wide_rescue
-        ):
-            if gemini_evidence or claude_res.get("cell_equipment_evidence"):
-                res["cell_equipment_evidence"] = (
-                    f"{gemini_evidence or ''} | Claude veto soft-kept "
-                    f"(Nearmap+Gemini); Claude: "
-                    f"{claude_res.get('cell_equipment_evidence') or 'cell=false'}"
+        res["cell_models_agree"] = True
+        res["dual_model_resolution"] = "agree_crop"
+        normalize_model_result(res)
+        _step_done("dual-model cell", "agree (Claude crop check)")
+        return res, "claude", True
+
+    # Localize path: Claude must produce a usable box.
+    claude_box = get_valid_asset_box(claude_res)
+    claude_view = str(claude_res.get("asset_view") or "").strip()
+    if not claude_box:
+        claude_res = dict(claude_res)
+        claude_res["cell_equipment"] = False
+        claude_res["cell_equipment_evidence"] = (
+            str(claude_res.get("cell_equipment_evidence") or "")
+            + " | localize: Claude true without usable box"
+        ).strip(" |")
+        return _apply_claude_veto(
+            claude_res, reason="localize true without box"
+        )
+
+    if gemini_box and gemini_view and claude_view:
+        same_view = (
+            gemini_view.lower() in claude_view.lower()
+            or claude_view.lower() in gemini_view.lower()
+        )
+        if same_view:
+            iou = box_iou(gemini_box, claude_box)
+            res["claude_gemini_box_iou"] = round(iou, 3)
+            if iou < GEMINI_CLAUDE_BOX_IOU:
+                claude_res = dict(claude_res)
+                claude_res["cell_equipment"] = False
+                claude_res["cell_equipment_evidence"] = (
+                    f"{claude_res.get('cell_equipment_evidence') or ''} | "
+                    f"box IoU {iou:.2f} < {GEMINI_CLAUDE_BOX_IOU:g} vs Gemini"
                 ).strip(" |")
-            return _apply_soft_keep(
-                "disagree → soft-keep Gemini (Nearmap+Gemini)"
-            )
-        res["cell_equipment"] = claude_res.get("cell_equipment")
-        if claude_res.get("cell_equipment_evidence"):
-            res["cell_equipment_evidence"] = claude_res.get("cell_equipment_evidence")
-        if claude_res.get("cell_gear_kind"):
-            res["cell_gear_kind"] = claude_res.get("cell_gear_kind")
-        if "cell_equipment_confidence" in claude_res:
-            res["cell_equipment_confidence"] = claude_res.get(
-                "cell_equipment_confidence"
-            )
-        res["dual_model_resolution"] = "claude_veto"
+                return _apply_claude_veto(
+                    claude_res, reason=f"box IoU {iou:.2f} mismatch"
+                )
+
+    # Prefer Gemini box when IoU/views align; else adopt Claude localization.
+    if not gemini_box:
+        res["asset_box_2d"] = claude_box
+        res["asset_view"] = claude_view or res.get("asset_view")
+    if claude_res.get("cell_equipment_confidence") is not None:
+        res["cell_equipment_confidence"] = claude_res.get(
+            "cell_equipment_confidence"
+        )
+    if claude_res.get("cell_equipment_evidence"):
+        res["cell_equipment_evidence"] = claude_res.get("cell_equipment_evidence")
+    if claude_res.get("cell_gear_kind"):
+        res["cell_gear_kind"] = claude_res.get("cell_gear_kind")
+    res["cell_equipment"] = True
+    res["cell_models_agree"] = True
+    res["dual_model_resolution"] = "agree_localize"
     normalize_model_result(res)
-    _step_done("dual-model cell", "agree" if agree else "disagree")
-    return res, "claude", agree
+    _step_done("dual-model cell", "agree (Claude localize)")
+    return res, "claude", True
 
 
 # ----------------------------- geocoding ------------------------------------
@@ -1467,9 +1775,11 @@ def box_to_latlon(geo: dict, box) -> tuple[float, float, float] | None:
 def box_to_latlon_centered(
     lat: float, lon: float, chip_m: float, box
 ) -> tuple[float, float, float] | None:
-    """Geocode a top-down chip box when the AOI is a square centered on lat/lon.
+    """Geocode a chip box when the AOI is a square centered on lat/lon.
 
-    Used for Nearmap Vert (and similar) where we lack a projected CRS geo dict.
+    Used for Nearmap Vert and as an approximation for Nearmap obliques: the
+    mosaic is still fetched around the same AOI, so the box center is a nearby
+    pin (perspective error is usually tens of meters, not hundreds).
     """
     try:
         ymin, xmin, ymax, xmax = (float(v) for v in box[:4])
@@ -1478,7 +1788,11 @@ def box_to_latlon_centered(
         return None
     if side <= 0:
         return None
-    if not (0 <= ymin <= ymax <= 1000 and 0 <= xmin <= xmax <= 1000):
+    if ymin > ymax:
+        ymin, ymax = ymax, ymin
+    if xmin > xmax:
+        xmin, xmax = xmax, xmin
+    if not (0 <= ymin < ymax <= 1000 and 0 <= xmin < xmax <= 1000):
         return None
     cx = (xmin + xmax) / 2000.0
     cy = (ymin + ymax) / 2000.0
@@ -1491,6 +1805,55 @@ def box_to_latlon_centered(
     dlon = east_m / (111_320.0 * cos_lat)
     offset_m = math.hypot(east_m, south_m)
     return lat + dlat, lon + dlon, offset_m
+
+
+def locate_asset_box_latlon(
+    *,
+    lat: float,
+    lon: float,
+    box,
+    box_view: str | None,
+    naip_geo: dict | None = None,
+    nearmap_aoi_m: float | None = None,
+) -> tuple[float, float, float, str] | None:
+    """Map asset_box_2d → (lat, lon, offset_m, source) when possible.
+
+    Preference: true NAIP geo → Nearmap Vert → Nearmap oblique AOI approximation.
+    """
+    valid = coerce_asset_box(box)
+    if valid is None and isinstance(box, (list, tuple)) and len(box) >= 4:
+        # Allow slightly-oversized boxes through for geocode only.
+        try:
+            ymin, xmin, ymax, xmax = (int(round(float(v))) for v in box[:4])
+            if ymin > ymax:
+                ymin, ymax = ymax, ymin
+            if xmin > xmax:
+                xmin, xmax = xmax, xmin
+            if 0 <= ymin < ymax <= 1000 and 0 <= xmin < xmax <= 1000:
+                valid = [ymin, xmin, ymax, xmax]
+        except (TypeError, ValueError):
+            valid = None
+    if not valid:
+        return None
+
+    if _is_naip_view(box_view) and naip_geo:
+        located = box_to_latlon(naip_geo, valid)
+        if located:
+            return located[0], located[1], located[2], "naip_asset_box"
+
+    chip_m = float(nearmap_aoi_m or NEARMAP_CHIP_M)
+    view = str(box_view or "").lower()
+    if "top-down" in view or ("vert" in view and "oblique" not in view):
+        located = box_to_latlon_centered(lat, lon, chip_m, valid)
+        if located:
+            return located[0], located[1], located[2], "nearmap_vert_box"
+
+    if asset_view_is_nearmap_oblique(box_view):
+        located = box_to_latlon_centered(lat, lon, chip_m, valid)
+        if located:
+            return located[0], located[1], located[2], "nearmap_oblique_box"
+
+    return None
 
 
 def nearmap_full_blocks_rescue(
@@ -1568,13 +1931,29 @@ def should_soft_keep_gemini_cell(res: dict, *, from_wide_rescue: bool) -> bool:
     if (ymax - ymin) > 400 or (xmax - xmin) > 400:
         return False
     conf = normalize_confidence(res.get("cell_equipment_confidence"))
-    if conf is None or conf < 0.85:
+    if conf is None or conf < GEMINI_SOFT_KEEP_CELL_CONF:
         return False
     evidence = " ".join(
         str(res.get(key) or "")
         for key in ("cell_equipment_evidence", "site_evidence")
     )
     return _text_has_telecom_cue(evidence)
+
+
+def should_trust_gemini_cell_solo(res: dict, *, from_wide_rescue: bool = False) -> bool:
+    """Skip Claude dual-confirm when Gemini already locked a strong rooftop cell.
+
+    Requires soft-keep-strength Nearmap localization plus conf >= GEMINI_SOLO_CELL_CONF.
+    Saves Claude cost and avoids Claude false vetoes on clear antenna sites.
+    """
+    if res.get("cell_equipment") is not True:
+        return False
+    if not should_soft_keep_gemini_cell(res, from_wide_rescue=from_wide_rescue):
+        return False
+    conf = normalize_confidence(res.get("cell_equipment_confidence"))
+    if conf is None or conf < GEMINI_SOLO_CELL_CONF:
+        return False
+    return has_locked_oblique_asset_box(res)
 
 
 def align_site_evidence_with_cell(res: dict) -> dict:
@@ -1901,6 +2280,38 @@ def _gemini_retry_wait_s(attempt: int, exc: Exception) -> float:
     return min(wait, 120.0) + random.uniform(0.0, 3.0)
 
 
+def _gemini_thinking_budget() -> int:
+    """Resolved thinking token budget for the active GEMINI_MODEL."""
+    raw = GEMINI_THINKING_BUDGET_ENV or os.environ.get("GEMINI_THINKING_BUDGET", "").strip()
+    if raw and raw.lower() not in {"auto", "default"}:
+        try:
+            return max(0, int(float(raw)))
+        except (TypeError, ValueError):
+            return 0
+    model = str(GEMINI_MODEL or "").strip().lower()
+    if "lite" in model:
+        return 0
+    if model.startswith("gemini-3") or model.startswith("gemini-2.5"):
+        return 1024
+    return 0
+
+
+def _gemini_generate_config(schema: dict) -> genai_types.GenerateContentConfig:
+    """Structured JSON config; enable thinking for non-lite Gemini 2.5/3.x."""
+    budget = _gemini_thinking_budget()
+    kwargs: dict = {
+        "response_mime_type": "application/json",
+        "response_schema": schema,
+        # Thinking consumes output budget; keep headroom for the JSON reply.
+        "max_output_tokens": 8192 if budget > 0 else 1000,
+    }
+    if not str(GEMINI_MODEL).startswith("gemini-2.0"):
+        kwargs["thinking_config"] = genai_types.ThinkingConfig(
+            thinking_budget=budget
+        )
+    return genai_types.GenerateContentConfig(**kwargs)
+
+
 def _call_gemini_json(client: genai.Client, contents: list, schema: dict,
                       retries: int | None = None) -> dict:
     """Gemini vision call with structured JSON output (single model)."""
@@ -1911,13 +2322,7 @@ def _call_gemini_json(client: genai.Client, contents: list, schema: dict,
             resp = client.models.generate_content(
                 model=GEMINI_MODEL,
                 contents=contents,
-                config=genai_types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=schema,
-                    max_output_tokens=1000,
-                    **({"thinking_config": genai_types.ThinkingConfig(thinking_budget=0)}
-                       if not GEMINI_MODEL.startswith("gemini-2.0") else {}),
-                ),
+                config=_gemini_generate_config(schema),
             )
             break
         except Exception as exc:
@@ -2041,6 +2446,18 @@ def rooftop_requires_nearmap_tiers(res: dict) -> bool:
     mounts can raise (or challenge) cell confidence before SF write.
     """
     return _is_rooftop(res)
+
+
+def tower_cell_requires_nearmap_obliques(res: dict) -> bool:
+    """Tower + cell=true must not stop on Vert alone.
+
+    Pin-centered Vert chips often frame a nearby rooftop compound or a
+    different pole than the SF address; obliques are needed before write.
+    """
+    return (
+        str(res.get("site_type") or "").strip().lower() == "tower"
+        and res.get("cell_equipment") is True
+    )
 
 
 def naip_age_blocks_early_stop(
@@ -2168,10 +2585,18 @@ def classify_with_tiers(lat: float, lon: float, img: Image.Image | None,
     views = build_views(nearmap_views)
     res = classify_site(provider, clients, views, prompt=prompt)
     res = maybe_recheck_equipment(provider, clients, res, views, input_confidence)
+    res = gate_weak_rooftop_cell_claim(res)
     res = maybe_recheck_rooftop_cell_false_positive(provider, clients, res, views)
+    res = gate_weak_rooftop_cell_claim(res)
+    res = gate_weak_stealth_tower_claim(res)
     _step_done("classify (Nearmap vert)", _brief_pass_result(res))
-    # Rooftops always continue to obliques; towers may stop when confident.
-    if tier_confident_stop(res) and not rooftop_requires_nearmap_tiers(res):
+    # Rooftops always continue to obliques; tower+cell also continues (Vert-only
+    # often latches onto a nearby rooftop/pole that is not the SF pin asset).
+    if (
+        tier_confident_stop(res)
+        and not rooftop_requires_nearmap_tiers(res)
+        and not tower_cell_requires_nearmap_obliques(res)
+    ):
         return res, nearmap_views, nearmap_date, "vert_only", views
 
     missing = [v for v in OBLIQUE_VIEWS if v not in nearmap_views]
@@ -2188,7 +2613,10 @@ def classify_with_tiers(lat: float, lon: float, img: Image.Image | None,
     views = build_views(nearmap_views)
     res = classify_site(provider, clients, views, prompt=prompt)
     res = maybe_recheck_equipment(provider, clients, res, views, input_confidence)
+    res = gate_weak_rooftop_cell_claim(res)
     res = maybe_recheck_rooftop_cell_false_positive(provider, clients, res, views)
+    res = gate_weak_rooftop_cell_claim(res)
+    res = gate_weak_stealth_tower_claim(res)
     _step_done("classify (Nearmap obliques)", _brief_pass_result(res))
     return res, nearmap_views, nearmap_date, "full", views
 
@@ -3103,6 +3531,10 @@ def main():
     elif allow_claude_escalation:
         _out(f"BIFURCATED_AI=1 — Gemini first ({GEMINI_MODEL}), "
               f"Claude escalation ({CLAUDE_ESCALATION_MODEL})")
+        _out(
+            f"  Gemini thinking_budget={_gemini_thinking_budget()} · "
+            f"solo dual-skip conf>={GEMINI_SOLO_CELL_CONF:g}"
+        )
     elif primary_provider == "claude":
         _out(f"Claude only ({MODELS[0]})")
     if NEARMAP_TIERED and not NAIP_ONLY:
@@ -3370,13 +3802,18 @@ def main():
             fp_provider = (
                 "claude" if escalation_model else primary_provider
             )
+            res = gate_weak_rooftop_cell_claim(res)
             res = maybe_recheck_rooftop_cell_false_positive(
                 fp_provider, clients, res, views
             )
+            res = gate_weak_rooftop_cell_claim(res)
+            res = gate_weak_stealth_tower_claim(res)
             res = maybe_repair_rooftop_asset_box(fp_provider, clients, res, views)
+            res = gate_weak_rooftop_cell_claim(res)
+            res = gate_weak_stealth_tower_claim(res)
             res = maybe_recheck_rooftop_cell_crop(fp_provider, clients, res, views)
             res = enforce_rooftop_cell_requires_box(res, views)
-            confirm_views, _used_crop = build_cell_confirm_views(res, views)
+            confirm_views, used_crop = build_cell_confirm_views(res, views)
             res, dual_model, cell_agree = confirm_rooftop_cell_with_claude(
                 res,
                 clients,
@@ -3386,6 +3823,7 @@ def main():
                 from_wide_rescue=classification_stage
                 in {"wide_aoi", "zoom", "pin_recenter_rejected"}
                 or nearmap_tier in {"naip_wide", "wide_aoi"},
+                used_crop=used_crop,
             )
             if dual_model and not escalation_model:
                 escalation_model = dual_model
@@ -3397,14 +3835,22 @@ def main():
                 res = enforce_rooftop_cell_requires_box(res, views)
             res = align_site_evidence_with_cell(res)
 
-            # Convert the detection box to real-world coordinates - only valid
-            # when the box was drawn on the georeferenced NAIP chip
+            # Convert the detection box to real-world coordinates when possible
+            # (NAIP geo, Nearmap Vert, or Nearmap oblique AOI approximation).
             asset_lat = asset_lon = asset_offset_m = None
+            asset_coord_source = None
             box, box_view = res.get("asset_box_2d"), res.get("asset_view")
-            if box and _is_naip_view(box_view) and naip_geo:
-                located = box_to_latlon(naip_geo, box)
+            if box:
+                located = locate_asset_box_latlon(
+                    lat=lat,
+                    lon=lon,
+                    box=box,
+                    box_view=box_view,
+                    naip_geo=naip_geo,
+                    nearmap_aoi_m=nearmap_aoi_m,
+                )
                 if located:
-                    asset_lat, asset_lon, asset_offset_m = located
+                    asset_lat, asset_lon, asset_offset_m, asset_coord_source = located
 
             record.update({
                 "image_date": img_date,
@@ -3426,6 +3872,7 @@ def main():
                 "asset_lon": asset_lon,
                 "asset_offset_m": (round(asset_offset_m, 1)
                                    if asset_offset_m is not None else None),
+                "asset_coord_source": asset_coord_source,
                 "asset_box_2d": json.dumps(box) if box else None,
                 "asset_view": box_view,
                 "cell_equipment": res.get("cell_equipment"),
