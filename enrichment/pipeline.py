@@ -72,6 +72,7 @@ def run_enrichment(
     site_ids: list[str] | None = None,
     carrier_like: str | None = "NFL",
     states: list[str] | None = None,
+    llm_classified: bool = True,
     verbose: bool = True,
 ) -> dict[str, Any]:
     """Run proximity + NAIP enrichment and write candidate/holdout CSVs."""
@@ -111,10 +112,14 @@ def run_enrichment(
                     progress.stage(
                         "2/4 QUERY SALESFORCE",
                         f"blank Site_Type | carrier_like={carrier_like!r} | "
+                        f"llm_classified={str(llm_classified).lower()} | "
                         f"states={state_label}",
                     )
                 sites = query_blank_site_type_sites(
-                    sf_client, carrier_like=carrier_like, states=states
+                    sf_client,
+                    carrier_like=carrier_like,
+                    states=states,
+                    llm_classified=llm_classified,
                 )
             if verbose:
                 progress.result(f"{len(sites)} site(s)")

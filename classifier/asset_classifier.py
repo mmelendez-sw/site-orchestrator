@@ -115,6 +115,11 @@ GEMINI_SOFT_KEEP_CELL_CONF = float(os.environ.get("GEMINI_SOFT_KEEP_CELL_CONF", 
 # Skip Claude (escalation + tower dual-model) when Gemini site_confidence is
 # at/above this. Rooftop HVAC FPs still go through Claude dual-confirm.
 GEMINI_SOLO_CELL_CONF = float(os.environ.get("GEMINI_SOLO_CELL_CONF", "0.90"))
+# Do not burn Claude on weak Gemini — below this site_confidence, skip
+# full-scene escalation and dual-model Claude. Weak calls stay holdout.
+CLAUDE_ESCALATE_MIN_SITE_CONF = float(
+    os.environ.get("CLAUDE_ESCALATE_MIN_SITE_CONF", "0.70")
+)
 # Min IoU between Gemini and Claude boxes on localize dual-confirm.
 GEMINI_CLAUDE_BOX_IOU = float(os.environ.get("GEMINI_CLAUDE_BOX_IOU", "0.20"))
 OBLIQUE_VIEWS = ["North", "East", "South", "West"]
@@ -1566,6 +1571,16 @@ def confirm_rooftop_cell_with_claude(
         )
         return res, "gemini_strong_solo", True
 
+    site_conf = normalize_confidence(res.get("site_confidence"))
+    if site_conf is None or site_conf < CLAUDE_ESCALATE_MIN_SITE_CONF:
+        res["claude_cell_equipment"] = None
+        res["cell_models_agree"] = False
+        _step_done(
+            "dual-model cell",
+            f"skipped Claude (Gemini site conf<{CLAUDE_ESCALATE_MIN_SITE_CONF:g})",
+        )
+        return res, None, False
+
     if allow_gemini_solo and should_trust_gemini_cell_solo(
         res, from_wide_rescue=from_wide_rescue
     ):
@@ -2673,6 +2688,9 @@ def naip_age_blocks_early_stop(
 
 def escalation_reason(res: dict) -> str | None:
     """Why a Gemini result should escalate to Claude; None if no escalation."""
+    conf = normalize_confidence(res.get("site_confidence"))
+    if conf is None or conf < CLAUDE_ESCALATE_MIN_SITE_CONF:
+        return None
     # Rooftops: burn Claude when cellular gear is not yet confirmed at bar.
     if _is_rooftop(res):
         if res.get("cell_equipment") is not True:

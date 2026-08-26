@@ -943,6 +943,15 @@ class SoqlTests(unittest.TestCase):
         self.assertIn("LLM_Classified__c = true", soql)
         self.assertIn("(LLM_Holdout__c = false OR LLM_Holdout__c = null)", soql)
 
+    def test_blank_site_type_query_can_select_unclassified(self):
+        soql = build_blank_site_type_query(
+            carrier_like="PermittingSites",
+            llm_classified=False,
+        )
+        self.assertIn("LLM_Classified__c = false", soql)
+        self.assertNotIn("LLM_Classified__c = true", soql)
+        self.assertIn("Carrier_Leasing_Source__c LIKE '%PermittingSites%'", soql)
+
     def test_blank_site_type_query_can_omit_carrier(self):
         soql = build_blank_site_type_query(carrier_like=None)
         self.assertNotIn("Carrier_Leasing_Source__c LIKE", soql)

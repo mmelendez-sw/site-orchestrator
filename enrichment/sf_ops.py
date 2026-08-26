@@ -52,17 +52,21 @@ def build_blank_site_type_query(
     fields: Sequence[str] = SF_QUERY_FIELDS,
     carrier_like: str | None = "NFL",
     states: Sequence[str] | None = None,
+    llm_classified: bool = True,
 ) -> str:
     """SOQL for blank Site_Type__c sites in the enrichment queue.
 
     `carrier_like` filters Carrier_Leasing_Source__c with LIKE '%value%'.
     Pass None/"" to skip the carrier filter (e.g. non-NFL test batches).
     `states` filters Site_State__c IN (...); pass None/empty for all states.
+    `llm_classified` defaults True (the NFL enrichment queue). False selects
+    sites that have not been LLM-classified yet.
     """
     field_list = ", ".join(fields)
+    classified_sql = "true" if llm_classified else "false"
     clauses = [
         "(Site_Type__c = null OR Site_Type__c = '')",
-        "LLM_Classified__c = true",
+        f"LLM_Classified__c = {classified_sql}",
         "(LLM_Holdout__c = false OR LLM_Holdout__c = null)",
         "Site_Latitude__c != null AND Site_Latitude__c != ''",
         "Site_Longitude__c != null AND Site_Longitude__c != ''",
@@ -119,12 +123,14 @@ def query_blank_site_type_sites(
     owners: Sequence[str] = DEFAULT_OWNER_FILTER,
     carrier_like: str | None = "NFL",
     states: Sequence[str] | None = None,
+    llm_classified: bool = True,
 ) -> list[dict[str, Any]]:
     soql = build_blank_site_type_query(
         stages=stages,
         owners=owners,
         carrier_like=carrier_like,
         states=states,
+        llm_classified=llm_classified,
     )
     logger.info("Salesforce SOQL: %s", soql)
     return query_all(client, soql)

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -104,6 +105,20 @@ def build_parser() -> argparse.ArgumentParser:
             "Carrier_Leasing_Source__c LIKE filter (default: NFL). "
             "Pass empty string to disable carrier filter."
         ),
+    )
+    parser.add_argument(
+        "--llm-classified",
+        choices=("true", "false"),
+        default="true",
+        help=(
+            "LLM_Classified__c filter for the blank-Site_Type queue "
+            "(default: true). Use false for not-yet-classified batches."
+        ),
+    )
+    parser.add_argument(
+        "--naip-only",
+        action="store_true",
+        help="Skip all Nearmap fetches (NAIP + Gemini/Claude only).",
     )
     parser.add_argument(
         "--states",
@@ -196,6 +211,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     _quiet_third_party_loggers()
 
+    if args.naip_only:
+        os.environ["NAIP_ONLY"] = "1"
+
     run_dir = args.run_dir or default_run_dir(ROOT / "runs")
 
     if args.rebuild_review:
@@ -272,6 +290,7 @@ def main(argv: list[str] | None = None) -> int:
         site_ids=site_ids,
         carrier_like=carrier_like,
         states=states,
+        llm_classified=args.llm_classified == "true",
         verbose=args.verbose,
     )
     print(summary)

@@ -348,19 +348,15 @@ def verified_source_for_match(
 
 def _used_nearmap_imagery(classified: dict[str, Any]) -> bool:
     """True when classification consumed Nearmap (vert and/or obliques)."""
-    tier = str(classified.get("nearmap_tier") or "").strip().lower()
-    if tier in {"vert_only", "full", "wide_aoi", "zoom"}:
-        return True
-    views = str(classified.get("nearmap_views") or "").strip()
-    if not views:
-        return False
-    if tier in {"naip_only", "naip_wide"}:
-        return False
-    return True
+    return imagery_bucket(classified) in {"nearmap_vert", "nearmap_oblique"}
 
 
 def imagery_bucket(classified_or_row: dict[str, Any]) -> str:
-    """Coarse imagery label for run summaries: naip | nearmap_vert | nearmap_oblique."""
+    """Coarse imagery label for run summaries: naip | nearmap_vert | nearmap_oblique.
+
+    ``zoom`` / ``wide_aoi`` are pipeline stages, not proof of Nearmap. NAIP-only
+    zoom scout must stay ``naip`` or rooftops look like they had obliques.
+    """
     tier = str(
         classified_or_row.get("nearmap_tier")
         or classified_or_row.get("classification_stage")
@@ -368,8 +364,8 @@ def imagery_bucket(classified_or_row: dict[str, Any]) -> str:
     ).strip().lower()
     views = str(classified_or_row.get("nearmap_views") or "")
     view_parts = {p.strip() for p in views.split(",") if p.strip()}
-    has_oblique = bool(view_parts - {"Vert"}) or tier == "full"
-    if tier in {"full", "wide_aoi", "zoom"} or has_oblique:
+    has_oblique = bool(view_parts - {"Vert"})
+    if has_oblique or tier == "full":
         return "nearmap_oblique"
     if tier in {"vert_only"} or "Vert" in view_parts:
         return "nearmap_vert"

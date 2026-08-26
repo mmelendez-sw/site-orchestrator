@@ -206,12 +206,32 @@ class EscalationReasonTests(unittest.TestCase):
             )
         )
 
-    def test_other_below_high_conf_still_escalates(self):
-        self.assertEqual(
+    def test_other_below_0_7_skips_claude(self):
+        self.assertIsNone(
             escalation_reason(
                 {
                     "site_type": "other",
                     "site_confidence": 0.5,
+                    "cell_equipment": None,
+                }
+            )
+        )
+        self.assertIsNone(
+            escalation_reason(
+                {
+                    "site_type": "other",
+                    "site_confidence": 0.69,
+                    "cell_equipment": None,
+                }
+            )
+        )
+
+    def test_other_at_0_7_still_escalates(self):
+        self.assertEqual(
+            escalation_reason(
+                {
+                    "site_type": "other",
+                    "site_confidence": 0.7,
                     "cell_equipment": None,
                 }
             ),
@@ -228,6 +248,17 @@ class EscalationReasonTests(unittest.TestCase):
                 }
             ),
             "unclear_type",
+        )
+
+    def test_rooftop_cell_unconfirmed_below_0_7_skips_claude(self):
+        self.assertIsNone(
+            escalation_reason(
+                {
+                    "site_type": "rooftop",
+                    "site_confidence": 0.65,
+                    "cell_equipment": False,
+                }
+            )
         )
 
     def test_rooftop_cell_unconfirmed_at_high_conf_still_escalates(self):
