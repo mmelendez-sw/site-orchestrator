@@ -664,6 +664,83 @@ class ReviewSectionTests(unittest.TestCase):
         )
         self.assertEqual(decision["holdout_reason"], "tower_naip_only_forbidden")
 
+    def test_db_tower_naip_gemini_solo_is_ready(self):
+        """DB-hit Gemini >= 0.9 may write from NAIP without Nearmap."""
+        from enrichment.tests.golden_cases import _tower
+
+        decision = bucket_classification(
+            match_source=MATCH_SOURCE_FCC,
+            classified=_tower(
+                dual_model_resolution="gemini_strong_solo",
+                escalation_model="gemini_strong_solo",
+                nearmap_tier="naip_only",
+                nearmap_views="",
+                asset_view="NAIP top-down",
+            ),
+            db_lat=36.0256,
+            db_lng=-115.0853,
+            sf_lat=36.0255,
+            sf_lng=-115.0852,
+        )
+        self.assertEqual(decision["bucket"], BUCKET_POTENTIAL_UPDATE)
+
+    def test_db_tower_naip_without_gemini_lock_still_forbidden(self):
+        from enrichment.tests.golden_cases import _tower
+
+        decision = bucket_classification(
+            match_source=MATCH_SOURCE_FCC,
+            classified=_tower(
+                dual_model_resolution="agree_crop",
+                escalation_model="claude",
+                nearmap_tier="naip_only",
+                nearmap_views="",
+            ),
+            db_lat=36.0256,
+            db_lng=-115.0853,
+            sf_lat=36.0255,
+            sf_lng=-115.0852,
+        )
+        self.assertEqual(decision["holdout_reason"], "tower_naip_only_forbidden")
+
+    def test_db_tower_vert_gemini_solo_is_ready(self):
+        """DB-hit Gemini >= 0.9 may write from Vert without obliques."""
+        from enrichment.tests.golden_cases import _tower
+
+        decision = bucket_classification(
+            match_source=MATCH_SOURCE_FCC,
+            classified=_tower(
+                dual_model_resolution="gemini_strong_solo",
+                escalation_model="gemini_strong_solo",
+                nearmap_tier="vert_only",
+                nearmap_views="Vert",
+                asset_view="Nearmap top-down",
+            ),
+            db_lat=36.0256,
+            db_lng=-115.0853,
+            sf_lat=36.0255,
+            sf_lng=-115.0852,
+        )
+        self.assertEqual(decision["bucket"], BUCKET_POTENTIAL_UPDATE)
+
+    def test_imagery_only_tower_vert_gemini_solo_still_needs_obliques(self):
+        from enrichment.tests.golden_cases import _tower
+
+        decision = bucket_classification(
+            match_source=MATCH_SOURCE_NONE,
+            classified=_tower(
+                dual_model_resolution="gemini_strong_solo",
+                escalation_model="gemini_strong_solo",
+                nearmap_tier="vert_only",
+                nearmap_views="Vert",
+                asset_view="Nearmap top-down",
+            ),
+            db_lat=None,
+            db_lng=None,
+            sf_lat=36.0255,
+            sf_lng=-115.0852,
+        )
+        self.assertEqual(decision["holdout_reason"], "tower_needs_nearmap_obliques")
+
     def test_imagery_only_tower_vert_only_held_out(self):
         """Green Valley-style: Vert-only tower must not be Ready."""
         decision = bucket_classification(
@@ -707,6 +784,50 @@ class ReviewSectionTests(unittest.TestCase):
             },
             db_lat=None,
             db_lng=None,
+            sf_lat=36.0255,
+            sf_lng=-115.0852,
+        )
+        self.assertEqual(decision["holdout_reason"], "tower_needs_dual_model_cell")
+
+    def test_tower_gemini_high_conf_solo_is_ready(self):
+        """Gemini tower at >= 0.9 skips Claude and can write (DB or imagery)."""
+        from enrichment.tests.golden_cases import _tower
+
+        classified = _tower(
+            dual_model_resolution="gemini_strong_solo",
+            escalation_model="gemini_strong_solo",
+        )
+        db = bucket_classification(
+            match_source=MATCH_SOURCE_FCC,
+            classified=classified,
+            db_lat=36.0256,
+            db_lng=-115.0853,
+            sf_lat=36.0255,
+            sf_lng=-115.0852,
+        )
+        self.assertEqual(db["bucket"], BUCKET_POTENTIAL_UPDATE)
+        imagery = bucket_classification(
+            match_source=MATCH_SOURCE_NONE,
+            classified=classified,
+            db_lat=None,
+            db_lng=None,
+            sf_lat=36.0255,
+            sf_lng=-115.0852,
+        )
+        self.assertEqual(imagery["bucket"], BUCKET_POTENTIAL_UPDATE)
+
+    def test_tower_gemini_solo_below_high_conf_held_out(self):
+        from enrichment.tests.golden_cases import _tower
+
+        decision = bucket_classification(
+            match_source=MATCH_SOURCE_FCC,
+            classified=_tower(
+                site_confidence=0.85,
+                dual_model_resolution="gemini_strong_solo",
+                escalation_model="gemini_strong_solo",
+            ),
+            db_lat=36.0256,
+            db_lng=-115.0853,
             sf_lat=36.0255,
             sf_lng=-115.0852,
         )

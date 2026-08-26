@@ -70,11 +70,15 @@ def classify_site_imagery(
     pin_lon: float | None = None,
     pin_address_offset_m: float | None = None,
     pin_address_mismatch: bool = False,
+    db_backed: bool = False,
 ) -> dict[str, Any]:
     """Classify one coordinate with the full Nearmap + bifurcated AI stack.
 
     Same strategy as `classifier.asset_classifier` main loop for a single pin:
     NAIP → (optional) Nearmap vert/obliques → wide AOI / zoom → Claude escalate.
+
+    ``db_backed``: FCC/TowerSource already matched. High-conf Gemini towers
+    then skip Vert/obliques. Imagery-only tower+cell still fetches obliques.
 
     When pin_address_mismatch is set, also save a pin-centered Nearmap Vert chip
     (`{id}_pin_nearmap_vert.jpg`) so review can compare address vs SF pin.
@@ -228,6 +232,7 @@ def classify_site_imagery(
             input_conf,
             build_views,
             naip_age_years=(naip_meta or {}).get("image_age_years"),
+            db_backed=db_backed,
         )
         primary_model = primary_provider
     else:
@@ -565,10 +570,15 @@ def classify_site_imagery(
         from_wide_rescue=from_wide_rescue,
         used_crop=used_crop,
         allow_gemini_solo=False,
+        all_views=views,
     )
     if dual_model and not escalation_model:
         escalation_model = dual_model
-        escalation_reason_str = escalation_reason_str or "rooftop_dual_model_cell"
+        escalation_reason_str = escalation_reason_str or (
+            "gemini_high_conf_tower"
+            if dual_model == "gemini_strong_solo"
+            else "rooftop_dual_model_cell"
+        )
     res["cell_models_agree"] = cell_agree
     # Soft-keep / agree must still have a box for candidacy confidence.
     if res.get("cell_equipment") is True:

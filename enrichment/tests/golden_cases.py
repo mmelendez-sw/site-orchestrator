@@ -95,6 +95,23 @@ GOLDEN_CASES: list[GoldenCase] = [
         {"holdout_reason": "tower_needs_nearmap_obliques"},
     ),
     (
+        "db_tower_naip_gemini_solo_ready",
+        MATCH_SOURCE_FCC,
+        _tower(
+            dual_model_resolution="gemini_strong_solo",
+            escalation_model="gemini_strong_solo",
+            nearmap_tier="naip_only",
+            nearmap_views="",
+            asset_view="NAIP top-down",
+            cell_equipment_evidence="NAIP shows lattice tower with triangular platform",
+        ),
+        36.0256,
+        -115.0853,
+        36.0255,
+        -115.0852,
+        {"bucket": BUCKET_POTENTIAL_UPDATE, "coord_prefix": "db:"},
+    ),
+    (
         "sunset_stealth_fp_cleared_to_other_or_dual",
         MATCH_SOURCE_NONE,
         _tower(
@@ -152,6 +169,19 @@ GOLDEN_CASES: list[GoldenCase] = [
         -89.01,
         43.0,
         -89.0,
+        {"bucket": BUCKET_POTENTIAL_UPDATE, "coord_prefix": "db:"},
+    ),
+    (
+        "db_tower_gemini_high_conf_solo_ready",
+        MATCH_SOURCE_FCC,
+        _tower(
+            dual_model_resolution="gemini_strong_solo",
+            escalation_model="gemini_strong_solo",
+        ),
+        36.0256,
+        -115.0853,
+        36.0255,
+        -115.0852,
         {"bucket": BUCKET_POTENTIAL_UPDATE, "coord_prefix": "db:"},
     ),
     (

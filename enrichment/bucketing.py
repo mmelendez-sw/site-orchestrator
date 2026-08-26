@@ -19,6 +19,7 @@ from enrichment.constants import (
     MATCH_SOURCE_NONE,
     MATCH_SOURCE_TOWERSOURCE,
     MAX_ASSET_OFFSET_M,
+    GEMINI_TOWER_SKIP_CLAUDE_CONF,
     MIN_IMAGERY_ONLY_CELL_CONFIDENCE,
     MIN_IMAGERY_ONLY_SITE_CONFIDENCE,
     MIN_ROOFTOP_CELL_CONFIDENCE,
@@ -192,12 +193,31 @@ def _dual_model_cell_ok(classified: dict[str, Any]) -> bool:
     return cell_equipment_confirmed(classified.get("cell_equipment"))
 
 
+def _tower_gemini_high_conf_ok(classified: dict[str, Any]) -> bool:
+    """Gemini already locked a tower at >= 0.9 — Claude dual-model not required.
+
+    Rooftop HVAC FPs still need Claude hard-agree. Imagery-only still needs
+    Nearmap obliques + an asset box (checked before this helper is used).
+    DB-hit towers may write from NAIP or Vert when this lock applies.
+    """
+    if str(classified.get("site_type") or "").strip().lower() != "tower":
+        return False
+    if not cell_equipment_confirmed(classified.get("cell_equipment")):
+        return False
+    if not _confidence_ok(
+        classified.get("site_confidence"), GEMINI_TOWER_SKIP_CLAUDE_CONF
+    ):
+        return False
+    resolution = str(classified.get("dual_model_resolution") or "").strip().lower()
+    return resolution == "gemini_strong_solo"
+
+
 def _dual_model_hard_agree(classified: dict[str, Any]) -> bool:
     """True only for real Gemini+Claude agree on cell gear.
 
-    Soft-keep and Gemini-solo must not unlock Salesforce writes — those are the
-    HVAC / wrong-neighbor FP paths. Auto-apply requires an explicit Claude
-    confirm resolution (agree / agree_crop / agree_localize).
+    Soft-keep and rooftop Gemini-solo must not unlock Salesforce writes — those
+    are the HVAC / wrong-neighbor FP paths. Towers at Gemini site_confidence
+    >= 0.9 may write via ``_tower_gemini_high_conf_ok`` instead.
     """
     if not cell_equipment_confirmed(classified.get("cell_equipment")):
         return False
@@ -371,10 +391,14 @@ def bucket_classification(
     - cell_equipment must be confirmed true (towers and rooftops)
     - rooftops need Nearmap obliques, dual-model cell agreement, asset box,
       telecom evidence / cell_gear_kind, and cell conf ≥ bar
+    - towers need Claude hard-agree, or Gemini site_confidence >= 0.9
+      (``gemini_strong_solo``); rooftop Gemini-solo never writes
     - DB hits may use bare Claude ``agree``; imagery-only requires
-      ``agree_crop`` or ``agree_localize`` (boxed-region proof)
+      ``agree_crop`` or ``agree_localize`` unless the Gemini tower lock applies
     - imagery-only (no DB hit) uses stricter site/cell confidence bars
-    - NAIP-only imagery never writes rooftop or tower Site Type
+    - NAIP-only imagery never writes rooftops; imagery-only towers also
+      never write from NAIP. DB-hit Gemini towers at >= 0.9 may write
+      from NAIP or Vert (obliques skipped)
     - rooftops never verify as NAIP
     - update coords prefer FCC/TowerSource when present
     """
@@ -406,11 +430,13 @@ def bucket_classification(
             return _holdout(BUCKET_ROOFTOP, reason, classified)
         return _holdout(BUCKET_OTHER, reason, classified)
 
-    # Never write Site Type from NAIP-only chips (too many HVAC/utility FPs).
+    # NAIP-only: rooftops never write. Imagery-only towers never write.
+    # DB-hit Gemini towers at >= 0.9 may write (FCC/TS already anchors).
     if img_bucket == "naip":
         if site_type_raw == "rooftop":
             return _holdout(BUCKET_ROOFTOP, "rooftop_naip_only_forbidden", classified)
-        return _holdout(BUCKET_OTHER, "tower_naip_only_forbidden", classified)
+        if imagery_only or not _tower_gemini_high_conf_ok(classified):
+            return _holdout(BUCKET_OTHER, "tower_naip_only_forbidden", classified)
 
     if site_type_raw == "tower" and not cell_equipment_confirmed(
         classified.get("cell_equipment")
@@ -425,13 +451,22 @@ def bucket_classification(
         if not _has_asset_box(classified):
             return _holdout(BUCKET_OTHER, "tower_needs_asset_box", classified)
 
-    # Auto-apply airtight: every tower write needs Claude hard-agree (not solo/soft-keep).
-    if site_type_raw == "tower" and not _dual_model_hard_agree(classified):
+    # Auto-apply: Claude hard-agree, or Gemini already locked the tower at >= 0.9.
+    tower_gemini_locked = _tower_gemini_high_conf_ok(classified)
+    if (
+        site_type_raw == "tower"
+        and not tower_gemini_locked
+        and not _dual_model_hard_agree(classified)
+    ):
         return _holdout(BUCKET_OTHER, "tower_needs_dual_model_cell", classified)
 
-    # Imagery-only is the exception path: require boxed crop/localize confirm.
-    if site_type_raw == "tower" and imagery_only and not _dual_model_localized_agree(
-        classified
+    # Imagery-only is the exception path: require boxed crop/localize confirm
+    # unless Gemini already locked the tower at >= 0.9.
+    if (
+        site_type_raw == "tower"
+        and imagery_only
+        and not tower_gemini_locked
+        and not _dual_model_localized_agree(classified)
     ):
         return _holdout(
             BUCKET_OTHER,

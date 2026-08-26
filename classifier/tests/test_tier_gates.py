@@ -4,10 +4,15 @@ from __future__ import annotations
 
 import unittest
 
+from unittest.mock import patch
+
 from classifier.asset_classifier import (
+    confirm_rooftop_cell_with_claude,
     escalation_reason,
     rooftop_requires_nearmap_tiers,
+    should_skip_claude_for_gemini_tower,
     tier_confident_stop,
+    tower_cell_requires_nearmap_obliques,
 )
 
 
@@ -87,6 +92,48 @@ class TierConfidentStopTests(unittest.TestCase):
         )
 
 
+class TowerObliqueFetchTests(unittest.TestCase):
+    _locked = {
+        "site_type": "tower",
+        "site_confidence": 0.9,
+        "cell_equipment": True,
+    }
+
+    def test_imagery_only_tower_cell_requires_obliques(self):
+        self.assertTrue(
+            tower_cell_requires_nearmap_obliques(self._locked, db_backed=False)
+        )
+
+    def test_db_hit_gemini_lock_skips_obliques(self):
+        self.assertFalse(
+            tower_cell_requires_nearmap_obliques(self._locked, db_backed=True)
+        )
+
+    def test_db_hit_below_lock_still_requires_obliques(self):
+        self.assertTrue(
+            tower_cell_requires_nearmap_obliques(
+                {
+                    "site_type": "tower",
+                    "site_confidence": 0.85,
+                    "cell_equipment": True,
+                },
+                db_backed=True,
+            )
+        )
+
+    def test_tower_cell_false_does_not_require_obliques(self):
+        self.assertFalse(
+            tower_cell_requires_nearmap_obliques(
+                {
+                    "site_type": "tower",
+                    "site_confidence": 0.9,
+                    "cell_equipment": False,
+                },
+                db_backed=False,
+            )
+        )
+
+
 class EscalationReasonTests(unittest.TestCase):
     def test_tower_cell_false_skips_claude(self):
         self.assertIsNone(
@@ -147,6 +194,183 @@ class EscalationReasonTests(unittest.TestCase):
                 }
             )
         )
+
+    def test_other_at_high_gemini_conf_skips_claude(self):
+        self.assertIsNone(
+            escalation_reason(
+                {
+                    "site_type": "other",
+                    "site_confidence": 0.9,
+                    "cell_equipment": None,
+                }
+            )
+        )
+
+    def test_other_below_high_conf_still_escalates(self):
+        self.assertEqual(
+            escalation_reason(
+                {
+                    "site_type": "other",
+                    "site_confidence": 0.5,
+                    "cell_equipment": None,
+                }
+            ),
+            "other_type",
+        )
+
+    def test_unclear_at_high_conf_still_escalates(self):
+        self.assertEqual(
+            escalation_reason(
+                {
+                    "site_type": "unclear",
+                    "site_confidence": 0.95,
+                    "cell_equipment": None,
+                }
+            ),
+            "unclear_type",
+        )
+
+    def test_rooftop_cell_unconfirmed_at_high_conf_still_escalates(self):
+        self.assertEqual(
+            escalation_reason(
+                {
+                    "site_type": "rooftop",
+                    "site_confidence": 0.95,
+                    "cell_equipment": False,
+                }
+            ),
+            "rooftop_cell_unconfirmed",
+        )
+
+
+class GeminiTowerSkipClaudeTests(unittest.TestCase):
+    def test_skip_when_tower_site_conf_at_least_0_9(self):
+        self.assertTrue(
+            should_skip_claude_for_gemini_tower(
+                {
+                    "site_type": "tower",
+                    "site_confidence": 0.9,
+                    "cell_equipment": True,
+                }
+            )
+        )
+
+    def test_do_not_skip_below_0_9(self):
+        self.assertFalse(
+            should_skip_claude_for_gemini_tower(
+                {
+                    "site_type": "tower",
+                    "site_confidence": 0.89,
+                    "cell_equipment": True,
+                }
+            )
+        )
+
+    def test_do_not_skip_rooftop(self):
+        self.assertFalse(
+            should_skip_claude_for_gemini_tower(
+                {
+                    "site_type": "rooftop",
+                    "site_confidence": 0.99,
+                    "cell_equipment": True,
+                }
+            )
+        )
+
+    def test_do_not_skip_wide_rescue(self):
+        self.assertFalse(
+            should_skip_claude_for_gemini_tower(
+                {
+                    "site_type": "tower",
+                    "site_confidence": 1.0,
+                    "cell_equipment": True,
+                },
+                from_wide_rescue=True,
+            )
+        )
+
+    def test_dual_model_skips_claude_for_high_conf_tower(self):
+        res = {
+            "site_type": "tower",
+            "site_confidence": 1.0,
+            "cell_equipment": True,
+            "cell_equipment_confidence": 0.82,
+            "cell_equipment_evidence": "lattice tower with sector panels",
+            "cell_gear_kind": "sector_panel",
+            "asset_box_2d": [220, 310, 360, 420],
+            "asset_view": "Nearmap oblique (East)",
+        }
+        with patch(
+            "classifier.asset_classifier.classify_site"
+        ) as mock_classify:
+            out, model, agree = confirm_rooftop_cell_with_claude(
+                res,
+                {"claude": object()},
+                [],
+                already_escalated=False,
+                allow_soft_keep=False,
+                allow_gemini_solo=False,
+                used_crop=False,
+            )
+        mock_classify.assert_not_called()
+        self.assertTrue(agree)
+        self.assertEqual(model, "gemini_strong_solo")
+        self.assertEqual(out["dual_model_resolution"], "gemini_strong_solo")
+
+    def test_rooftop_crop_no_falls_back_to_localize(self):
+        from PIL import Image
+
+        img = Image.new("RGB", (64, 64), "gray")
+        full_views = [("Nearmap oblique (North)", img)]
+        crop_views = [("cell crop (Nearmap oblique (North))", img), full_views[0]]
+        res = {
+            "site_type": "rooftop",
+            "site_confidence": 0.9,
+            "cell_equipment": True,
+            "cell_equipment_confidence": 0.88,
+            "cell_equipment_evidence": "North oblique shows sector panels",
+            "cell_gear_kind": "sector_panel",
+            "asset_box_2d": [220, 310, 360, 420],
+            "asset_view": "Nearmap oblique (North)",
+        }
+
+        def _fake_classify(_provider, _clients, views, prompt=None, **_kwargs):
+            labels = [str(v[0]) for v in views]
+            if any("cell crop" in lab for lab in labels):
+                return {
+                    "site_type": "rooftop",
+                    "cell_equipment": False,
+                    "cell_equipment_evidence": "crop too tight, only roof membrane",
+                    "cell_gear_kind": "none",
+                }
+            return {
+                "site_type": "rooftop",
+                "cell_equipment": True,
+                "cell_equipment_confidence": 0.9,
+                "cell_equipment_evidence": "sector panels on north facade",
+                "cell_gear_kind": "sector_panel",
+                "asset_box_2d": [200, 300, 340, 400],
+                "asset_view": "Nearmap oblique (North)",
+            }
+
+        with patch(
+            "classifier.asset_classifier.classify_site",
+            side_effect=_fake_classify,
+        ):
+            out, model, agree = confirm_rooftop_cell_with_claude(
+                res,
+                {"claude": object()},
+                crop_views,
+                already_escalated=False,
+                allow_soft_keep=False,
+                allow_gemini_solo=False,
+                used_crop=True,
+                all_views=full_views,
+            )
+        self.assertTrue(agree)
+        self.assertEqual(model, "claude")
+        self.assertEqual(out["dual_model_resolution"], "agree_localize")
+        self.assertTrue(out["cell_equipment"])
 
 
 if __name__ == "__main__":

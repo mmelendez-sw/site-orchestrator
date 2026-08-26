@@ -482,6 +482,7 @@ def _process_site(
             else None
         ),
         "pin_address_mismatch": bool(base["pin_address_mismatch"]),
+        "db_backed": hit is not None,
     }
     try:
         classified = classify_fn(**classify_kwargs)
@@ -494,6 +495,7 @@ def _process_site(
                 lon=float(classify_lng),
                 chip_dir=chip_dir,
                 verbose=verbose,
+                db_backed=hit is not None,
             )
         except TypeError:
             classified = classify_fn(

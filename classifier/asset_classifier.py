@@ -112,6 +112,8 @@ CLAUDE_ESCALATION_MODEL = os.environ.get(
 GEMINI_THINKING_BUDGET_ENV = os.environ.get("GEMINI_THINKING_BUDGET", "").strip()
 # Soft-keep / solo-trust cell confidence floors.
 GEMINI_SOFT_KEEP_CELL_CONF = float(os.environ.get("GEMINI_SOFT_KEEP_CELL_CONF", "0.85"))
+# Skip Claude (escalation + tower dual-model) when Gemini site_confidence is
+# at/above this. Rooftop HVAC FPs still go through Claude dual-confirm.
 GEMINI_SOLO_CELL_CONF = float(os.environ.get("GEMINI_SOLO_CELL_CONF", "0.90"))
 # Min IoU between Gemini and Claude boxes on localize dual-confirm.
 GEMINI_CLAUDE_BOX_IOU = float(os.environ.get("GEMINI_CLAUDE_BOX_IOU", "0.20"))
@@ -179,6 +181,9 @@ ZOOM_MAX_CANDIDATES = 6    # max zoom crops sent to stage-2 classifier
 ZOOM_OUTPUT_PX = 1024      # magnified crop size in pixels
 ZOOM_MIN_FRAC = 0.10       # minimum crop side as fraction of source image
 ZOOM_PAD_FRAC = 0.15       # padding around each candidate box
+# Dual-model / cell-recheck crops need more context than zoom scout. 15% pad
+# clips panel arrays and Claude then votes false on foliage / tank rim / HVAC.
+CELL_CONFIRM_PAD_FRAC = 0.40
 # Rooftop gear boxes are intentionally tight (sector panels). Do not reuse
 # ZOOM_MIN_FRAC here — that rejects valid antenna boxes as "invalid".
 ASSET_BOX_MIN_FRAC = 0.03  # ~30/1000 normalized
@@ -467,16 +472,18 @@ present or absent — do not flip to false merely because HVAC is visible.
 """
 
 ROOFTOP_CELL_CROP_RECHECK_PROMPT = """\
-You are inspecting a MAGNIFIED crop of a rooftop/facade region previously \
-flagged as having cellular equipment.
+You are inspecting a MAGNIFIED crop PLUS the source view of a rooftop/facade \
+region previously flagged as having cellular equipment.
 
-Decide ONLY whether cellular telecom hardware is visible in this crop:
-- true: unmistakable sector panels, facade mounts, dishes, RRUs, or antenna masts
-- false: only HVAC, vents, pipes, drains, skylights, solar, or blank roof
-- null: still ambiguous at this crop resolution
+Decide whether cellular telecom hardware is visible in the crop OR the source \
+view:
+- true: sector panels, facade mounts, dishes, RRUs, or parapet masts
+- false: ONLY when the boxed region is clearly HVAC/vents/pipes/solar/skylights \
+with no telecom gear in the crop or the source view
+- null: crop is too tight, blurry, or foliage-obscured — do NOT vote false
 
-Set cell_gear_kind accordingly (sector_panel | facade_mount | microwave | rru | \
-parapet_mast | none | unclear). Prefer false over true when unsure.
+If the crop clips the array, use the source view. Prefer null over false when \
+unsure. Set cell_gear_kind accordingly.
 Return the same JSON schema.
 """
 
@@ -490,29 +497,87 @@ Return the same JSON schema.
 """
 
 ROOFTOP_CELL_CROP_CONFIRM_PROMPT = """\
-You are checking ONE magnified crop that another model already boxed as cellular \
-gear (plus the source view for context).
+You are checking a magnified crop PLUS the source view of a rooftop/facade \
+region another model boxed as cellular gear.
 
-Question: is the boxed region CLEAR cellular/telecom hardware?
-TRUE only for sector panels, facade mounts, microwave dishes, RRUs, or parapet \
-masts. FALSE for HVAC condensers/chillers, vents, pipes, skylights, solar, water \
-tanks, or generic mechanical clusters.
+TRUE when the crop OR the source view shows sector panels, facade mounts, \
+microwave dishes, RRUs, or parapet masts. FALSE only when that boxed region is \
+clearly HVAC/vents/pipes/solar/skylights with no telecom gear in either view.
 
-Do not invent a different roof location. Leave asset_box_2d null — the prior box \
-is fixed; only vote cell_equipment true/false for THIS crop. Prefer false when \
-unsure. Set cell_gear_kind accordingly and cite crop cues in cell_equipment_evidence.
+If the crop is too tight, blurry, or foliage-obscured, use the source view. \
+If still unsure, set cell_equipment null (not false) and cell_gear_kind=unclear. \
+Leave asset_box_2d null — the prior box is fixed.
 Return the same JSON schema.
 """
 
 ROOFTOP_CELL_LOCALIZE_CONFIRM_PROMPT = """\
-Independent localization pass (no trusted prior crop): does this rooftop/facade \
-show CLEAR cellular equipment?
+Independent localization pass: does this rooftop/facade show CLEAR cellular \
+equipment anywhere in the views (not only a prior crop)?
 
 If cell_equipment=true you MUST draw your own tight asset_box_2d on the Nearmap \
 oblique where the gear is clearest, and set asset_view to that exact view label. \
-Never box HVAC alone. Prefer false / null box when unsure.
+Never box HVAC alone. Do not vote false merely because a prior crop was too \
+tight — search the full obliques. Prefer null over false when unsure.
 Return the same JSON schema.
 """
+
+TOWER_CELL_CROP_CONFIRM_PROMPT = """\
+You are checking a magnified crop PLUS the source view of a suspected telecom \
+TOWER (not a rooftop HVAC cluster).
+
+Vote cell_equipment true if the crop OR the source view shows a purpose-built \
+telecom tower with cellular/microwave gear: sector panels, RRUs, microwave \
+dishes, or an antenna platform/array. Lattice/self-support, monopole, guyed, \
+stealth (monopine/palm/canister), water tower, silo, flagpole, and smokestack \
+hosts WITH antennas are towers — never treat those as HVAC.
+
+If the crop is foliage, a tank rim, the mast base, or otherwise inconclusive \
+but the source view shows the tower and its antenna array, vote true from the \
+source view. Satellite-only earth-station dishes without cellular arrays → false. \
+Leave asset_box_2d null — the prior box is fixed.
+Return the same JSON schema.
+"""
+
+TOWER_CELL_LOCALIZE_CONFIRM_PROMPT = """\
+Independent confirmation of a candidate GROUND-BASED telecom tower (not a \
+rooftop HVAC check). Search EVERY view, including edges and corners.
+
+A tower may be a monopole, lattice/self-support, guyed mast, stealth \
+monopine/palm/canister, water tower, silo, flagpole, or smokestack with \
+telecom gear.
+
+1. site_type: "tower" if a purpose-built tower/mast is visible; "rooftop" only \
+if there is no tower and a building hosts gear; "other" if neither.
+2. cell_equipment: true when cellular or microwave gear is visible on that \
+tower (sector panels, RRUs, dishes, antenna platforms/arrays, or side-arm \
+mounts consistent with cellular). Satellite-only earth-station dishes without \
+cellular arrays → false. HVAC, trees, bare tanks, and vehicles are not cell gear.
+3. If cell_equipment=true, draw a tight asset_box_2d on the clearest view \
+(prefer the antenna array; the full mast is OK) and set asset_view to that \
+view's exact label.
+
+Do NOT classify a visible lattice/monopole/guyed/water tower as rooftop or \
+other. Do NOT vote false merely because individual panels are small or the \
+top is slightly soft — platforms, arrays, and mounts count. Prefer false only \
+when no tower is present, or the structure has no telecom gear.
+Return the same JSON schema.
+"""
+
+
+def cell_confirm_prompt(site_type: str, *, used_crop: bool) -> str:
+    """Prompt for dual-model cell confirm: tower vs rooftop, crop vs localize."""
+    site = str(site_type or "").strip().lower()
+    if site == "tower":
+        return (
+            TOWER_CELL_CROP_CONFIRM_PROMPT
+            if used_crop
+            else TOWER_CELL_LOCALIZE_CONFIRM_PROMPT
+        )
+    return (
+        ROOFTOP_CELL_CROP_CONFIRM_PROMPT
+        if used_crop
+        else ROOFTOP_CELL_LOCALIZE_CONFIRM_PROMPT
+    )
 
 ROOFTOP_BOX_REPAIR_PROMPT = """\
 Prior classification suggested a rooftop cellular site but did not return a \
@@ -1148,8 +1213,11 @@ def maybe_recheck_rooftop_cell_crop(
         _step_done("cell crop recheck", "skipped (oblique box view missing)")
         return res
 
-    crop = _crop_zoom(source_img, valid)
-    crop_views = [(f"zoom crop ({source_label})", crop)]
+    crop = _crop_zoom(source_img, valid, pad_frac=CELL_CONFIRM_PAD_FRAC)
+    crop_views = [
+        (f"zoom crop ({source_label})", crop),
+        (source_label, source_img),
+    ]
     recheck = classify_site(
         provider, clients, crop_views, prompt=ROOFTOP_CELL_CROP_RECHECK_PROMPT
     )
@@ -1168,16 +1236,14 @@ def maybe_recheck_rooftop_cell_crop(
         _step_done("cell crop recheck", f"confirmed cellular on {source_label}")
         return res
 
-    res["cell_equipment"] = new_cell
-    if "cell_equipment_confidence" in recheck:
-        res["cell_equipment_confidence"] = recheck.get("cell_equipment_confidence")
-    if recheck.get("cell_equipment_evidence"):
-        res["cell_equipment_evidence"] = recheck.get("cell_equipment_evidence")
-    if recheck.get("cell_gear_kind"):
-        res["cell_gear_kind"] = recheck.get("cell_gear_kind")
-    normalize_model_result(res)
-    label = "downgraded to false" if new_cell is False else "downgraded to null"
-    _step_done("cell crop recheck", f"{label} on {source_label}")
+    # Do not hard-downgrade on a tight/inconclusive crop — dual-model localize
+    # still gets a chance. Keep Gemini cell=true + box.
+    note = str(recheck.get("cell_equipment_evidence") or "crop inconclusive")
+    res["cell_equipment_evidence"] = (
+        f"{res.get('cell_equipment_evidence') or ''} | crop recheck kept "
+        f"for dual-model ({note})"
+    ).strip(" |")
+    _step_done("cell crop recheck", "inconclusive — keep for dual-model")
     return res
 
 
@@ -1351,16 +1417,21 @@ def confirm_rooftop_cell_with_claude(
     from_wide_rescue: bool = False,
     used_crop: bool = False,
     allow_gemini_solo: bool = True,
+    all_views: list | None = None,
 ) -> tuple[dict, str | None, bool]:
     """Tiered Claude check for rooftop/tower cell=true.
 
     1) Strong Gemini (optional) → skip Claude when allow_gemini_solo.
     2) usable Gemini crop → Claude votes true/false on THAT box only.
-       Crop veto is authoritative (no soft-keep of the same HVAC box).
+       A crop no is not final for rooftops: fall back to full-scene localize
+       so a too-tight crop cannot unqualify a real array. Clear HVAC after
+       localize still vetoes.
     3) No crop → Claude localizes; cell=true requires Claude box + IoU.
 
     Enrichment auto-apply should pass allow_soft_keep=False and
-    allow_gemini_solo=False so only Claude hard-agree reaches Salesforce.
+    allow_gemini_solo=False so rooftop HVAC FPs still need Claude hard-agree.
+    Towers with Gemini site_confidence >= GEMINI_SOLO_CELL_CONF skip Claude
+    even when allow_gemini_solo is False (Gemini already locked the tower).
     """
     site = str(res.get("site_type") or "").strip().lower()
     if site not in {"rooftop", "tower"}:
@@ -1482,6 +1553,19 @@ def confirm_rooftop_cell_with_claude(
         )
         return res, "claude", agree
 
+    if should_skip_claude_for_gemini_tower(
+        res, from_wide_rescue=from_wide_rescue
+    ):
+        res["claude_cell_equipment"] = None
+        res["cell_models_agree"] = True
+        res["dual_model_resolution"] = "gemini_strong_solo"
+        normalize_model_result(res)
+        _step_done(
+            "dual-model cell",
+            f"skipped Claude (Gemini tower conf>={GEMINI_SOLO_CELL_CONF:g})",
+        )
+        return res, "gemini_strong_solo", True
+
     if allow_gemini_solo and should_trust_gemini_cell_solo(
         res, from_wide_rescue=from_wide_rescue
     ):
@@ -1501,10 +1585,10 @@ def confirm_rooftop_cell_with_claude(
         return res, None, False
 
     if used_crop:
-        prompt = ROOFTOP_CELL_CROP_CONFIRM_PROMPT
+        prompt = cell_confirm_prompt(site, used_crop=True)
         mode = "crop_check"
     else:
-        prompt = ROOFTOP_CELL_LOCALIZE_CONFIRM_PROMPT
+        prompt = cell_confirm_prompt(site, used_crop=False)
         mode = "localize_iou"
 
     claude_res = classify_site(
@@ -1519,10 +1603,49 @@ def confirm_rooftop_cell_with_claude(
     res["claude_dual_mode"] = mode
 
     if not claude_cell:
+        loc_views = all_views or []
+        if used_crop and site == "rooftop" and loc_views:
+            loc_res = classify_site(
+                "claude",
+                clients,
+                loc_views,
+                prompt=ROOFTOP_CELL_LOCALIZE_CONFIRM_PROMPT,
+                claude_model=CLAUDE_ESCALATION_MODEL,
+            )
+            loc_box = get_valid_asset_box(loc_res)
+            if loc_res.get("cell_equipment") is True and loc_box:
+                res["claude_cell_equipment"] = True
+                res["claude_dual_mode"] = "crop_then_localize"
+                if loc_res.get("cell_equipment_confidence") is not None:
+                    res["cell_equipment_confidence"] = loc_res.get(
+                        "cell_equipment_confidence"
+                    )
+                if loc_res.get("cell_equipment_evidence"):
+                    res["cell_equipment_evidence"] = (
+                        f"{gemini_evidence or ''} | crop inconclusive; "
+                        f"localize: {loc_res.get('cell_equipment_evidence')}"
+                    ).strip(" |")
+                if loc_res.get("cell_gear_kind"):
+                    res["cell_gear_kind"] = loc_res.get("cell_gear_kind")
+                res["asset_box_2d"] = loc_box
+                res["asset_view"] = loc_res.get("asset_view") or res.get("asset_view")
+                res["cell_equipment"] = True
+                res["cell_models_agree"] = True
+                res["dual_model_resolution"] = "agree_localize"
+                normalize_model_result(res)
+                _step_done(
+                    "dual-model cell",
+                    "crop no → localize agree (tight crop fallback)",
+                )
+                return res, "claude", True
+            claude_res = loc_res
+            res["claude_cell_equipment"] = loc_res.get("cell_equipment")
         return _apply_claude_veto(
             claude_res,
             reason=(
-                "crop veto (HVAC/not cell)"
+                "crop+localize veto"
+                if used_crop and site == "rooftop"
+                else "crop veto (HVAC/not cell)"
                 if used_crop
                 else "localize veto"
             ),
@@ -1562,7 +1685,7 @@ def confirm_rooftop_cell_with_claude(
             claude_res, reason="localize true without box"
         )
 
-    if gemini_box and gemini_view and claude_view:
+    if gemini_box and gemini_view and claude_view and site != "tower":
         same_view = (
             gemini_view.lower() in claude_view.lower()
             or claude_view.lower() in gemini_view.lower()
@@ -1581,8 +1704,10 @@ def confirm_rooftop_cell_with_claude(
                     claude_res, reason=f"box IoU {iou:.2f} mismatch"
                 )
 
-    # Prefer Gemini box when IoU/views align; else adopt Claude localization.
-    if not gemini_box:
+    # Towers: Gemini often boxes the full mast/compound; Claude boxes the
+    # antenna array. Prefer Claude's tighter box. Rooftops keep Gemini when
+    # IoU already aligned above; otherwise adopt Claude localization.
+    if site == "tower" or not gemini_box:
         res["asset_box_2d"] = claude_box
         res["asset_view"] = claude_view or res.get("asset_view")
     if claude_res.get("cell_equipment_confidence") is not None:
@@ -1940,6 +2065,36 @@ def should_soft_keep_gemini_cell(res: dict, *, from_wide_rescue: bool) -> bool:
     return _text_has_telecom_cue(evidence)
 
 
+def should_skip_claude_for_gemini_tower(
+    res: dict, *, from_wide_rescue: bool = False
+) -> bool:
+    """Skip Claude when Gemini already locked a tower at >= GEMINI_SOLO_CELL_CONF.
+
+    Wide-AOI / zoom rescues still go through Claude (wrong-neighbor risk).
+    Rooftops are not skipped here — HVAC FPs need the dual-model crop vote.
+    """
+    if from_wide_rescue:
+        return False
+    if str(res.get("site_type") or "").strip().lower() != "tower":
+        return False
+    if res.get("cell_equipment") is not True:
+        return False
+    conf = normalize_confidence(res.get("site_confidence"))
+    return conf is not None and conf >= GEMINI_SOLO_CELL_CONF
+
+
+def gemini_confidence_locks_claude(res: dict) -> bool:
+    """True when Gemini site_confidence is high enough to skip full-scene Claude.
+
+    ``unclear`` never locks. Rooftop cell-unconfirmed is checked first in
+    ``escalation_reason`` and still escalates.
+    """
+    if str(res.get("site_type") or "").strip().lower() == "unclear":
+        return False
+    conf = normalize_confidence(res.get("site_confidence"))
+    return conf is not None and conf >= GEMINI_SOLO_CELL_CONF
+
+
 def should_trust_gemini_cell_solo(res: dict, *, from_wide_rescue: bool = False) -> bool:
     """Skip Claude dual-confirm when Gemini already locked a strong rooftop cell.
 
@@ -1998,8 +2153,16 @@ def pick_view_for_asset_box(
 def build_cell_confirm_views(res: dict, views: list) -> tuple[list, bool]:
     """Crop the asset box for dual-model confirm when possible.
 
+    Towers skip crop: Gemini's mast/compound box often misses the antenna
+    array (or lands on foliage / a tank rim), and the rooftop HVAC crop
+    prompt then false-vetoes a tower that is obvious in the full Nearmap
+    stack. Rooftops still crop so Claude votes on the boxed HVAC-vs-panel
+    region.
+
     Returns (views_for_confirm, used_crop).
     """
+    if str(res.get("site_type") or "").strip().lower() == "tower":
+        return views, False
     valid = get_valid_asset_box(res)
     picked = pick_view_for_asset_box(res, views)
     if not valid or picked is None:
@@ -2011,7 +2174,7 @@ def build_cell_confirm_views(res: dict, views: list) -> tuple[list, bool]:
     ):
         return views, False
     res["asset_box_2d"] = valid
-    crop = _crop_zoom(img, valid)
+    crop = _crop_zoom(img, valid, pad_frac=CELL_CONFIRM_PAD_FRAC)
     return [(f"cell crop ({label})", crop), (label, img)], True
 
 
@@ -2448,16 +2611,26 @@ def rooftop_requires_nearmap_tiers(res: dict) -> bool:
     return _is_rooftop(res)
 
 
-def tower_cell_requires_nearmap_obliques(res: dict) -> bool:
-    """Tower + cell=true must not stop on Vert alone.
+def tower_cell_requires_nearmap_obliques(
+    res: dict, *, db_backed: bool = False
+) -> bool:
+    """Whether a tower+cell call must continue to Nearmap obliques.
 
-    Pin-centered Vert chips often frame a nearby rooftop compound or a
-    different pole than the SF address; obliques are needed before write.
+    Imagery-only (no FCC/TowerSource) always continues: pin-centered Vert
+    often frames a neighbor rooftop or a different pole than the SF pin.
+
+    DB-hit Gemini towers at >= GEMINI_SOLO_CELL_CONF may stop on NAIP or
+    Vert — the database already anchors the site. Below that bar, still
+    pull obliques so Claude can confirm. Rooftops are handled separately
+    by rooftop_requires_nearmap_tiers.
     """
-    return (
-        str(res.get("site_type") or "").strip().lower() == "tower"
-        and res.get("cell_equipment") is True
-    )
+    if str(res.get("site_type") or "").strip().lower() != "tower":
+        return False
+    if res.get("cell_equipment") is not True:
+        return False
+    if db_backed and should_skip_claude_for_gemini_tower(res):
+        return False
+    return True
 
 
 def naip_age_blocks_early_stop(
@@ -2509,6 +2682,9 @@ def escalation_reason(res: dict) -> str | None:
     elif res.get("cell_equipment") is False:
         # Towers (and non-rooftop): definitive no-gear — skip Claude.
         return None
+    # Gemini already locked the call at >= 0.9 — don't overwrite with Claude.
+    if gemini_confidence_locks_claude(res):
+        return None
     if res.get("site_type") == "other":
         return "other_type"
     if res.get("site_type") == "unclear":
@@ -2544,9 +2720,15 @@ def classify_with_tiers(lat: float, lon: float, img: Image.Image | None,
                         provider: str, clients: dict, prompt: str,
                         input_confidence: str,
                         build_views,
-                        naip_age_years: float | None = None) -> tuple[dict, dict, str | None, str, list]:
+                        naip_age_years: float | None = None,
+                        db_backed: bool = False) -> tuple[dict, dict, str | None, str, list]:
     """Tier 0 (NAIP) -> Tier 1 (Vert) -> Tier 2 (obliques). Returns
-    (result, nearmap_views, nearmap_date, nearmap_tier, views)."""
+    (result, nearmap_views, nearmap_date, nearmap_tier, views).
+
+    ``db_backed`` is True when FCC/TowerSource already hit — high-conf Gemini
+    towers may then stop on NAIP or Vert. Imagery-only tower+cell always
+    continues to obliques.
+    """
     nearmap_views: dict = {}
     nearmap_date = None
 
@@ -2557,12 +2739,34 @@ def classify_with_tiers(lat: float, lon: float, img: Image.Image | None,
     _step_done("classify (NAIP)", _brief_pass_result(res))
     force_nearmap = rooftop_requires_nearmap_tiers(res)
     age_blocks = naip_age_blocks_early_stop(res, naip_age_years)
-    if tier_confident_stop(res) and not age_blocks and not force_nearmap:
+    need_tower_obliques = tower_cell_requires_nearmap_obliques(
+        res, db_backed=db_backed
+    )
+    if (
+        tier_confident_stop(res)
+        and not age_blocks
+        and not force_nearmap
+        and not need_tower_obliques
+    ):
+        if db_backed and should_skip_claude_for_gemini_tower(res):
+            _step_done(
+                "Nearmap skipped",
+                f"DB-hit Gemini tower conf>={GEMINI_SOLO_CELL_CONF:g}",
+            )
         return res, nearmap_views, nearmap_date, "naip_only", views
     if force_nearmap and NEARMAP_API_KEY:
         _step_done(
             "Nearmap required",
             "rooftop — Vert+obliques for cellular confirmation",
+        )
+    elif need_tower_obliques and NEARMAP_API_KEY:
+        _step_done(
+            "Nearmap required",
+            (
+                "imagery-only tower — Vert+obliques"
+                if not db_backed
+                else "DB tower below Gemini lock — Vert+obliques"
+            ),
         )
     elif tier_confident_stop(res) and age_blocks:
         _step_done(
@@ -2590,13 +2794,18 @@ def classify_with_tiers(lat: float, lon: float, img: Image.Image | None,
     res = gate_weak_rooftop_cell_claim(res)
     res = gate_weak_stealth_tower_claim(res)
     _step_done("classify (Nearmap vert)", _brief_pass_result(res))
-    # Rooftops always continue to obliques; tower+cell also continues (Vert-only
-    # often latches onto a nearby rooftop/pole that is not the SF pin asset).
+    # Rooftops always continue to obliques. Imagery-only tower+cell continues
+    # (Vert often latches onto a neighbor). DB-hit Gemini >= lock may stop.
     if (
         tier_confident_stop(res)
         and not rooftop_requires_nearmap_tiers(res)
-        and not tower_cell_requires_nearmap_obliques(res)
+        and not tower_cell_requires_nearmap_obliques(res, db_backed=db_backed)
     ):
+        if db_backed and should_skip_claude_for_gemini_tower(res):
+            _step_done(
+                "Nearmap obliques skipped",
+                f"DB-hit Gemini tower conf>={GEMINI_SOLO_CELL_CONF:g}",
+            )
         return res, nearmap_views, nearmap_date, "vert_only", views
 
     missing = [v for v in OBLIQUE_VIEWS if v not in nearmap_views]
@@ -2696,12 +2905,15 @@ def _grid_boxes(grid: int = ZOOM_GRID) -> list[list[int]]:
     return boxes
 
 
-def _crop_zoom(img: Image.Image, box: list[int]) -> Image.Image:
+def _crop_zoom(
+    img: Image.Image, box: list[int], *, pad_frac: float | None = None
+) -> Image.Image:
     """Magnify a normalized box from a source image to ZOOM_OUTPUT_PX."""
     w, h = img.size
     ymin, xmin, ymax, xmax = box
-    pad_y = int((ymax - ymin) * ZOOM_PAD_FRAC)
-    pad_x = int((xmax - xmin) * ZOOM_PAD_FRAC)
+    pad = ZOOM_PAD_FRAC if pad_frac is None else float(pad_frac)
+    pad_y = int((ymax - ymin) * pad)
+    pad_x = int((xmax - xmin) * pad)
     ymin = max(0, ymin - pad_y)
     xmin = max(0, xmin - pad_x)
     ymax = min(1000, ymax + pad_y)
@@ -3824,11 +4036,14 @@ def main():
                 in {"wide_aoi", "zoom", "pin_recenter_rejected"}
                 or nearmap_tier in {"naip_wide", "wide_aoi"},
                 used_crop=used_crop,
+                all_views=views,
             )
             if dual_model and not escalation_model:
                 escalation_model = dual_model
-                escalation_reason_str = (
-                    escalation_reason_str or "rooftop_dual_model_cell"
+                escalation_reason_str = escalation_reason_str or (
+                    "gemini_high_conf_tower"
+                    if dual_model == "gemini_strong_solo"
+                    else "rooftop_dual_model_cell"
                 )
             res["cell_models_agree"] = cell_agree
             if res.get("cell_equipment") is True:

@@ -28,7 +28,8 @@ _REASON_HINTS: dict[str, str] = {
         "Gemini/Claude cell disagreement or soft-keep — sample HVAC vs panel FPs."
     ),
     "tower_needs_dual_model_cell": (
-        "Tower cell claim without Claude hard-agree — check wrong-neighbor poles."
+        "Tower cell claim without Claude hard-agree or Gemini >= 0.9 lock — "
+        "check wrong-neighbor poles."
     ),
     "rooftop_needs_oblique_asset_box": (
         "Missing compact oblique box — repair/localize path or Nearmap coverage."
@@ -58,7 +59,8 @@ _REASON_HINTS: dict[str, str] = {
         "NAIP-only rooftop — Nearmap gap or fetch failure."
     ),
     "tower_naip_only_forbidden": (
-        "NAIP-only tower — Nearmap gap or fetch failure."
+        "NAIP-only tower without a DB-hit Gemini >= 0.9 lock — "
+        "imagery-only still needs Nearmap, or conf is below the lock."
     ),
 }
 

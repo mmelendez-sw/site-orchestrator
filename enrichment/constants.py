@@ -113,6 +113,12 @@ MIN_IMAGERY_ONLY_CELL_CONFIDENCE = 0.80
 # before a rooftop SF write (also required whenever Gemini cell=true).
 MIN_ENSEMBLE_CELL_CONFIDENCE = 0.85
 
+# Skip Claude dual-model for towers when Gemini site_confidence is at/above this.
+# Must match classifier.asset_classifier.GEMINI_SOLO_CELL_CONF default.
+GEMINI_TOWER_SKIP_CLAUDE_CONF = float(
+    os.environ.get("GEMINI_SOLO_CELL_CONF", "0.90")
+)
+
 CELL_GEAR_KINDS = (
     "sector_panel",
     "facade_mount",

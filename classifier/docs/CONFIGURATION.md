@@ -141,7 +141,7 @@ These are not environment variables; change them in code if needed.
 | `nearmap_tier` | Always (when run completes): `naip_only`, `naip_wide`, `vert_only`, `full`, `wide_aoi`, `zoom` |
 | `primary_model` | Always: `gemini` or `claude` |
 | `escalation_model` | When `BIFURCATED_AI=1` and escalation occurred |
-| `escalation_reason` | `low_confidence`, `unclear_type`, or `other_type` |
+| `escalation_reason` | `low_confidence`, `unclear_type`, `other_type`, `gemini_high_conf_tower` |
 
 ---
 

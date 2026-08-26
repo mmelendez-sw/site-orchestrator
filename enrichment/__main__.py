@@ -3,9 +3,13 @@
 Auto-apply (airtight) flow:
   python -m enrichment --states CA,MA,FL,NV --apply --dequeue-holdouts
 
-Only Claude hard-agree candidates are pushed. Imagery-only also requires
-agree_crop / agree_localize. Soft-keep and Gemini-solo never write. Holdouts
-dequeue (LLM_Classified=false, LLM_Holdout=true) for later reconciliation.
+Only Claude hard-agree candidates are pushed, except towers where Gemini
+site_confidence is already >= 0.9 (Claude skip). Those DB-hit towers may
+also write from NAIP or Vert without Nearmap obliques. Imagery-only also
+requires agree_crop / agree_localize unless that Gemini tower lock applies,
+and still needs obliques. Rooftop soft-keep and Gemini-solo never write.
+Holdouts dequeue (LLM_Classified=false, LLM_Holdout=true) for later
+reconciliation.
 
 Each run writes review/, spot_audit.html (~10% sample), and holdout_triage.md.
 
