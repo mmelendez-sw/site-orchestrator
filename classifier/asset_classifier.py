@@ -105,8 +105,16 @@ ROOFTOP_CELL_CONF_MIN = float(os.environ.get("ROOFTOP_CELL_CONF_MIN", "0.75"))
 NAIP_MAX_AGE_YEARS = float(os.environ.get("NAIP_MAX_AGE_YEARS", "2"))
 NAIP_AGE_HIGH_CONF_OVERRIDE = float(os.environ.get("NAIP_AGE_HIGH_CONF_OVERRIDE", "0.85"))
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+# Cheap NAIP screen; promote to GEMINI_MODEL for tower/rooftop/unclear/weak other.
+GEMINI_SCREEN_MODEL = os.environ.get(
+    "GEMINI_SCREEN_MODEL", "gemini-2.5-flash-lite"
+)
 CLAUDE_ESCALATION_MODEL = os.environ.get(
     "CLAUDE_ESCALATION_MODEL", "claude-sonnet-4-6")
+# Dual-model cell crops use Haiku; Sonnet stays on rooftop HVAC localize.
+CLAUDE_CROP_MODEL = os.environ.get(
+    "CLAUDE_CROP_MODEL", "claude-haiku-4-5-20251001"
+)
 # Thinking tokens for Gemini vision calls. Empty/auto: 1024 for non-lite
 # Gemini 2.5/3.x, 0 for *-lite* (keeps Flash-Lite cheap/fast).
 GEMINI_THINKING_BUDGET_ENV = os.environ.get("GEMINI_THINKING_BUDGET", "").strip()
@@ -122,7 +130,18 @@ CLAUDE_ESCALATE_MIN_SITE_CONF = float(
 )
 # Min IoU between Gemini and Claude boxes on localize dual-confirm.
 GEMINI_CLAUDE_BOX_IOU = float(os.environ.get("GEMINI_CLAUDE_BOX_IOU", "0.20"))
-OBLIQUE_VIEWS = ["North", "East", "South", "West"]
+
+
+def _csv_oblique_views(raw: str, default: tuple[str, ...] = ("North", "East")) -> list[str]:
+    allowed = {"North", "East", "South", "West"}
+    parts = [p.strip().title() for p in str(raw or "").split(",") if p.strip()]
+    views = [p for p in parts if p in allowed]
+    return views or list(default)
+
+
+OBLIQUE_VIEWS = _csv_oblique_views(
+    os.environ.get("NEARMAP_OBLIQUE_VIEWS", "North,East")
+)
 
 # ----------------------------- configuration --------------------------------
 
@@ -167,22 +186,25 @@ RUN_DIR = Path(".")
 NEARMAP_API_KEY = os.environ.get("NEARMAP_API_KEY")
 NEARMAP_TILE_URL = "https://api.nearmap.com/tiles/v3/{content}/{z}/{x}/{y}.jpg"
 NEARMAP_COVERAGE_POINT_URL = "https://api.nearmap.com/coverage/v2/point/{lon},{lat}"
-NEARMAP_VIEWS = ["Vert", "North", "East", "South", "West"]
+NEARMAP_VIEWS = ["Vert", *OBLIQUE_VIEWS]
 NEARMAP_CHIP_M = 100       # side length of the Nearmap AOI, in meters
 # Wide-AOI fallback: rural sites often have vert-only Nearmap coverage and the
 # recorded coordinates can put the real asset outside the narrow AOI. When the
 # first pass can't identify a site and no obliques were available, the Nearmap
 # fetch is retried at this size (matching the NAIP chip) and re-classified.
 NEARMAP_FALLBACK_CHIP_M = 250
-NEARMAP_VERT_ZOOM = 21     # ~6 cm/px Web Mercator ground resolution
-NEARMAP_OBLIQUE_ZOOM = 20  # panorama max zoom, ~11 cm/px
-NEARMAP_MAX_PX = 2048      # downscale stitched views before saving/sending
+NEARMAP_VERT_ZOOM = int(os.environ.get("NEARMAP_VERT_ZOOM", "20"))
+NEARMAP_OBLIQUE_ZOOM = int(os.environ.get("NEARMAP_OBLIQUE_ZOOM", "20"))
+NEARMAP_MAX_PX = int(os.environ.get("NEARMAP_MAX_PX", "1024"))
+# Downscale copies sent to vision models (saved chips stay at NEARMAP_MAX_PX).
+MODEL_IMAGE_MAX_PX = int(os.environ.get("MODEL_IMAGE_MAX_PX", "1024"))
+MODEL_MAX_OBLIQUES = int(os.environ.get("MODEL_MAX_OBLIQUES", "2"))
 
 # Two-stage zoom: after primary + wide-AOI passes still return other/unclear,
 # scout suspicious regions on the best top-down image, magnify them, and
 # re-classify. Critical for rural sites where towers are tiny in wide chips.
 ZOOM_GRID = 3              # 3x3 grid fallback when scout finds nothing
-ZOOM_MAX_CANDIDATES = 6    # max zoom crops sent to stage-2 classifier
+ZOOM_MAX_CANDIDATES = int(os.environ.get("ZOOM_MAX_CANDIDATES", "3"))
 ZOOM_OUTPUT_PX = 1024      # magnified crop size in pixels
 ZOOM_MIN_FRAC = 0.10       # minimum crop side as fraction of source image
 ZOOM_PAD_FRAC = 0.15       # padding around each candidate box
@@ -901,7 +923,7 @@ def build_classification_prompt(row) -> str:
 def maybe_recheck_equipment(provider: str, clients: dict, res: dict, views: list,
                             input_confidence: str) -> dict:
     """Second pass when a trusted source expects gear but the model said false."""
-    if input_confidence not in ("high", "medium"):
+    if input_confidence != "high":
         return res
     if res.get("cell_equipment") is not False:
         return res
@@ -983,6 +1005,8 @@ def maybe_recheck_rooftop_cell_false_positive(
     if str(res.get("site_type") or "").strip().lower() != "rooftop":
         return res
     if res.get("cell_equipment") is not True:
+        return res
+    if not _rooftop_cell_confirmed(res):
         return res
     if not views:
         return res
@@ -1611,7 +1635,7 @@ def confirm_rooftop_cell_with_claude(
         clients,
         views,
         prompt=prompt,
-        claude_model=CLAUDE_ESCALATION_MODEL,
+        claude_model=CLAUDE_CROP_MODEL if used_crop else CLAUDE_ESCALATION_MODEL,
     )
     claude_cell = claude_res.get("cell_equipment") is True
     res["claude_cell_equipment"] = claude_res.get("cell_equipment")
@@ -2025,16 +2049,40 @@ def has_locked_oblique_asset_box(res: dict) -> bool:
 
 
 def needs_pin_offset_scout(res: dict) -> bool:
-    """True when pin-centered imagery may have missed a nearby cellular asset.
+    """True when a rooftop pin may have missed facade/parapet gear.
 
-    Covers parking-lot / mall-edge pins: settled other/unclear, or a weak
-    rooftop call without confirmed cell gear.
+    Other/unclear sites use cheap NAIP wide/zoom instead of Nearmap recenters.
     """
+    if str(res.get("site_type") or "").strip().lower() != "rooftop":
+        return False
+    return res.get("cell_equipment") is not True
+
+
+def needs_naip_rescue(res: dict) -> bool:
+    """True when a weak NAIP other/unclear still warrants NAIP wide/zoom."""
     site = str(res.get("site_type") or "").strip().lower()
-    if site in {"other", "unclear"}:
+    if site == "unclear":
         return True
-    if site == "rooftop" and res.get("cell_equipment") is not True:
+    if site == "other":
+        return not confident_no_asset(res)
+    return False
+
+
+def confident_no_asset(res: dict) -> bool:
+    """True when Gemini already locked a high-confidence empty/other chip."""
+    if str(res.get("site_type") or "").strip().lower() != "other":
+        return False
+    conf = normalize_confidence(res.get("site_confidence"))
+    return conf is not None and conf >= TIER_CONF_HIGH
+
+
+def needs_flash_confirm(res: dict) -> bool:
+    """Promote the NAIP lite screen to Flash for anything that is not a confident other."""
+    site = str(res.get("site_type") or "").strip().lower()
+    if site in _positive_site_types() or site == "unclear":
         return True
+    if site == "other":
+        return not confident_no_asset(res)
     return False
 
 
@@ -2458,32 +2506,35 @@ def _gemini_retry_wait_s(attempt: int, exc: Exception) -> float:
     return min(wait, 120.0) + random.uniform(0.0, 3.0)
 
 
-def _gemini_thinking_budget() -> int:
-    """Resolved thinking token budget for the active GEMINI_MODEL."""
+def _gemini_thinking_budget(model: str | None = None) -> int:
+    """Resolved thinking token budget for a Gemini vision model."""
     raw = GEMINI_THINKING_BUDGET_ENV or os.environ.get("GEMINI_THINKING_BUDGET", "").strip()
     if raw and raw.lower() not in {"auto", "default"}:
         try:
             return max(0, int(float(raw)))
         except (TypeError, ValueError):
             return 0
-    model = str(GEMINI_MODEL or "").strip().lower()
-    if "lite" in model:
+    use = str(model or GEMINI_MODEL or "").strip().lower()
+    if "lite" in use:
         return 0
-    if model.startswith("gemini-3") or model.startswith("gemini-2.5"):
+    if use.startswith("gemini-3") or use.startswith("gemini-2.5"):
         return 1024
     return 0
 
 
-def _gemini_generate_config(schema: dict) -> genai_types.GenerateContentConfig:
+def _gemini_generate_config(
+    schema: dict, model: str | None = None
+) -> genai_types.GenerateContentConfig:
     """Structured JSON config; enable thinking for non-lite Gemini 2.5/3.x."""
-    budget = _gemini_thinking_budget()
+    use_model = model or GEMINI_MODEL
+    budget = _gemini_thinking_budget(use_model)
     kwargs: dict = {
         "response_mime_type": "application/json",
         "response_schema": schema,
         # Thinking consumes output budget; keep headroom for the JSON reply.
         "max_output_tokens": 8192 if budget > 0 else 1000,
     }
-    if not str(GEMINI_MODEL).startswith("gemini-2.0"):
+    if not str(use_model).startswith("gemini-2.0"):
         kwargs["thinking_config"] = genai_types.ThinkingConfig(
             thinking_budget=budget
         )
@@ -2491,16 +2542,18 @@ def _gemini_generate_config(schema: dict) -> genai_types.GenerateContentConfig:
 
 
 def _call_gemini_json(client: genai.Client, contents: list, schema: dict,
-                      retries: int | None = None) -> dict:
+                      retries: int | None = None,
+                      model: str | None = None) -> dict:
     """Gemini vision call with structured JSON output (single model)."""
     max_retries = GEMINI_RETRIES if retries is None else retries
+    use_model = model or GEMINI_MODEL
     attempt = 0
     while True:
         try:
             resp = client.models.generate_content(
-                model=GEMINI_MODEL,
+                model=use_model,
                 contents=contents,
-                config=_gemini_generate_config(schema),
+                config=_gemini_generate_config(schema, model=use_model),
             )
             break
         except Exception as exc:
@@ -2524,7 +2577,7 @@ def _call_gemini_json(client: genai.Client, contents: list, schema: dict,
         res = {"site_type": "unclear", "site_confidence": 0.0,
                "site_evidence": f"unparseable model reply: {text[:200]}"}
     normalize_model_result(res)
-    res["model"] = GEMINI_MODEL
+    res["model"] = use_model
     return res
 
 
@@ -2546,11 +2599,65 @@ def _views_to_gemini_contents(views: list[tuple[str, Image.Image]], prompt: str)
     return contents
 
 
+def downscale_image(img: Image.Image, max_px: int) -> Image.Image:
+    """Return a copy capped at max_px on the long side (original unchanged)."""
+    if img is None or max_px <= 0:
+        return img
+    if max(img.size) <= max_px:
+        return img
+    copy = img.copy()
+    copy.thumbnail((max_px, max_px), Image.Resampling.LANCZOS)
+    return copy
+
+
+def trim_views_for_model(
+    views: list,
+    *,
+    max_obliques: int | None = None,
+    max_px: int | None = None,
+) -> list:
+    """Keep one top-down + a few obliques (or crops) and downscale for the API."""
+    if not views:
+        return views
+    max_obliques = MODEL_MAX_OBLIQUES if max_obliques is None else max_obliques
+    max_px = MODEL_IMAGE_MAX_PX if max_px is None else max_px
+    top: list = []
+    obliques: list = []
+    other: list = []
+    for label, img in views:
+        lower = str(label).lower()
+        if "zoom crop" in lower or "cell crop" in lower:
+            other.append((label, img))
+            continue
+        is_naip = "naip" in lower
+        is_oblique = (not is_naip) and (
+            "oblique" in lower
+            or any(d in lower for d in ("north", "east", "south", "west"))
+        )
+        if is_oblique:
+            obliques.append((label, img))
+        elif is_naip or "vert" in lower or "top-down" in lower:
+            top.append((label, img))
+        else:
+            other.append((label, img))
+    nearmap_vert = [
+        item
+        for item in top
+        if "naip" not in str(item[0]).lower()
+    ]
+    chosen_top = (nearmap_vert[:1] if nearmap_vert else top[:1])
+    selected = chosen_top + obliques[: max(0, max_obliques)] + other
+    return [(label, downscale_image(img, max_px)) for label, img in selected]
+
+
 def classify_site(provider: str, clients: dict,
                   views: list[tuple[str, Image.Image]],
                   prompt: str = CLASSIFICATION_PROMPT, retries: int = 3,
-                  scan: bool = False, claude_model: str | None = None) -> dict:
+                  scan: bool = False, claude_model: str | None = None,
+                  gemini_model: str | None = None,
+                  trim_views: bool = True) -> dict:
     """Classify one asset via Gemini or Claude using the same prompt."""
+    send_views = trim_views_for_model(views) if trim_views else list(views)
     if scan:
         claude_schema, gemini_schema = SCAN_SCHEMA, GEMINI_SCAN_SCHEMA
         tool_name = "scan_candidates"
@@ -2560,9 +2667,12 @@ def classify_site(provider: str, clients: dict,
         tool_name = "classify_site"
         classify_prompt = prompt
     if provider == "gemini":
-        contents = _views_to_gemini_contents(views, classify_prompt)
-        return _call_gemini_json(clients["gemini"], contents, gemini_schema, retries)
-    content = _views_to_claude_content(views, classify_prompt)
+        contents = _views_to_gemini_contents(send_views, classify_prompt)
+        return _call_gemini_json(
+            clients["gemini"], contents, gemini_schema, retries,
+            model=gemini_model or GEMINI_MODEL,
+        )
+    content = _views_to_claude_content(send_views, classify_prompt)
     return _call_claude_json(
         clients["claude"], content, claude_schema, tool_name, retries,
         model=claude_model)
@@ -2703,10 +2813,10 @@ def escalation_reason(res: dict) -> str | None:
     # Gemini already locked the call at >= 0.9 — don't overwrite with Claude.
     if gemini_confidence_locks_claude(res):
         return None
-    if res.get("site_type") == "other":
-        return "other_type"
-    if res.get("site_type") == "unclear":
-        return "unclear_type"
+    # other/unclear no longer escalate on type — need a cheaper second opinion
+    # that actually disagrees (see maybe_escalate_to_claude).
+    if str(res.get("site_type") or "").strip().lower() in {"other", "unclear"}:
+        return None
     if site_confidence_band(res) == "low":
         return "low_confidence"
     return None
@@ -2734,27 +2844,62 @@ def _step_done(step: str, detail: str | None = None) -> None:
         _out(f"         {step} — done", important=True)
 
 
+def _classify_pass(
+    provider: str,
+    clients: dict,
+    views: list,
+    prompt: str,
+    input_confidence: str,
+    *,
+    screen: bool = False,
+) -> dict:
+    """One Gemini/Claude classify pass; optional lite screen then Flash confirm."""
+    gemini_model = None
+    if provider == "gemini":
+        gemini_model = GEMINI_SCREEN_MODEL if screen else GEMINI_MODEL
+    res = classify_site(
+        provider, clients, views, prompt=prompt, gemini_model=gemini_model
+    )
+    if (
+        screen
+        and provider == "gemini"
+        and GEMINI_SCREEN_MODEL != GEMINI_MODEL
+        and needs_flash_confirm(res)
+    ):
+        res = classify_site(
+            provider, clients, views, prompt=prompt, gemini_model=GEMINI_MODEL
+        )
+        _step_done("Flash confirm", _brief_pass_result(res))
+    res = maybe_recheck_equipment(provider, clients, res, views, input_confidence)
+    return res
+
+
 def classify_with_tiers(lat: float, lon: float, img: Image.Image | None,
                         provider: str, clients: dict, prompt: str,
                         input_confidence: str,
                         build_views,
                         naip_age_years: float | None = None,
                         db_backed: bool = False) -> tuple[dict, dict, str | None, str, list]:
-    """Tier 0 (NAIP) -> Tier 1 (Vert) -> Tier 2 (obliques). Returns
-    (result, nearmap_views, nearmap_date, nearmap_tier, views).
+    """Tier 0 (NAIP) -> paid Nearmap only for rooftop / tower-cell.
 
-    ``db_backed`` is True when FCC/TowerSource already hit — high-conf Gemini
-    towers may then stop on NAIP or Vert. Imagery-only tower+cell always
-    continues to obliques.
+    Confident NAIP ``other`` stops immediately. other/unclear otherwise stay
+    on NAIP (wide/zoom happen upstream). When Nearmap is required, Vert and
+    the configured obliques are fetched together and classified once.
     """
     nearmap_views: dict = {}
     nearmap_date = None
 
     views = build_views({})
     _step_done("NAIP")
-    res = classify_site(provider, clients, views, prompt=prompt)
-    res = maybe_recheck_equipment(provider, clients, res, views, input_confidence)
+    res = _classify_pass(
+        provider, clients, views, prompt, input_confidence, screen=True
+    )
     _step_done("classify (NAIP)", _brief_pass_result(res))
+
+    if confident_no_asset(res):
+        _step_done("Nearmap skipped", f"confident other (>={TIER_CONF_HIGH:g})")
+        return res, nearmap_views, nearmap_date, "naip_only", views
+
     force_nearmap = rooftop_requires_nearmap_tiers(res)
     age_blocks = naip_age_blocks_early_stop(res, naip_age_years)
     need_tower_obliques = tower_cell_requires_nearmap_obliques(
@@ -2772,6 +2917,11 @@ def classify_with_tiers(lat: float, lon: float, img: Image.Image | None,
                 f"DB-hit Gemini tower conf>={GEMINI_SOLO_CELL_CONF:g}",
             )
         return res, nearmap_views, nearmap_date, "naip_only", views
+
+    if not force_nearmap and not need_tower_obliques:
+        _step_done("Nearmap skipped", "NAIP other/unclear — no paid imagery")
+        return res, nearmap_views, nearmap_date, "naip_only", views
+
     if force_nearmap and NEARMAP_API_KEY:
         _step_done(
             "Nearmap required",
@@ -2802,29 +2952,7 @@ def classify_with_tiers(lat: float, lon: float, img: Image.Image | None,
     if not nearmap_views:
         _step_done("Nearmap vert", "no coverage")
         return res, nearmap_views, nearmap_date, "naip_only", views
-
     _step_done("Nearmap vert")
-    views = build_views(nearmap_views)
-    res = classify_site(provider, clients, views, prompt=prompt)
-    res = maybe_recheck_equipment(provider, clients, res, views, input_confidence)
-    res = gate_weak_rooftop_cell_claim(res)
-    res = maybe_recheck_rooftop_cell_false_positive(provider, clients, res, views)
-    res = gate_weak_rooftop_cell_claim(res)
-    res = gate_weak_stealth_tower_claim(res)
-    _step_done("classify (Nearmap vert)", _brief_pass_result(res))
-    # Rooftops always continue to obliques. Imagery-only tower+cell continues
-    # (Vert often latches onto a neighbor). DB-hit Gemini >= lock may stop.
-    if (
-        tier_confident_stop(res)
-        and not rooftop_requires_nearmap_tiers(res)
-        and not tower_cell_requires_nearmap_obliques(res, db_backed=db_backed)
-    ):
-        if db_backed and should_skip_claude_for_gemini_tower(res):
-            _step_done(
-                "Nearmap obliques skipped",
-                f"DB-hit Gemini tower conf>={GEMINI_SOLO_CELL_CONF:g}",
-            )
-        return res, nearmap_views, nearmap_date, "vert_only", views
 
     missing = [v for v in OBLIQUE_VIEWS if v not in nearmap_views]
     if missing:
@@ -2838,14 +2966,21 @@ def classify_with_tiers(lat: float, lon: float, img: Image.Image | None,
         _step_done("Nearmap obliques", "no coverage")
 
     views = build_views(nearmap_views)
-    res = classify_site(provider, clients, views, prompt=prompt)
-    res = maybe_recheck_equipment(provider, clients, res, views, input_confidence)
+    res = _classify_pass(
+        provider, clients, views, prompt, input_confidence, screen=False
+    )
     res = gate_weak_rooftop_cell_claim(res)
     res = maybe_recheck_rooftop_cell_false_positive(provider, clients, res, views)
     res = gate_weak_rooftop_cell_claim(res)
     res = gate_weak_stealth_tower_claim(res)
-    _step_done("classify (Nearmap obliques)", _brief_pass_result(res))
-    return res, nearmap_views, nearmap_date, "full", views
+    _step_done("classify (Nearmap combined)", _brief_pass_result(res))
+    return (
+        res,
+        nearmap_views,
+        nearmap_date,
+        "full" if has_obliques else "vert_only",
+        views,
+    )
 
 
 def classify_chip(client: Anthropic, views: list[tuple[str, Image.Image]],
@@ -2949,7 +3084,10 @@ def scout_candidates(provider: str, clients: dict, label: str,
                      img: Image.Image) -> list[dict]:
     """Ask the vision model to propose candidate regions on one top-down image."""
     views = [(label, img)]
-    res = classify_site(provider, clients, views, scan=True)
+    gemini_model = GEMINI_SCREEN_MODEL if provider == "gemini" else None
+    res = classify_site(
+        provider, clients, views, scan=True, gemini_model=gemini_model
+    )
     return res.get("candidates") or []
 
 
@@ -3506,32 +3644,50 @@ def regenerate_reports_from_detail(run_root: Path, output_csv: str,
 
 def classify_with_routing(provider: str, clients: dict, views: list,
                           prompt: str, input_confidence: str,
-                          *, escalate: bool = True
+                          *, escalate: bool = True, screen: bool = False
                           ) -> tuple[dict, str, str | None, str | None]:
     """Run primary classification; optionally escalate Gemini -> Claude.
 
     Pass escalate=False for intermediate imagery stages so Gemini is fully
     exhausted (NAIP/Nearmap/zoom) before a single final Claude call.
+    ``screen=True`` uses GEMINI_SCREEN_MODEL then Flash-confirm when needed.
     """
     primary_model = provider
-    res = classify_site(provider, clients, views, prompt=prompt)
-    res = maybe_recheck_equipment(provider, clients, res, views, input_confidence)
+    res = _classify_pass(
+        provider, clients, views, prompt, input_confidence, screen=screen
+    )
 
     escalation_model = None
     escalation_reason_str = None
     if (escalate and BIFURCATED_AI and not GEMINI_ONLY
             and provider == "gemini"):
-        reason = escalation_reason(res)
-        if reason:
-            escalation_reason_str = reason
-            escalation_model = "claude"
-            res = classify_site(
-                "claude", clients, views, prompt=prompt,
-                claude_model=CLAUDE_ESCALATION_MODEL)
-            res = maybe_recheck_equipment(
-                "claude", clients, res, views, input_confidence)
-            _step_done("escalate (Claude)", _brief_pass_result(res))
+        res, escalation_model, escalation_reason_str = maybe_escalate_to_claude(
+            res, clients, views, prompt, input_confidence, allow=True
+        )
     return res, primary_model, escalation_model, escalation_reason_str
+
+
+def cheap_second_opinion_disagrees(
+    res: dict, clients: dict, views: list, prompt: str
+) -> bool:
+    """True when Flash (or a second Gemini pass) calls a positive vs other/unclear.
+
+    If the last call was already GEMINI_MODEL, type alone is not disagreement.
+    """
+    site = str(res.get("site_type") or "").strip().lower()
+    if site not in {"other", "unclear"}:
+        return False
+    if confident_no_asset(res):
+        return False
+    if "gemini" not in clients or clients.get("gemini") is None:
+        return False
+    last_model = str(res.get("model") or "").strip()
+    if last_model == GEMINI_MODEL:
+        return False
+    second = classify_site(
+        "gemini", clients, views, prompt=prompt, gemini_model=GEMINI_MODEL
+    )
+    return str(second.get("site_type") or "").strip().lower() in _positive_site_types()
 
 
 def maybe_escalate_to_claude(res: dict, clients: dict, views: list, prompt: str,
@@ -3543,7 +3699,15 @@ def maybe_escalate_to_claude(res: dict, clients: dict, views: list, prompt: str,
         return res, None, None
     reason = escalation_reason(res)
     if not reason:
-        return res, None, None
+        site = str(res.get("site_type") or "").strip().lower()
+        if (
+            site in {"other", "unclear"}
+            and not confident_no_asset(res)
+            and cheap_second_opinion_disagrees(res, clients, views, prompt)
+        ):
+            reason = "second_opinion_disagree"
+        else:
+            return res, None, None
     escalated = classify_site(
         "claude", clients, views, prompt=prompt,
         claude_model=CLAUDE_ESCALATION_MODEL)
@@ -3887,7 +4051,7 @@ def main():
                 res, primary_model, escalation_model, escalation_reason_str = (
                     classify_with_routing(
                         primary_provider, clients, views, prompt,
-                        input_confidence, escalate=False))
+                        input_confidence, escalate=False, screen=True))
                 _step_done("classify (NAIP)", _brief_pass_result(res))
             elif NEARMAP_TIERED:
                 # Gemini exhausts NAIP -> Vert -> obliques before any Claude.
@@ -3923,6 +4087,13 @@ def main():
             pin_offset_scout = (
                 not nearmap_blocks_rescue and needs_pin_offset_scout(res)
             )
+            naip_rescue = (
+                not nearmap_blocks_rescue
+                and not pin_offset_scout
+                and needs_naip_rescue(res)
+            )
+            if confident_no_asset(res):
+                _step_done("rescue skipped", "confident NAIP other")
             if nearmap_blocks_rescue:
                 _step_done(
                     "Nearmap settled",
@@ -3950,7 +4121,9 @@ def main():
 
             # NAIP zoom-out: tower may sit just outside the 250 m frame (coords off).
             # One extra Gemini call — cheap catch for "tower exists but out of picture".
-            if (pin_offset_scout and WIDE_AOI_STAGE and img is not None
+            wide_was_other = False
+            if ((pin_offset_scout or naip_rescue) and WIDE_AOI_STAGE and img is not None
+                    and not confident_no_asset(res)
                     and res.get("site_type") in ("other", "unclear", "rooftop")
                     and res.get("cell_equipment") is not True
                     and NAIP_WIDE_CHIP_M > CHIP_SIZE_M):
@@ -3987,10 +4160,14 @@ def main():
                         chip_path = wide_path
                         classification_stage = "wide_aoi"
                         nearmap_tier = "naip_wide"
+                    if str(wide_res.get("site_type") or "").strip().lower() == "other":
+                        wide_was_other = True
 
             # Two-stage zoom: scout suspicious regions, magnify, re-classify.
             force_zoom = label_hint == "stealth"
-            if (pin_offset_scout and ZOOM_STAGE
+            if ((pin_offset_scout or naip_rescue or force_zoom) and ZOOM_STAGE
+                    and not confident_no_asset(res)
+                    and not wide_was_other
                     and (
                         force_zoom
                         or (
@@ -4041,7 +4218,6 @@ def main():
             res = maybe_repair_rooftop_asset_box(fp_provider, clients, res, views)
             res = gate_weak_rooftop_cell_claim(res)
             res = gate_weak_stealth_tower_claim(res)
-            res = maybe_recheck_rooftop_cell_crop(fp_provider, clients, res, views)
             res = enforce_rooftop_cell_requires_box(res, views)
             confirm_views, used_crop = build_cell_confirm_views(res, views)
             res, dual_model, cell_agree = confirm_rooftop_cell_with_claude(

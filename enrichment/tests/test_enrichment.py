@@ -1158,7 +1158,8 @@ class CoordinationHelperTests(unittest.TestCase):
     def test_needs_pin_offset_scout(self):
         from classifier import asset_classifier as ac
 
-        self.assertTrue(ac.needs_pin_offset_scout({"site_type": "other"}))
+        self.assertFalse(ac.needs_pin_offset_scout({"site_type": "other"}))
+        self.assertFalse(ac.needs_pin_offset_scout({"site_type": "unclear"}))
         self.assertTrue(
             ac.needs_pin_offset_scout(
                 {"site_type": "rooftop", "cell_equipment": False}
@@ -1474,6 +1475,88 @@ class AuditTriageTests(unittest.TestCase):
             report["weekly_focus"][0]["reason"],
             "rooftop_needs_dual_model_cell",
         )
+
+
+class CostPolicyTests(unittest.TestCase):
+    def test_auto_skip_unique_close_hit(self):
+        from enrichment.cost_policy import should_auto_skip_classify
+        from enrichment.mssql import ProximityHit
+
+        hit = ProximityHit(
+            source="FCC",
+            distance_m=12.0,
+            latitude=43.0,
+            longitude=-89.0,
+            candidate_count=1,
+            runner_up_gap_m=None,
+        )
+        self.assertTrue(should_auto_skip_classify(hit))
+
+    def test_auto_skip_rejects_ambiguous_cluster(self):
+        from enrichment.cost_policy import should_auto_skip_classify
+        from enrichment.mssql import ProximityHit
+
+        hit = ProximityHit(
+            source="FCC",
+            distance_m=10.0,
+            latitude=43.0,
+            longitude=-89.0,
+            candidate_count=3,
+            runner_up_gap_m=8.0,
+        )
+        self.assertFalse(should_auto_skip_classify(hit))
+
+    def test_auto_skip_rejects_far_unique_hit(self):
+        from enrichment.cost_policy import should_auto_skip_classify
+        from enrichment.mssql import ProximityHit
+
+        hit = ProximityHit(
+            source="FCC",
+            distance_m=80.0,
+            latitude=43.0,
+            longitude=-89.0,
+            candidate_count=1,
+        )
+        self.assertFalse(should_auto_skip_classify(hit))
+
+    def test_cluster_match_within_50m(self):
+        from enrichment.cost_policy import find_cluster_match
+
+        cache = [
+            {
+                "lat": 43.0,
+                "lon": -89.0,
+                "classified": {"site_type": "other", "site_confidence": 0.8},
+            }
+        ]
+        # ~11 m north
+        match = find_cluster_match(cache, 43.0001, -89.0)
+        self.assertIsNotNone(match)
+        self.assertIsNone(find_cluster_match(cache, 43.01, -89.0))
+
+    def test_osm_empty_chip_and_tower_tags(self):
+        from enrichment.osm_prefilter import (
+            osm_suggests_empty_chip,
+            parse_overpass_elements,
+        )
+
+        empty = parse_overpass_elements([])
+        self.assertTrue(empty["ok"])
+        self.assertTrue(osm_suggests_empty_chip(empty))
+
+        tower = parse_overpass_elements(
+            [
+                {
+                    "tags": {
+                        "man_made": "mast",
+                        "tower:type": "communication",
+                    }
+                }
+            ]
+        )
+        self.assertTrue(tower["communication_tower"])
+        self.assertFalse(osm_suggests_empty_chip(tower))
+        self.assertFalse(osm_suggests_empty_chip({"ok": False}))
 
 
 if __name__ == "__main__":

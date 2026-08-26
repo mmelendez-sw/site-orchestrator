@@ -121,6 +121,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip all Nearmap fetches (NAIP + Gemini/Claude only).",
     )
     parser.add_argument(
+        "--wave",
+        choices=("1", "2"),
+        default="2",
+        help=(
+            "1 = NAIP+Gemini screen only (no Nearmap/Claude). "
+            "2 = default: paid Nearmap/Claude only when NAIP says rooftop/tower-cell."
+        ),
+    )
+    parser.add_argument(
         "--states",
         type=str,
         default=None,
@@ -211,8 +220,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     _quiet_third_party_loggers()
 
-    if args.naip_only:
+    if args.naip_only or args.wave == "1":
         os.environ["NAIP_ONLY"] = "1"
+    if args.wave == "1":
+        os.environ["GEMINI_ONLY"] = "1"
 
     run_dir = args.run_dir or default_run_dir(ROOT / "runs")
 

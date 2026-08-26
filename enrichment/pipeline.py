@@ -29,6 +29,10 @@ from enrichment.constants import (
     REVIEW_DIR_NAME,
     SPOT_AUDIT_HTML,
 )
+from enrichment.cost_policy import (
+    find_cluster_match,
+    should_auto_skip_classify,
+)
 from enrichment.mssql import connect_mssql, describe_match, find_proximity_hit
 from enrichment.naip_classify import classify_site_imagery
 from enrichment.outputs import (
@@ -130,6 +134,7 @@ def run_enrichment(
 
         detail_rows: list[dict[str, Any]] = []
         cursor = sql_connection.cursor()
+        cluster_cache: list[dict[str, Any]] = []
 
         for index, site in enumerate(sites, start=1):
             sf_id = str(site.get("Id") or "")
@@ -152,6 +157,7 @@ def run_enrichment(
                 classify_fn=classify,
                 chip_dir=chip_dir,
                 verbose=verbose,
+                cluster_cache=cluster_cache,
             )
             site_elapsed = time.monotonic() - site_t0
             row.setdefault("sf_update_status", "")
@@ -274,6 +280,7 @@ def _process_site(
     classify_fn: Callable[..., dict[str, Any]],
     chip_dir: Path,
     verbose: bool = True,
+    cluster_cache: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     sf_id = str(site.get("Id") or "")
     coords = parse_sf_lat_lng(site)
@@ -453,9 +460,14 @@ def _process_site(
     base["classify_lat"] = classify_lat
     base["classify_lng"] = classify_lng
 
-    if skip_classify:
+    auto_skip = skip_classify or should_auto_skip_classify(hit)
+    if auto_skip:
         if verbose:
-            progress.step("skip classify")
+            progress.step(
+                "skip classify"
+                if skip_classify
+                else "auto skip classify (unique DB hit ≤25 m)"
+            )
         if hit is not None:
             base["bucket"] = BUCKET_POTENTIAL_UPDATE
             base["holdout_reason"] = "skip_classify_db_hit"
@@ -470,6 +482,52 @@ def _process_site(
             base["bucket"] = BUCKET_OTHER
             base["holdout_reason"] = "skip_classify_no_db_hit"
         return base
+
+    if cluster_cache is not None and hit is None:
+        reuse = find_cluster_match(
+            cluster_cache, float(classify_lat), float(classify_lng)
+        )
+        if reuse is not None:
+            classified = dict(reuse["classified"])
+            classified["classification_stage"] = "cluster_reuse"
+            if verbose:
+                progress.step(
+                    f"reuse nearby pin ({reuse.get('lat')}, {reuse.get('lon')})"
+                )
+            base["naip_site_type"] = classified.get("site_type") or ""
+            base["naip_tower_subtype"] = classified.get("tower_subtype") or ""
+            base["naip_site_confidence"] = classified.get("site_confidence") or ""
+            base["naip_cell_equipment"] = classified.get("cell_equipment")
+            base["cell_equipment_confidence"] = (
+                classified.get("cell_equipment_confidence") or ""
+            )
+            base["cell_equipment_evidence"] = (
+                classified.get("cell_equipment_evidence") or ""
+            )
+            base["cell_gear_kind"] = classified.get("cell_gear_kind") or ""
+            base["site_evidence"] = classified.get("site_evidence") or ""
+            base["classification_stage"] = "cluster_reuse"
+            base["nearmap_tier"] = classified.get("nearmap_tier") or ""
+            base["nearmap_views"] = classified.get("nearmap_views") or ""
+            base["imagery_used"] = imagery_bucket(classified)
+            base["primary_model"] = classified.get("primary_model") or ""
+            decision = bucket_classification(
+                match_source=base["match_source"],
+                classified=classified,
+                db_lat=db_lat,
+                db_lng=db_lng,
+                sf_lat=sf_lat,
+                sf_lng=sf_lng,
+            )
+            base.update(decision)
+            cluster_cache.append(
+                {
+                    "lat": float(classify_lat),
+                    "lon": float(classify_lng),
+                    "classified": classified,
+                }
+            )
+            return base
 
     if verbose:
         progress.stage("CLASSIFY")
@@ -556,6 +614,18 @@ def _process_site(
         sf_lng=sf_lng,
     )
     base.update(decision)
+    if (
+        cluster_cache is not None
+        and hit is None
+        and not classified.get("error")
+    ):
+        cluster_cache.append(
+            {
+                "lat": float(classify_lat),
+                "lon": float(classify_lng),
+                "classified": classified,
+            }
+        )
     return base
 
 
