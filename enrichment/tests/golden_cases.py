@@ -77,7 +77,7 @@ def _rooftop(**overrides: Any) -> dict[str, Any]:
 
 GOLDEN_CASES: list[GoldenCase] = [
     (
-        "green_valley_vert_only_tower_fp",
+        "green_valley_vert_only_tower_ready",
         MATCH_SOURCE_NONE,
         _tower(
             nearmap_tier="vert_only",
@@ -92,7 +92,7 @@ GOLDEN_CASES: list[GoldenCase] = [
         None,
         36.0255,
         -115.0852,
-        {"holdout_reason": "tower_needs_nearmap_obliques"},
+        {"bucket": BUCKET_POTENTIAL_UPDATE},
     ),
     (
         "db_tower_naip_gemini_solo_ready",

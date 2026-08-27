@@ -28,6 +28,8 @@ from enrichment.constants import (
     VERIFIED_SITE_SOURCE_NAIP,
     VERIFIED_SITE_SOURCE_NEARMAP,
     VERIFIED_SITE_SOURCE_TOWERSOURCE,
+    ROOFTOP_CERTAIN_CONF,
+    DISCERNIBLE_CELL_GEAR_KINDS,
 )
 
 
@@ -99,6 +101,61 @@ def _parse_asset_box_2d(classified: dict[str, Any]) -> list[int] | None:
     if not (0 <= ymin < ymax <= 1000 and 0 <= xmin < xmax <= 1000):
         return None
     return [ymin, xmin, ymax, xmax]
+
+
+def _hedged_cell_claim(classified: dict[str, Any]) -> bool:
+    """True when evidence sounds guessed (HVAC FP / 'likely conceals' language)."""
+    text = " ".join(
+        str(classified.get(key) or "")
+        for key in ("cell_equipment_evidence", "site_evidence")
+    ).lower()
+    hedges = (
+        "likely",
+        "probably",
+        "possibly",
+        "possible",
+        "may be",
+        "might be",
+        "appears to",
+        "seem to",
+        "cannot confirm",
+        "can't confirm",
+        "uncertain",
+        "typical for this type",
+        "low resolution",
+        "too small to",
+        "hard to tell",
+        "unable to distinguish",
+    )
+    return any(h in text for h in hedges)
+
+
+def _rooftop_cell_certain(classified: dict[str, Any]) -> bool:
+    """True when NAIP/Gemini evidence is strong enough to auto-apply a rooftop.
+
+    Requires explicit high site + cell confidence, a named telecom gear kind
+    (not unclear/none), unhedged evidence that names the gear, and a box.
+    """
+    if str(classified.get("site_type") or "").strip().lower() != "rooftop":
+        return False
+    if not cell_equipment_confirmed(classified.get("cell_equipment")):
+        return False
+    if not _confidence_ok(classified.get("site_confidence"), ROOFTOP_CERTAIN_CONF):
+        return False
+    if not _rooftop_cell_confidence_ok(
+        classified, minimum=ROOFTOP_CERTAIN_CONF
+    ):
+        return False
+    kind = str(classified.get("cell_gear_kind") or "").strip().lower().replace(" ", "_")
+    if kind not in DISCERNIBLE_CELL_GEAR_KINDS:
+        return False
+    if not _telecom_evidence_cues(classified):
+        return False
+    if _hedged_cell_claim(classified):
+        return False
+    if not _has_asset_box(classified):
+        return False
+    return True
 
 
 def _cell_gear_kind_ok(classified: dict[str, Any]) -> bool:
@@ -196,9 +253,9 @@ def _dual_model_cell_ok(classified: dict[str, Any]) -> bool:
 def _tower_gemini_high_conf_ok(classified: dict[str, Any]) -> bool:
     """Gemini already locked a tower at >= 0.9 — Claude dual-model not required.
 
-    Rooftop HVAC FPs still need Claude hard-agree. Imagery-only still needs
-    Nearmap obliques + an asset box (checked before this helper is used).
-    DB-hit towers may write from NAIP or Vert when this lock applies.
+    Accepts ``gemini_strong_solo`` or an empty dual_model_resolution (NAIP-only
+    Gemini path never stamps Claude fields). Rooftop HVAC FPs still need Claude
+    hard-agree. Imagery-only towers may write when this lock applies.
     """
     if str(classified.get("site_type") or "").strip().lower() != "tower":
         return False
@@ -209,7 +266,7 @@ def _tower_gemini_high_conf_ok(classified: dict[str, Any]) -> bool:
     ):
         return False
     resolution = str(classified.get("dual_model_resolution") or "").strip().lower()
-    return resolution == "gemini_strong_solo"
+    return resolution in {"", "gemini_strong_solo"}
 
 
 def _dual_model_hard_agree(classified: dict[str, Any]) -> bool:
@@ -392,9 +449,9 @@ def bucket_classification(
     - DB hits may use bare Claude ``agree``; imagery-only requires
       ``agree_crop`` or ``agree_localize`` unless the Gemini tower lock applies
     - imagery-only (no DB hit) uses stricter site/cell confidence bars
-    - NAIP-only imagery never writes rooftops; imagery-only towers also
-      never write from NAIP. DB-hit Gemini towers at >= 0.9 may write
-      from NAIP or Vert (obliques skipped)
+    - NAIP rooftops write only when cellular gear is certain (conf ≥ 0.95,
+      named gear kind, unhedged evidence, asset box). Gemini towers at >= 0.9
+      may write from NAIP with or without a DB hit
     - rooftops never verify as NAIP
     - update coords prefer FCC/TowerSource when present
     """
@@ -426,26 +483,21 @@ def bucket_classification(
             return _holdout(BUCKET_ROOFTOP, reason, classified)
         return _holdout(BUCKET_OTHER, reason, classified)
 
-    # NAIP-only: rooftops never write. Imagery-only towers never write.
-    # DB-hit Gemini towers at >= 0.9 may write (FCC/TS already anchors).
+    # NAIP: rooftops write only when cellular gear is certain. Gemini towers
+    # at >= 0.9 may write.
     if img_bucket == "naip":
         if site_type_raw == "rooftop":
-            return _holdout(BUCKET_ROOFTOP, "rooftop_naip_only_forbidden", classified)
-        if imagery_only or not _tower_gemini_high_conf_ok(classified):
+            if not _rooftop_cell_certain(classified):
+                return _holdout(
+                    BUCKET_ROOFTOP, "rooftop_not_certain_on_naip", classified
+                )
+        elif not _tower_gemini_high_conf_ok(classified):
             return _holdout(BUCKET_OTHER, "tower_naip_only_forbidden", classified)
 
     if site_type_raw == "tower" and not cell_equipment_confirmed(
         classified.get("cell_equipment")
     ):
         return _holdout(BUCKET_OTHER, "tower_no_cell_equipment", classified)
-
-    # Imagery-only towers: Vert-only + Gemini-alone is how nearby rooftop/pole
-    # false positives reach Ready (e.g. Green Valley Pkwy pin offset).
-    if site_type_raw == "tower" and imagery_only:
-        if not _rooftop_oblique_imagery_ok(classified):
-            return _holdout(BUCKET_OTHER, "tower_needs_nearmap_obliques", classified)
-        if not _has_asset_box(classified):
-            return _holdout(BUCKET_OTHER, "tower_needs_asset_box", classified)
 
     # Auto-apply: Claude hard-agree, or Gemini already locked the tower at >= 0.9.
     tower_gemini_locked = _tower_gemini_high_conf_ok(classified)
@@ -477,35 +529,38 @@ def bucket_classification(
         return _holdout(BUCKET_OTHER, "unmapped_site_type", classified)
 
     if site_type_raw == "rooftop":
-        # Imagery-only uses a higher cell-conf floor unless Gemini+Claude hard-agree.
-        if imagery_only and _dual_model_hard_agree(classified):
-            cell_min = MIN_ROOFTOP_CELL_CONFIDENCE
-        elif imagery_only:
-            cell_min = MIN_IMAGERY_ONLY_CELL_CONFIDENCE
-        else:
-            cell_min = MIN_ROOFTOP_CELL_CONFIDENCE
-        if not _rooftop_cell_confidence_ok(classified, minimum=cell_min):
-            return _holdout(BUCKET_ROOFTOP, "rooftop_low_cell_confidence", classified)
-        if not _cell_gear_kind_ok(classified):
-            return _holdout(BUCKET_ROOFTOP, "rooftop_no_telecom_evidence", classified)
-        if not _rooftop_oblique_imagery_ok(classified):
-            return _holdout(BUCKET_ROOFTOP, "rooftop_needs_nearmap_obliques", classified)
-        # Auto-apply airtight: Claude hard-agree required (crop/localize agree).
-        if not _dual_model_hard_agree(classified):
-            return _holdout(BUCKET_ROOFTOP, "rooftop_needs_dual_model_cell", classified)
-        if imagery_only and not _dual_model_localized_agree(classified):
-            return _holdout(
-                BUCKET_ROOFTOP,
-                "imagery_only_needs_crop_or_localize_agree",
-                classified,
-            )
-        if not _has_asset_box(classified):
-            return _holdout(BUCKET_ROOFTOP, "rooftop_needs_asset_box", classified)
-        if not _rooftop_localization_box_ok(
-            classified, require_localized=imagery_only
-        ):
-            return _holdout(BUCKET_ROOFTOP, "rooftop_needs_oblique_asset_box", classified)
-        if not _view_evidence_consistent(classified):
+        rooftop_certain = _rooftop_cell_certain(classified)
+        if not rooftop_certain:
+            # Imagery-only uses a higher cell-conf floor unless Gemini+Claude hard-agree.
+            if imagery_only and _dual_model_hard_agree(classified):
+                cell_min = MIN_ROOFTOP_CELL_CONFIDENCE
+            elif imagery_only:
+                cell_min = MIN_IMAGERY_ONLY_CELL_CONFIDENCE
+            else:
+                cell_min = MIN_ROOFTOP_CELL_CONFIDENCE
+            if not _rooftop_cell_confidence_ok(classified, minimum=cell_min):
+                return _holdout(BUCKET_ROOFTOP, "rooftop_low_cell_confidence", classified)
+            if not _cell_gear_kind_ok(classified):
+                return _holdout(BUCKET_ROOFTOP, "rooftop_no_telecom_evidence", classified)
+            if not _rooftop_oblique_imagery_ok(classified):
+                return _holdout(BUCKET_ROOFTOP, "rooftop_needs_nearmap_obliques", classified)
+            if not _dual_model_hard_agree(classified):
+                return _holdout(BUCKET_ROOFTOP, "rooftop_needs_dual_model_cell", classified)
+            if imagery_only and not _dual_model_localized_agree(classified):
+                return _holdout(
+                    BUCKET_ROOFTOP,
+                    "imagery_only_needs_crop_or_localize_agree",
+                    classified,
+                )
+            if not _has_asset_box(classified):
+                return _holdout(BUCKET_ROOFTOP, "rooftop_needs_asset_box", classified)
+            if not _rooftop_localization_box_ok(
+                classified, require_localized=imagery_only
+            ):
+                return _holdout(BUCKET_ROOFTOP, "rooftop_needs_oblique_asset_box", classified)
+            if not _view_evidence_consistent(classified):
+                return _holdout(BUCKET_ROOFTOP, "rooftop_view_evidence_mismatch", classified)
+        elif not _view_evidence_consistent(classified):
             return _holdout(BUCKET_ROOFTOP, "rooftop_view_evidence_mismatch", classified)
         if far_offset is not None:
             limit = _effective_max_asset_offset_m()
@@ -544,8 +599,12 @@ def bucket_classification(
     verified_source = verified_source_for_match(
         match_source, classified=classified
     )
-    # Rooftops must never stamp Verified_Site_Source__c = NAIP.
-    if site_type_raw == "rooftop" and verified_source == VERIFIED_SITE_SOURCE_NAIP:
+    # Uncertain rooftops must never stamp Verified_Site_Source__c = NAIP.
+    if (
+        site_type_raw == "rooftop"
+        and verified_source == VERIFIED_SITE_SOURCE_NAIP
+        and not _rooftop_cell_certain(classified)
+    ):
         return _holdout(BUCKET_ROOFTOP, "rooftop_naip_verified_forbidden", classified)
 
     return {

@@ -111,6 +111,26 @@ def classify_site_imagery(
     naip_chip_m = (naip_meta or {}).get("naip_chip_m") or ac.CHIP_SIZE_M
 
     skip_paid_imagery = bool(ac.NAIP_ONLY)
+    if not skip_paid_imagery:
+        try:
+            from enrichment.osm_prefilter import (
+                lookup_osm_features,
+                osm_suggests_empty_chip,
+            )
+
+            osm_info = lookup_osm_features(lat, lon)
+            if osm_info.get("communication_tower"):
+                db_backed = True
+                if verbose:
+                    progress.result("OSM communication tower nearby")
+            if osm_suggests_empty_chip(osm_info) and not db_backed:
+                skip_paid_imagery = True
+                if verbose:
+                    progress.result("OSM: no building/tower — skip Nearmap")
+        except Exception as exc:  # noqa: BLE001
+            if verbose:
+                progress.warn(f"OSM prefilter failed: {exc}")
+
     nearmap_views: dict = {}
     nearmap_date = None
     if not skip_paid_imagery and not ac.NEARMAP_TIERED:

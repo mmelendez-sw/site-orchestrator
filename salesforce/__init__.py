@@ -1,1 +1,1 @@
-"""Salesforce integration: site creation and duplicate audit logging."""
+"""Salesforce Site__c query and update."""

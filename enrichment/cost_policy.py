@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from typing import Any, Sequence
 
-from dedupe.spatial import haversine_meters
+from enrichment.geo import haversine_meters
 from enrichment.constants import PROXIMITY_AMBIGUITY_GAP_M, PROXIMITY_CONFIDENT_M
 from enrichment.mssql import ProximityHit
 

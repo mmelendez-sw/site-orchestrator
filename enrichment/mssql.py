@@ -9,7 +9,7 @@ import struct
 from dataclasses import dataclass
 from typing import Any, Iterable, Sequence
 
-from dedupe.spatial import haversine_meters
+from enrichment.geo import haversine_meters
 
 from enrichment.constants import (
     BBOX_BUFFER_DEG,
@@ -214,7 +214,7 @@ def connect_mssql(connection_string: str | None = None):
 
     conn_str = connection_string or build_odbc_connection_string()
     use_token = connection_string is None and not resolve_authentication()
-    logger.info("Connecting to Azure SQLâ€¦")
+    logger.info("Connecting to Azure SQL...")
     if use_token:
         return pyodbc.connect(
             conn_str,

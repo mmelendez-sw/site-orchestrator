@@ -1769,9 +1769,6 @@ def confirm_rooftop_cell_with_claude(
 
 # ----------------------------- geocoding ------------------------------------
 
-from ingest.geocoder import geocode_address
-
-
 def _has_coordinates(row) -> bool:
     lat, lon = row.get("lat"), row.get("lon")
     if lat is None or lon is None:
@@ -1802,6 +1799,13 @@ def resolve_row_coordinates(row) -> tuple[float, float, dict]:
     if not address:
         raise ValueError(
             "each row needs lat+lon or a non-empty address column")
+
+    try:
+        from ingest.geocoder import geocode_address
+    except ImportError as exc:
+        raise ValueError(
+            "address geocoding requires ingest.geocoder; pass lat+lon instead"
+        ) from exc
 
     try:
         geo = geocode_address(address)

@@ -1,4 +1,4 @@
-"""Enrichment pipeline: SF blank Site_Type → FCC/TowerSource → Nearmap/AI → CSVs."""
+"""Enrichment pipeline: SF blank Site_Type → FCC/TowerSource → imagery classify → CSVs."""
 
 from __future__ import annotations
 
@@ -9,12 +9,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
-from enrichment.audit import write_spot_audit_package
 from enrichment.bucketing import (
     bucket_classification,
     imagery_bucket,
     verified_source_for_match,
 )
+from enrichment.naip_classify import classify_site_imagery
 from enrichment.constants import (
     APPLY_LOG_CSV,
     BUCKET_OTHER,
@@ -23,26 +23,20 @@ from enrichment.constants import (
     CANDIDATE_CSV,
     DETAIL_CSV,
     HOLDOUT_CSV,
-    HOLDOUT_TRIAGE_MD,
     MATCH_SOURCE_NONE,
     PROXIMITY_MAX_M,
-    REVIEW_DIR_NAME,
-    SPOT_AUDIT_HTML,
 )
 from enrichment.cost_policy import (
     find_cluster_match,
     should_auto_skip_classify,
 )
 from enrichment.mssql import connect_mssql, describe_match, find_proximity_hit
-from enrichment.naip_classify import classify_site_imagery
 from enrichment.outputs import (
     CANDIDATE_COLUMNS,
     DETAIL_COLUMNS,
     HOLDOUT_COLUMNS,
     write_csv,
 )
-from enrichment.pin_address import reconcile_pin_to_address
-from enrichment.review import load_approved_ids, write_review_package
 from enrichment import progress
 from enrichment.sf_ops import (
     apply_updates_idempotent,
@@ -51,14 +45,17 @@ from enrichment.sf_ops import (
     query_blank_site_type_sites,
     query_sites_by_ids,
 )
-from enrichment.triage import write_holdout_triage
+from paths import runs_dir
 
 
 logger = logging.getLogger(__name__)
 
 
 def default_run_dir(root: Path | None = None) -> Path:
-    base = root or Path("runs")
+    from paths import ensure_data_layout
+
+    ensure_data_layout()
+    base = root or runs_dir()
     stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
     return base / f"{stamp}_sf_enrichment"
 
@@ -78,8 +75,14 @@ def run_enrichment(
     states: list[str] | None = None,
     llm_classified: bool = True,
     verbose: bool = True,
+    apply: bool = True,
+    dequeue_holdouts: bool = True,
 ) -> dict[str, Any]:
-    """Run proximity + NAIP enrichment and write candidate/holdout CSVs."""
+    """Run proximity + NAIP/Nearmap/Claude enrichment, write CSVs, auto-apply.
+
+    Certain rooftops and high-conf towers become Salesforce updates.
+    Remaining rows dequeue (LLM_Classified=false, LLM_Holdout=true).
+    """
     run_dir.mkdir(parents=True, exist_ok=True)
     chip_dir = run_dir / "chips"
     progress.reset_run_timer()
@@ -186,82 +189,65 @@ def run_enrichment(
             for r in detail_rows
             if r.get("bucket") in {BUCKET_ROOFTOP, BUCKET_OTHER}
         ]
-        rooftop_holdouts = [
-            r for r in detail_rows if r.get("bucket") == BUCKET_ROOFTOP
-        ]
         if verbose:
             progress.stage("4/4 WRITE CSVs", str(run_dir.name))
         write_csv(run_dir / CANDIDATE_CSV, candidates, CANDIDATE_COLUMNS)
         write_csv(run_dir / HOLDOUT_CSV, holdouts, HOLDOUT_COLUMNS)
-        review_dir = write_review_package(
-            run_dir,
-            candidates=candidates,
-            rooftop_holdouts=rooftop_holdouts,
-        )
-        triage = write_holdout_triage(run_dir, detail_rows)
-        audit_dir = write_spot_audit_package(run_dir, candidates)
         if verbose:
             progress.result(
                 f"updates={len(candidates)} holdouts={len(holdouts)} total={len(detail_rows)}"
             )
-            progress.result(f"review package → {review_dir}")
-            progress.result(
-                f"holdout triage → {run_dir / HOLDOUT_TRIAGE_MD} "
-                f"(focus={len(triage.get('weekly_focus') or [])})"
-            )
-            progress.result(f"spot audit → {audit_dir / SPOT_AUDIT_HTML}")
 
         summary = {
             "run_dir": str(run_dir),
-            "review_dir": str(review_dir),
             "total": len(detail_rows),
             "db_hits": sum(
                 1 for r in detail_rows if r.get("match_source") not in ("", MATCH_SOURCE_NONE)
             ),
             "potential_updates": len(candidates),
-            "db_backed_candidates": triage.get("db_backed_candidates", 0),
-            "imagery_only_candidates": triage.get("imagery_only_candidates", 0),
             "holdout_rooftop": sum(1 for r in holdouts if r.get("bucket") == BUCKET_ROOFTOP),
             "holdout_other": sum(1 for r in holdouts if r.get("bucket") == BUCKET_OTHER),
-            "holdout_triage_focus": [
-                f"{x.get('reason')}={x.get('count')}"
-                for x in (triage.get("weekly_focus") or [])
-            ],
             "errors": sum(1 for r in detail_rows if r.get("error")),
             "imagery_naip_only": sum(
                 1 for r in detail_rows if r.get("imagery_used") == "naip"
-            ),
-            "imagery_nearmap_vert": sum(
-                1 for r in detail_rows if r.get("imagery_used") == "nearmap_vert"
-            ),
-            "imagery_nearmap_oblique": sum(
-                1 for r in detail_rows if r.get("imagery_used") == "nearmap_oblique"
             ),
             "gemini_sites": sum(
                 1
                 for r in detail_rows
                 if str(r.get("primary_model") or "").lower() == "gemini"
             ),
-            "claude_escalations": sum(
-                1
-                for r in detail_rows
-                if str(r.get("escalation_model") or "").lower() == "claude"
-            ),
         }
+        if apply:
+            apply_rows = list(candidates)
+            if dequeue_holdouts:
+                apply_rows.extend(
+                    r
+                    for r in detail_rows
+                    if r.get("bucket") != BUCKET_POTENTIAL_UPDATE
+                )
+            if apply_rows:
+                batch_csv = run_dir / "_apply_batch.csv"
+                write_csv(batch_csv, apply_rows, DETAIL_COLUMNS)
+                summary["apply"] = apply_candidate_csv(
+                    sf_client=sf_client,
+                    candidate_csv=batch_csv,
+                    run_dir=run_dir,
+                    apply=True,
+                    verbose=verbose,
+                )
+            else:
+                summary["apply"] = {
+                    "total": 0,
+                    "success": 0,
+                    "dequeued_holdouts": 0,
+                    "failed": 0,
+                    "apply": True,
+                }
         (run_dir / "summary.json").write_text(
             json.dumps(summary, indent=2), encoding="utf-8"
         )
         if verbose:
             progress.dump_summary(summary)
-            if candidates:
-                progress.step(
-                    "Next (review path): open review/index.html, then "
-                    f"--apply-reviewed --run-dir {run_dir}\n"
-                    "Or re-run with --apply --dequeue-holdouts to auto-push "
-                    "Claude hard-agree candidates.\n"
-                    f"Spot-audit sample: {audit_dir / SPOT_AUDIT_HTML}\n"
-                    f"Holdout triage: {run_dir / HOLDOUT_TRIAGE_MD}"
-                )
         return summary
     finally:
         if own_sql:
@@ -324,6 +310,7 @@ def _process_site(
         "gemini_cell_equipment": "",
         "claude_cell_equipment": "",
         "cell_models_agree": "",
+        "dual_model_resolution": "",
         "classification_stage": "",
         "nearmap_tier": "",
         "nearmap_views": "",
@@ -361,43 +348,11 @@ def _process_site(
     base["sf_lng"] = sf_lng
     if verbose:
         progress.step(f"SF pin: {sf_lat:.6f}, {sf_lng:.6f}")
-        progress.stage("PIN↔ADDRESS")
-    recon = reconcile_pin_to_address(site, sf_lat, sf_lng)
-    base["address_query"] = recon.get("address_query") or ""
-    base["address_lat"] = recon.get("address_lat") if recon.get("address_lat") != "" else ""
-    base["address_lng"] = recon.get("address_lng") if recon.get("address_lng") != "" else ""
-    base["address_geocode_source"] = recon.get("address_geocode_source") or ""
-    base["address_matched"] = recon.get("address_matched") or ""
-    base["pin_address_offset_m"] = (
-        recon.get("pin_address_offset_m")
-        if recon.get("pin_address_offset_m") != ""
-        else ""
-    )
-    base["pin_address_mismatch"] = bool(recon.get("pin_address_mismatch"))
-    if verbose:
-        if base["pin_address_offset_m"] != "":
-            flag = "MISMATCH → classify at address" if base["pin_address_mismatch"] else "ok"
-            progress.result(
-                f"pin↔address {base['pin_address_offset_m']} m "
-                f"({recon.get('address_geocode_source') or '—'}) · {flag}"
-            )
-        else:
-            progress.result(
-                f"address geocode skipped ({recon.get('address_geocode_source') or '—'})"
-            )
 
     if verbose:
         progress.stage("PROXIMITY", f"≤{max_m:g} m")
-    addr_lat = (
-        float(recon["address_lat"])
-        if recon.get("address_lat") not in ("", None)
-        else None
-    )
-    addr_lng = (
-        float(recon["address_lng"])
-        if recon.get("address_lng") not in ("", None)
-        else None
-    )
+    addr_lat = None
+    addr_lng = None
     try:
         hit = find_proximity_hit(
             cursor,
@@ -437,25 +392,10 @@ def _process_site(
             )
     else:
         db_lat = db_lng = None
-        # Pin far from geocoded address → pull Nearmap/NAIP on the address
-        # (building rooftop), not the parking-lot / ROW pin.
-        if (
-            base["pin_address_mismatch"]
-            and recon.get("address_lat") != ""
-            and recon.get("address_lng") != ""
-        ):
-            classify_lat = float(recon["address_lat"])
-            classify_lng = float(recon["address_lng"])
-            base["classify_coord_source"] = "geocoded_address"
-            if verbose:
-                progress.result(
-                    "no DB hit · pin/address mismatch → classify on geocoded address"
-                )
-        else:
-            classify_lat, classify_lng = sf_lat, sf_lng
-            base["classify_coord_source"] = "sf_pin"
-            if verbose:
-                progress.result("no DB hit → classify on SF pin")
+        classify_lat, classify_lng = sf_lat, sf_lng
+        base["classify_coord_source"] = "sf_pin"
+        if verbose:
+            progress.result("no DB hit → classify on SF pin")
 
     base["classify_lat"] = classify_lat
     base["classify_lng"] = classify_lng
@@ -506,11 +446,16 @@ def _process_site(
             )
             base["cell_gear_kind"] = classified.get("cell_gear_kind") or ""
             base["site_evidence"] = classified.get("site_evidence") or ""
+            base["cell_models_agree"] = classified.get("cell_models_agree", "")
+            base["dual_model_resolution"] = classified.get("dual_model_resolution") or ""
             base["classification_stage"] = "cluster_reuse"
             base["nearmap_tier"] = classified.get("nearmap_tier") or ""
             base["nearmap_views"] = classified.get("nearmap_views") or ""
             base["imagery_used"] = imagery_bucket(classified)
             base["primary_model"] = classified.get("primary_model") or ""
+            base["escalation_model"] = classified.get("escalation_model") or ""
+            base["asset_box_2d"] = classified.get("asset_box_2d") or ""
+            base["asset_view"] = classified.get("asset_view") or ""
             decision = bucket_classification(
                 match_source=base["match_source"],
                 classified=classified,

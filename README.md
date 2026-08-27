@@ -1,32 +1,27 @@
 # Site Orchestrator
 
-End-to-end pipeline for wireless site sales intelligence: discover candidate sites from open permit data, normalize and geocode them, dedupe against Salesforce, classify from aerial imagery, and load net-new records.
+Salesforce enrichment: pull blank `Site_Type__c` sites, snap to FCC/TowerSource, classify from NAIP + optional Nearmap with Gemini/Claude (OSM prefilter before paid imagery), then write qualifying results back to Salesforce in the same run.
+
+There is no upload-template or CSV-import step. Run CSVs under `../site-orchestrator-data/runs/` are an audit log.
 
 ```
-source → ingest → dedupe → classifier → salesforce
+python -m enrichment
 ```
 
-## Repository layout
+Set `APPLY=0` to classify and write CSVs without Salesforce updates. Optional env: `STATES`, `LIMIT`, `IDS`, `RUN_DIR`, `VERBOSE`.
+
+## Layout
 
 ```
 site-orchestrator/
-├── orchestrator.py          # CSV/permits → dedupe → classify → SF create
-├── tower_snap.py            # FCC/TowerSource proximity helpers
-├── enrichment/              # SF pull → proximity → Nearmap/AI → SF update
-├── requirements.txt
-├── .env.example
-├── source/                  # permit discovery (gov data, CSV/JSON, scripts)
-├── ingest/                  # geocode + normalize to canonical records
-├── dedupe/                  # Salesforce spatial + fuzzy dedupe
-├── classifier/              # NAIP/Nearmap imagery + Gemini/Claude classification
-├── salesforce/              # create/update Site__c
-├── scripts/                 # one-off upload/retry helpers
-├── data/                    # input CSVs (gitignored)
-├── runs/                    # runtime outputs (gitignored)
-└── chips/                   # saved imagery chips (gitignored)
+├── enrichment/     # pull → proximity → classify → apply
+├── classifier/     # NAIP + Nearmap imagery, Gemini + Claude, OSM prefilter
+├── salesforce/     # auth + Site_Type picklist mapping
+├── paths.py        # sibling data folder
+└── requirements.txt
 ```
 
-Classifier-specific docs live in [`classifier/docs/`](classifier/docs/) (configuration, workflow guides, diagrams).
+CSVs, `runs/`, and `chips/` live in **`../site-orchestrator-data`** (not in git). Override with `SITE_ORCHESTRATOR_DATA`.
 
 ## Setup
 
@@ -37,134 +32,17 @@ pip install -r requirements.txt
 copy .env.example .env   # fill in credentials
 ```
 
-Key environment variables:
+Also install `pyodbc` (and `azure-identity` if you use Entra token auth) for FCC/TowerSource proximity.
 
-| Variable | Used by | Purpose |
-|----------|---------|---------|
-| `SF_USERNAME`, `SF_PASSWORD`, `SF_SECURITY_TOKEN` | dedupe, salesforce | Salesforce API auth |
-| `GEOCODER`, `GEOCODER_USER_AGENT` | ingest, classifier | US Census + Nominatim geocoding (free, no API key) |
-| `ANTHROPIC_API_KEY` | classifier | Claude vision classification |
-| `NEARMAP_API_KEY` | classifier | Optional high-res oblique imagery |
+## Classify path
 
-See [`.env.example`](.env.example) for the full list.
+1. **NAIP + Gemini** — always, unless a unique FCC/TowerSource hit ≤ 25 m skips imagery.
+2. **OSM Overpass** — cheap prefilter before Nearmap when the NAIP pass is inconclusive.
+3. **Nearmap** vert + obliques — rooftops and towers that still need high-res sides.
+4. **Claude** — dual-model cell confirm (skipped for high-conf Gemini towers ≥ 0.9, and below 0.7 site confidence).
 
-## Pipeline stages
+## What it writes
 
-### 1. Source — discover candidate sites
-
-Generate site lists from open permit portals, Python scripts, or Claude-generated CSV/JSON. Geographic scope accepts **country, state, county, city, and zip codes**.
-
-```powershell
-# List adapters compatible with a scope
-python -m source.runner --list-sources --state WI --city Milwaukee
-
-# Milwaukee open-data permits → assets CSV
-python -m source.runner milwaukee_permits --state WI --city Milwaukee --output-csv data/WI_assets.csv
-
-# Any hand-built or AI-generated file
-python -m source.runner file --input data/candidates.csv --state WI --zip 53202,53203 --output-csv data/WI_assets.csv
-
-# Export JSON for Claude review
-python -m source.runner file --input data/candidates.json --output-json data/candidates.json
-```
-
-**Registered sources:** `milwaukee_permits`, `file` (CSV/JSON). Add new jurisdictions by implementing `BaseSourceAdapter` in `source/adapters/`.
-
-### 2. Ingest — normalize records
-
-Each raw record is geocoded (if needed) via US Census with Nominatim fallback, reverse-geocoded (if needed), or validated for address/coordinate alignment. Output is a canonical dict: `lat`, `lng`, `address`, `zip_code`, `permit_metadata`.
-
-### 3. Dedupe — match against Salesforce
-
-Before matching, the orchestrator **prefetches** Salesforce candidates for the entire batch:
-
-1. All **zip codes** found in the dataset
-2. One bounding box from the dataset **min/max lat/lng**, expanded by **±250m** (dataset-wide, not per site)
-
-SOQL uses `Site_Latitude__c`, `Site_Longitude__c`, `Site_Address__c`, and `Site_Zip_Code__c`. Before fuzzy matching, each incoming record gets an **urbanicity search radius** from its zip population (`data/zip_populations.csv`):
-
-| Tier | ZCTA population | Search radius |
-|------|-----------------|-----------------|
-| Urban | ≥ 25,000 | 100 m |
-| Suburban | 2,500 – 24,999 | 100 m |
-| Rural | < 2,500 | 250 m |
-
-Salesforce candidates inside that radius are scored with a combined metric: **65% address fuzzy match + 35% proximity** (100 at the same point, 0 at the radius edge). When `address_score ≥ 90`, the resolver uses **`address_exact_override`**: `combined_score` is pinned to the address score and proximity is ignored. Otherwise `scoring_mode=weighted_blend` applies the 65/35 formula. Rows exported in `dedupe_results.csv` include `scoring_mode`, `status_resolver`, `status_recommended`, and `top_candidates` (when the prefilter pool is noisy).
-
-| Status | Meaning |
-|--------|---------|
-| `duplicate` | High-confidence match — logged, skipped |
-| `review` | Medium-confidence match — written to `runs/review_log.csv` |
-| `net_new` | No match — proceeds to classification |
-
-### 4. Classifier — aerial imagery classification
-
-Net-new records are classified using NAIP (+ optional Nearmap) imagery and Claude vision. Runs standalone or via the orchestrator.
-
-```powershell
-python classifier/asset_classifier.py -i data/WI_assets.csv
-```
-
-### 5. Salesforce — load net-new sites
-
-Classified net-new records are mapped to the same column layout as the manual Data Loader template and written to `runs/<run>/sf_upload.csv` (plus `sf_upload_picklists.txt` for valid picklist values). Live upload uses `Site__c` field mappings in `salesforce/field_map.py`.
-
-```powershell
-# Dedupe only → export upload CSV for net-new rows
-python orchestrator.py --source file --input data/all_DC_assets.csv --state DC --dry-run
-
-# Full pipeline → classify, export sf_upload.csv, then API create (when not dry-run)
-python orchestrator.py --source file --input data/WI_assets.csv --state WI --classify
-
-# Build upload CSV from an existing dedupe run
-python scripts/export_sf_upload.py --input runs/dedupe_2026-06-18_155235/dedupe_results.csv
-```
-
-### 6. Salesforce enrichment (update existing sites)
-
-Pull existing `Site__c` rows (e.g. NFL leasing source + blank Site Type), run FCC/TowerSource proximity + Nearmap/bifurcated classify, write candidate/holdout CSVs. Add `--apply` only when ready to update Salesforce.
-
-```powershell
-# Classify only (no SF writes)
-python -m enrichment --limit 25 -v
-
-# Classify + apply updates
-python -m enrichment --limit 25 --apply -v
-```
-
-## Run the full orchestrator
-
-```powershell
-# Source → dedupe only
-python orchestrator.py --source milwaukee_permits --state WI --city Milwaukee
-
-# Source → dedupe → classify → Salesforce load
-python orchestrator.py --source file --input data/WI_assets.csv --state WI --classify
-
-# Dedupe an in-memory list from Python
-python -c "from orchestrator import run_from_source; run_from_source('milwaukee_permits', classify=False)"
-```
-
-## Data files
-
-Input CSVs belong in `data/` (gitignored). Classifier expects:
-
-```csv
-id,address,label,input_confidence
-wi_001,"100 E PLEASANT ST, MILWAUKEE, WI 53212",WI,high
-```
-
-Runtime outputs (`runs/`, `chips/`, `results.csv`) are gitignored and stay local.
-
-## Branch workflow
-
-- **`main`** — stable
-- **`nearmap-run`** — Nearmap/bifurcated classify + enrichment (ops candidate)
-- **`salesforce-update`** — prior enrichment/SF-update work
-- **`dev`** — active development
-
-## Further reading
-
-- [`classifier/docs/README.md`](classifier/docs/README.md) — classifier setup and run details
-- [`classifier/docs/CONFIGURATION.md`](classifier/docs/CONFIGURATION.md) — pipeline flags and model settings
-- [`classifier/docs/WORKFLOW_GUIDE.md`](classifier/docs/WORKFLOW_GUIDE.md) — operational workflow
+- **Towers:** Gemini tower + cell at site confidence ≥ 0.9 auto-apply (imagery-only allowed). Claude can confirm weaker towers.
+- **Rooftops:** Nearmap obliques + dual-model agreement, or NAIP-only when site and cell confidence ≥ 0.95 with named gear, unhedged evidence, and an asset box. Otherwise holdout and dequeue (`LLM_Classified=false`, `LLM_Holdout=true`).
+- Unique FCC/TowerSource hit ≤ 25 m skips imagery and still updates coords + verified source.

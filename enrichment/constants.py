@@ -85,18 +85,6 @@ CANDIDATE_CSV = "potential_sf_updates.csv"
 HOLDOUT_CSV = "holdout_rooftop_other.csv"
 DETAIL_CSV = "enrichment_detail.csv"
 APPLY_LOG_CSV = "sf_update_apply_log.csv"
-REVIEW_DIR_NAME = "review"
-REVIEW_MANIFEST_CSV = "review_manifest.csv"
-REVIEW_INDEX_HTML = "index.html"
-SPOT_AUDIT_HTML = "spot_audit.html"
-SPOT_AUDIT_CSV = "spot_audit.csv"
-HOLDOUT_TRIAGE_JSON = "holdout_triage.json"
-HOLDOUT_TRIAGE_MD = "holdout_triage.md"
-
-# Post-apply / post-classify spot check of ready candidates (deterministic sample).
-SPOT_AUDIT_RATE = float(os.environ.get("SPOT_AUDIT_RATE", "0.10"))
-SPOT_AUDIT_MIN = int(os.environ.get("SPOT_AUDIT_MIN", "3"))
-SPOT_AUDIT_MAX = int(os.environ.get("SPOT_AUDIT_MAX", "25"))
 
 # Medium/high confidence required for automatic update candidacy (DB hits).
 MIN_UPDATE_CONFIDENCE = 0.6
@@ -105,18 +93,26 @@ MIN_UPDATE_CONFIDENCE = 0.6
 MIN_ROOFTOP_CELL_CONFIDENCE = 0.75
 
 # Stricter bars when there is no FCC/TowerSource proximity hit.
-# Slightly below prior 0.85 so strong Nearmap rooftops are not lost on conf alone.
+# Slightly below prior 0.85 so strong NAIP rooftops are not lost on conf alone.
 MIN_IMAGERY_ONLY_SITE_CONFIDENCE = 0.80
 MIN_IMAGERY_ONLY_CELL_CONFIDENCE = 0.80
 
-# When Gemini cell conf is in this band, Claude confirmation is mandatory
-# before a rooftop SF write (also required whenever Gemini cell=true).
-MIN_ENSEMBLE_CELL_CONFIDENCE = 0.85
-
-# Skip Claude dual-model for towers when Gemini site_confidence is at/above this.
+# Skip dual-model for towers when Gemini site_confidence is at/above this.
 # Must match classifier.asset_classifier.GEMINI_SOLO_CELL_CONF default.
 GEMINI_TOWER_SKIP_CLAUDE_CONF = float(
     os.environ.get("GEMINI_SOLO_CELL_CONF", "0.90")
+)
+
+# NAIP rooftop auto-apply: both site and cell confidence must clear this, plus
+# a named telecom gear kind, unhedged evidence, and an asset box.
+ROOFTOP_CERTAIN_CONF = float(os.environ.get("ROOFTOP_CERTAIN_CONF", "0.95"))
+
+DISCERNIBLE_CELL_GEAR_KINDS = (
+    "sector_panel",
+    "facade_mount",
+    "microwave",
+    "rru",
+    "parapet_mast",
 )
 
 CELL_GEAR_KINDS = (

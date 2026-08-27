@@ -6,7 +6,8 @@ __pycache__/
 .DS_Store
 .cursor/
 
-# Runtime / local artifacts
+# Runtime / local artifacts live in ../site-orchestrator-data
+# (see paths.py / SITE_ORCHESTRATOR_DATA). Ignore leftovers in this repo.
 runs/
 chips/
 results.csv
@@ -14,11 +15,13 @@ results.csv
 *_results_detail.csv
 *_results.xlsx
 *_EXECUTIVE_SUMMARY.md
+data/
 data/*.csv
 
 # Root-level local dumps (keep tree clean for EC2/on-prem clones)
 /*.csv
 !requirements.txt
 
-# Architecture diagrams (local only — edit/regenerate outside git)
+# Architecture diagrams (local only)
 classifier/docs/diagrams/
+

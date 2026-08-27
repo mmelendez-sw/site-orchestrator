@@ -1,4 +1,4 @@
-"""Salesforce query + update helpers for enrichment (additive; create path untouched)."""
+"""Salesforce query + update helpers for enrichment."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import time
 from typing import Any, Iterable, Sequence
 
 from salesforce.field_map import OBJECT_NAME
-from salesforce.sf_client import SalesforceClient, _is_missing
+from salesforce.sf_client import SalesforceClient
 
 from enrichment.constants import (
     DEFAULT_OWNER_FILTER,
@@ -440,6 +440,22 @@ def apply_updates_idempotent(
                 )
         results.append(entry)
     return results
+
+
+def _is_missing(value: Any) -> bool:
+    """True for None/blank/NaN — never send these in a Salesforce JSON payload."""
+    if value is None:
+        return True
+    if isinstance(value, float):
+        try:
+            return value != value  # NaN
+        except Exception:
+            return False
+    if isinstance(value, str) and not value.strip():
+        return True
+    if isinstance(value, str) and value.strip().lower() == "nan":
+        return True
+    return False
 
 
 def _optional_float(value: Any) -> float | None:
