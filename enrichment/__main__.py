@@ -1,7 +1,7 @@
 """python -m enrichment
 
 Salesforce blank Site_Type → FCC/TowerSource → NAIP/Nearmap + Gemini/Claude → auto-apply.
-Holdouts dequeue. Optional env: STATES, LIMIT, IDS, APPLY, RUN_DIR, VERBOSE.
+Holdouts dequeue. Optional env: STATES, LIMIT, IDS, CARRIER_LIKE, LLM_CLASSIFIED, APPLY, RUN_DIR, VERBOSE.
 Set APPLY=0 to classify without Salesforce writes.
 """
 
@@ -21,6 +21,7 @@ if str(ROOT) not in sys.path:
 load_dotenv(ROOT / ".env")
 
 from enrichment.pipeline import default_run_dir, run_enrichment  # noqa: E402
+from enrichment.sf_ops import parse_carrier_like  # noqa: E402
 from paths import ensure_data_layout, runs_dir  # noqa: E402
 from salesforce.sf_client import SalesforceClient  # noqa: E402
 
@@ -68,6 +69,8 @@ def main() -> int:
         limit=int(limit_raw) if limit_raw else None,
         site_ids=_csv_env("IDS"),
         states=states,
+        carrier_like=parse_carrier_like(os.environ.get("CARRIER_LIKE")),
+        llm_classified=_flag("LLM_CLASSIFIED", "0"),
         apply=_flag("APPLY", "1"),
         verbose=_flag("VERBOSE"),
     )

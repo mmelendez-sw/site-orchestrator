@@ -37,6 +37,19 @@ def is_enrichment_payload(payload: dict[str, Any] | None) -> bool:
     return bool(ENRICHMENT_FIELDS.intersection(payload))
 
 
+def parse_carrier_like(raw: str | None, *, default: str = "NFL") -> str | None:
+    """Carrier_Leasing_Source__c LIKE needle from env/CLI.
+
+    Unset/blank → ``default`` (NFL). ``none`` / ``all`` / ``*`` omit the filter.
+    """
+    text = "" if raw is None else str(raw).strip()
+    if not text:
+        text = default
+    if text.lower() in {"none", "all", "*"}:
+        return None
+    return text
+
+
 def _soql_quote(value: str) -> str:
     return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
 
@@ -52,15 +65,15 @@ def build_blank_site_type_query(
     fields: Sequence[str] = SF_QUERY_FIELDS,
     carrier_like: str | None = "NFL",
     states: Sequence[str] | None = None,
-    llm_classified: bool = True,
+    llm_classified: bool = False,
 ) -> str:
     """SOQL for blank Site_Type__c sites in the enrichment queue.
 
     `carrier_like` filters Carrier_Leasing_Source__c with LIKE '%value%'.
     Pass None/"" to skip the carrier filter (e.g. non-NFL test batches).
     `states` filters Site_State__c IN (...); pass None/empty for all states.
-    `llm_classified` defaults True (the NFL enrichment queue). False selects
-    sites that have not been LLM-classified yet.
+    `llm_classified` defaults False (sites not yet LLM-classified). True selects
+    the already-flagged NFL re-queue.
     """
     field_list = ", ".join(fields)
     classified_sql = "true" if llm_classified else "false"
@@ -123,7 +136,7 @@ def query_blank_site_type_sites(
     owners: Sequence[str] = DEFAULT_OWNER_FILTER,
     carrier_like: str | None = "NFL",
     states: Sequence[str] | None = None,
-    llm_classified: bool = True,
+    llm_classified: bool = False,
 ) -> list[dict[str, Any]]:
     soql = build_blank_site_type_query(
         stages=stages,

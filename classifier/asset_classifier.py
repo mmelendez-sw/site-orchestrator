@@ -104,10 +104,25 @@ ROOFTOP_CELL_CONF_MIN = float(os.environ.get("ROOFTOP_CELL_CONF_MIN", "0.75"))
 # unless confidence is at/above this override (definitive NAIP-only identification).
 NAIP_MAX_AGE_YEARS = float(os.environ.get("NAIP_MAX_AGE_YEARS", "2"))
 NAIP_AGE_HIGH_CONF_OVERRIDE = float(os.environ.get("NAIP_AGE_HIGH_CONF_OVERRIDE", "0.85"))
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3-flash-preview")
 # Cheap NAIP screen; promote to GEMINI_MODEL for tower/rooftop/unclear/weak other.
 GEMINI_SCREEN_MODEL = os.environ.get(
-    "GEMINI_SCREEN_MODEL", "gemini-2.5-flash-lite"
+    "GEMINI_SCREEN_MODEL", "gemini-3.5-flash-lite"
+)
+# Gemini 3.x thinking_level: NAIP screen stays MINIMAL; Nearmap/confirm MEDIUM.
+_THINKING_LEVELS = frozenset({"MINIMAL", "LOW", "MEDIUM", "HIGH"})
+
+
+def _parse_thinking_level(raw: str | None, default: str) -> str:
+    text = (raw or "").strip().upper()
+    return text if text in _THINKING_LEVELS else default
+
+
+GEMINI_SCREEN_THINKING_LEVEL = _parse_thinking_level(
+    os.environ.get("GEMINI_SCREEN_THINKING_LEVEL"), "MINIMAL"
+)
+GEMINI_THINKING_LEVEL = _parse_thinking_level(
+    os.environ.get("GEMINI_THINKING_LEVEL"), "MEDIUM"
 )
 CLAUDE_ESCALATION_MODEL = os.environ.get(
     "CLAUDE_ESCALATION_MODEL", "claude-sonnet-4-6")
@@ -2538,6 +2553,28 @@ def _gemini_retry_wait_s(attempt: int, exc: Exception) -> float:
     return min(wait, 120.0) + random.uniform(0.0, 3.0)
 
 
+def _is_gemini_3(model: str | None) -> bool:
+    return "gemini-3" in str(model or "").lower()
+
+
+def _is_screen_model(model: str | None) -> bool:
+    use = str(model or "").strip()
+    screen = str(GEMINI_SCREEN_MODEL or "").strip()
+    return "lite" in use.lower() or (bool(screen) and use == screen)
+
+
+def _gemini_thinking_level(model: str | None = None) -> str:
+    """Gemini 3.x thinking_level for this model (NAIP screen vs Nearmap/confirm)."""
+    if _is_screen_model(model or GEMINI_MODEL):
+        return _parse_thinking_level(
+            os.environ.get("GEMINI_SCREEN_THINKING_LEVEL"),
+            GEMINI_SCREEN_THINKING_LEVEL,
+        )
+    return _parse_thinking_level(
+        os.environ.get("GEMINI_THINKING_LEVEL"), GEMINI_THINKING_LEVEL
+    )
+
+
 def _gemini_thinking_budget(model: str | None = None) -> int:
     """Resolved thinking token budget for a Gemini vision model.
 
@@ -2559,16 +2596,23 @@ def _gemini_thinking_budget(model: str | None = None) -> int:
 def _gemini_generate_config(
     schema: dict, model: str | None = None
 ) -> genai_types.GenerateContentConfig:
-    """Structured JSON config; enable thinking for non-lite Gemini 2.5/3.x."""
+    """Structured JSON config. Gemini 3.x uses thinking_level, not thinking_budget."""
     use_model = model or GEMINI_MODEL
     budget = _gemini_thinking_budget(use_model)
+    name = str(use_model or "").lower()
     kwargs: dict = {
         "response_mime_type": "application/json",
         "response_schema": schema,
-        # Thinking consumes output budget; keep headroom for the JSON reply.
         "max_output_tokens": 8192 if budget > 0 else 1000,
     }
-    if not str(use_model).startswith("gemini-2.0"):
+    if name.startswith("gemini-2.0"):
+        pass
+    elif _is_gemini_3(use_model):
+        # thinking_budget on 3.x lite/preview returns 400 INVALID_ARGUMENT.
+        level = _gemini_thinking_level(use_model)
+        kwargs["thinking_config"] = genai_types.ThinkingConfig(thinking_level=level)
+        kwargs["max_output_tokens"] = 1000 if level == "MINIMAL" else 8192
+    else:
         kwargs["thinking_config"] = genai_types.ThinkingConfig(
             thinking_budget=budget
         )

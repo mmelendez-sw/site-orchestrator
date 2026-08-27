@@ -8,6 +8,8 @@ from unittest.mock import patch
 
 from classifier.asset_classifier import (
     _gemini_thinking_budget,
+    _gemini_thinking_level,
+    _gemini_generate_config,
     confident_no_asset,
     confirm_rooftop_cell_with_claude,
     cheap_second_opinion_disagrees,
@@ -613,6 +615,21 @@ class CostGateTests(unittest.TestCase):
         with patch("classifier.asset_classifier.GEMINI_THINKING_BUDGET_ENV", ""):
             self.assertEqual(_gemini_thinking_budget("gemini-2.5-flash"), 0)
             self.assertEqual(_gemini_thinking_budget("gemini-2.5-flash-lite"), 0)
+
+    def test_gemini_3_lite_uses_thinking_level_not_budget(self):
+        cfg = _gemini_generate_config({"type": "OBJECT"}, "gemini-3.5-flash-lite")
+        thinking = cfg.thinking_config
+        self.assertIsNotNone(thinking)
+        self.assertIsNone(thinking.thinking_budget)
+        self.assertIn("MINIMAL", str(thinking.thinking_level).upper())
+
+    def test_naip_screen_minimal_nearmap_medium(self):
+        self.assertEqual(
+            _gemini_thinking_level("gemini-3.5-flash-lite"), "MINIMAL"
+        )
+        self.assertEqual(
+            _gemini_thinking_level("gemini-3-flash-preview"), "MEDIUM"
+        )
 
     def test_nearmap_coverage_skips_when_no_surveys(self):
         import classifier.asset_classifier as ac

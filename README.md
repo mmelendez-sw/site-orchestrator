@@ -8,7 +8,9 @@ There is no upload-template or CSV-import step. Run CSVs under `../site-orchestr
 python -m enrichment
 ```
 
-Set `APPLY=0` to classify and write CSVs without Salesforce updates. Optional env: `STATES`, `LIMIT`, `IDS`, `RUN_DIR`, `VERBOSE`.
+Set `APPLY=0` to classify and write CSVs without Salesforce updates. Optional env: `STATES`, `LIMIT`, `IDS`, `CARRIER_LIKE`, `LLM_CLASSIFIED`, `RUN_DIR`, `VERBOSE`.
+
+`CARRIER_LIKE` is the `Carrier_Leasing_Source__c` LIKE needle (default `NFL`). Set `CARRIER_LIKE=none` to pull without a carrier filter. Enrichment does not write that field. The queue defaults to `LLM_Classified__c = false`; set `LLM_CLASSIFIED=1` only to re-pull already-flagged rows.
 
 ## Layout
 
@@ -32,7 +34,7 @@ pip install -r requirements.txt
 copy .env.example .env   # fill in credentials
 ```
 
-Also install `pyodbc` (and `azure-identity` if you use Entra token auth) for FCC/TowerSource proximity.
+Also install the ODBC Driver 18 for SQL Server. Azure SQL uses Entra token auth (`az login`); `pyodbc` and `azure-identity` are in `requirements.txt`.
 
 ## Classify path
 

@@ -73,7 +73,7 @@ def run_enrichment(
     site_ids: list[str] | None = None,
     carrier_like: str | None = "NFL",
     states: list[str] | None = None,
-    llm_classified: bool = True,
+    llm_classified: bool = False,
     verbose: bool = True,
     apply: bool = True,
     dequeue_holdouts: bool = True,

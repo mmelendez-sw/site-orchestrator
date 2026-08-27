@@ -21,6 +21,7 @@ from enrichment.sf_ops import (
     build_blank_site_type_query,
     build_sites_by_ids_query,
     build_update_payload,
+    parse_carrier_like,
 )
 
 
@@ -856,23 +857,30 @@ class SoqlTests(unittest.TestCase):
         soql = build_blank_site_type_query()
         self.assertIn("Carrier_Leasing_Source__c LIKE '%NFL%'", soql)
         self.assertIn("Site_Latitude__c != null", soql)
-        self.assertIn("LLM_Classified__c = true", soql)
+        self.assertIn("LLM_Classified__c = false", soql)
         self.assertIn("(LLM_Holdout__c = false OR LLM_Holdout__c = null)", soql)
 
-    def test_blank_site_type_query_can_select_unclassified(self):
+    def test_blank_site_type_query_can_select_already_classified(self):
         soql = build_blank_site_type_query(
             carrier_like="PermittingSites",
-            llm_classified=False,
+            llm_classified=True,
         )
-        self.assertIn("LLM_Classified__c = false", soql)
-        self.assertNotIn("LLM_Classified__c = true", soql)
+        self.assertIn("LLM_Classified__c = true", soql)
+        self.assertNotIn("LLM_Classified__c = false", soql)
         self.assertIn("Carrier_Leasing_Source__c LIKE '%PermittingSites%'", soql)
 
     def test_blank_site_type_query_can_omit_carrier(self):
         soql = build_blank_site_type_query(carrier_like=None)
         self.assertNotIn("Carrier_Leasing_Source__c LIKE", soql)
-        self.assertIn("LLM_Classified__c = true", soql)
+        self.assertIn("LLM_Classified__c = false", soql)
         self.assertIn("LLM_Holdout__c", soql)
+
+    def test_parse_carrier_like_env(self):
+        self.assertEqual(parse_carrier_like(None), "NFL")
+        self.assertEqual(parse_carrier_like(""), "NFL")
+        self.assertEqual(parse_carrier_like("PermittingSites"), "PermittingSites")
+        self.assertIsNone(parse_carrier_like("none"))
+        self.assertIsNone(parse_carrier_like("ALL"))
 
     def test_sites_by_ids_query(self):
         soql = build_sites_by_ids_query(["a0Z1", "a0Z2"])

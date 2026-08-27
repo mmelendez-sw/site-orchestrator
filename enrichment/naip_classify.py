@@ -27,6 +27,16 @@ def _refresh_classifier_flags(ac: Any) -> None:
     ac.TOWER_ONLY = ac._env_flag("TOWER_ONLY", default="0")
     ac.ZOOM_STAGE = ac._env_flag("ZOOM_STAGE", default="1")
     ac.WIDE_AOI_STAGE = ac._env_flag("WIDE_AOI_STAGE", default="1")
+    ac.GEMINI_MODEL = (os.environ.get("GEMINI_MODEL") or ac.GEMINI_MODEL).strip()
+    ac.GEMINI_SCREEN_MODEL = (
+        os.environ.get("GEMINI_SCREEN_MODEL") or ac.GEMINI_SCREEN_MODEL
+    ).strip()
+    ac.GEMINI_SCREEN_THINKING_LEVEL = ac._parse_thinking_level(
+        os.environ.get("GEMINI_SCREEN_THINKING_LEVEL"), "MINIMAL"
+    )
+    ac.GEMINI_THINKING_LEVEL = ac._parse_thinking_level(
+        os.environ.get("GEMINI_THINKING_LEVEL"), "MEDIUM"
+    )
     ac.NEARMAP_API_KEY = (os.environ.get("NEARMAP_API_KEY") or "").strip()
     try:
         ac.NAIP_MAX_AGE_YEARS = float(os.environ.get("NAIP_MAX_AGE_YEARS", "2"))
