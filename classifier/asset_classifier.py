@@ -197,8 +197,10 @@ NEARMAP_VERT_ZOOM = int(os.environ.get("NEARMAP_VERT_ZOOM", "20"))
 NEARMAP_OBLIQUE_ZOOM = int(os.environ.get("NEARMAP_OBLIQUE_ZOOM", "20"))
 NEARMAP_MAX_PX = int(os.environ.get("NEARMAP_MAX_PX", "1024"))
 # Downscale copies sent to vision models (saved chips stay at NEARMAP_MAX_PX).
-MODEL_IMAGE_MAX_PX = int(os.environ.get("MODEL_IMAGE_MAX_PX", "1024"))
+MODEL_IMAGE_MAX_PX = int(os.environ.get("MODEL_IMAGE_MAX_PX", "768"))
 MODEL_MAX_OBLIQUES = int(os.environ.get("MODEL_MAX_OBLIQUES", "2"))
+# Lite NAIP screen uses a smaller image than Flash confirm.
+SCREEN_IMAGE_MAX_PX = int(os.environ.get("SCREEN_IMAGE_MAX_PX", "768"))
 
 # Two-stage zoom: after primary + wide-AOI passes still return other/unclear,
 # scout suspicious regions on the best top-down image, magnify them, and
@@ -2242,6 +2244,7 @@ def build_cell_confirm_views(res: dict, views: list) -> tuple[list, bool]:
 
 
 _nearmap_session = requests.Session()
+_nearmap_coverage_cache: dict[tuple[float, float], tuple[bool, str | None]] = {}
 
 
 def _nearmap_get(url: str) -> requests.Response:
@@ -2256,6 +2259,40 @@ def _nearmap_get(url: str) -> requests.Response:
             continue
         return resp
     return resp
+
+
+def nearmap_point_coverage(
+    lat: float, lon: float
+) -> tuple[bool, str | None]:
+    """Return (has_survey, capture_date). Fail-open on transport errors.
+
+    Cached per ~1 m so Vert then oblique fetches at the same pin do not
+    re-hit the coverage API.
+    """
+    if not NEARMAP_API_KEY:
+        return False, None
+    key = (round(float(lat), 5), round(float(lon), 5))
+    cached = _nearmap_coverage_cache.get(key)
+    if cached is not None:
+        return cached
+    try:
+        resp = _nearmap_get(
+            NEARMAP_COVERAGE_POINT_URL.format(lon=lon, lat=lat) + "?limit=1"
+        )
+        if resp.status_code in (401, 403):
+            result = (True, None)
+        elif not resp.ok:
+            result = (False, None)
+        else:
+            surveys = resp.json().get("surveys") or []
+            capture = None
+            if surveys:
+                capture = surveys[0].get("captureDate")
+            result = (bool(surveys), capture)
+    except Exception:
+        result = (True, None)
+    _nearmap_coverage_cache[key] = result
+    return result
 
 
 def _tile_range(lat: float, lon: float, half_m: float, zoom: int):
@@ -2286,6 +2323,10 @@ def fetch_nearmap_views(lat: float, lon: float, chip_m: float = NEARMAP_CHIP_M,
     OBLIQUE_VIEWS). Defaults to all NEARMAP_VIEWS when omitted.
     """
     if not NEARMAP_API_KEY:
+        return {}, None
+
+    has_survey, capture_date = nearmap_point_coverage(lat, lon)
+    if not has_survey:
         return {}, None
 
     fetch_views = views if views is not None else NEARMAP_VIEWS
@@ -2333,19 +2374,6 @@ def fetch_nearmap_views(lat: float, lon: float, chip_m: float = NEARMAP_CHIP_M,
 
     if not result:
         return {}, None
-
-    # Capture date metadata via the standard (non-transactional) coverage API;
-    # purely informational, so failures are ignored
-    capture_date = None
-    try:
-        resp = _nearmap_get(
-            NEARMAP_COVERAGE_POINT_URL.format(lon=lon, lat=lat) + "?limit=1")
-        if resp.ok:
-            surveys = resp.json().get("surveys") or []
-            if surveys:
-                capture_date = surveys[0].get("captureDate")
-    except Exception:
-        pass
     return result, capture_date
 
 # --------------------------- classification stage ---------------------------
@@ -2507,18 +2535,20 @@ def _gemini_retry_wait_s(attempt: int, exc: Exception) -> float:
 
 
 def _gemini_thinking_budget(model: str | None = None) -> int:
-    """Resolved thinking token budget for a Gemini vision model."""
+    """Resolved thinking token budget for a Gemini vision model.
+
+    Default is 0 (thinking is billed). Set GEMINI_THINKING_BUDGET=1024 to restore
+    Flash thinking. Lite models always stay at 0.
+    """
     raw = GEMINI_THINKING_BUDGET_ENV or os.environ.get("GEMINI_THINKING_BUDGET", "").strip()
+    use = str(model or GEMINI_MODEL or "").strip().lower()
+    if "lite" in use:
+        return 0
     if raw and raw.lower() not in {"auto", "default"}:
         try:
             return max(0, int(float(raw)))
         except (TypeError, ValueError):
             return 0
-    use = str(model or GEMINI_MODEL or "").strip().lower()
-    if "lite" in use:
-        return 0
-    if use.startswith("gemini-3") or use.startswith("gemini-2.5"):
-        return 1024
     return 0
 
 
@@ -2655,9 +2685,14 @@ def classify_site(provider: str, clients: dict,
                   prompt: str = CLASSIFICATION_PROMPT, retries: int = 3,
                   scan: bool = False, claude_model: str | None = None,
                   gemini_model: str | None = None,
-                  trim_views: bool = True) -> dict:
+                  trim_views: bool = True,
+                  image_max_px: int | None = None) -> dict:
     """Classify one asset via Gemini or Claude using the same prompt."""
-    send_views = trim_views_for_model(views) if trim_views else list(views)
+    send_views = (
+        trim_views_for_model(views, max_px=image_max_px)
+        if trim_views
+        else list(views)
+    )
     if scan:
         claude_schema, gemini_schema = SCAN_SCHEMA, GEMINI_SCAN_SCHEMA
         tool_name = "scan_candidates"
@@ -2858,7 +2893,12 @@ def _classify_pass(
     if provider == "gemini":
         gemini_model = GEMINI_SCREEN_MODEL if screen else GEMINI_MODEL
     res = classify_site(
-        provider, clients, views, prompt=prompt, gemini_model=gemini_model
+        provider,
+        clients,
+        views,
+        prompt=prompt,
+        gemini_model=gemini_model,
+        image_max_px=SCREEN_IMAGE_MAX_PX if screen else None,
     )
     if (
         screen
@@ -2872,6 +2912,30 @@ def _classify_pass(
         _step_done("Flash confirm", _brief_pass_result(res))
     res = maybe_recheck_equipment(provider, clients, res, views, input_confidence)
     return res
+
+
+def _maybe_osm_adjust_before_nearmap(
+    lat: float,
+    lon: float,
+    res: dict,
+) -> bool:
+    """OSM lookup only when we are about to buy Nearmap. Fail-open.
+
+    A nearby communication tower counts as DB-backed so strong Gemini towers
+    can skip obliques.
+    """
+    try:
+        from enrichment.osm_prefilter import lookup_osm_features
+    except Exception:
+        return False
+    try:
+        osm = lookup_osm_features(lat, lon)
+    except Exception:
+        return False
+    db_backed = bool(osm.get("communication_tower"))
+    if db_backed:
+        _step_done("OSM", "communication tower nearby")
+    return db_backed
 
 
 def classify_with_tiers(lat: float, lon: float, img: Image.Image | None,
@@ -2922,6 +2986,15 @@ def classify_with_tiers(lat: float, lon: float, img: Image.Image | None,
         _step_done("Nearmap skipped", "NAIP other/unclear — no paid imagery")
         return res, nearmap_views, nearmap_date, "naip_only", views
 
+    if not db_backed:
+        db_backed = _maybe_osm_adjust_before_nearmap(lat, lon, res)
+        need_tower_obliques = tower_cell_requires_nearmap_obliques(
+            res, db_backed=db_backed
+        )
+        if not force_nearmap and not need_tower_obliques:
+            _step_done("Nearmap skipped", "OSM tower + Gemini lock — no obliques")
+            return res, nearmap_views, nearmap_date, "naip_only", views
+
     if force_nearmap and NEARMAP_API_KEY:
         _step_done(
             "Nearmap required",
@@ -2969,8 +3042,6 @@ def classify_with_tiers(lat: float, lon: float, img: Image.Image | None,
     res = _classify_pass(
         provider, clients, views, prompt, input_confidence, screen=False
     )
-    res = gate_weak_rooftop_cell_claim(res)
-    res = maybe_recheck_rooftop_cell_false_positive(provider, clients, res, views)
     res = gate_weak_rooftop_cell_claim(res)
     res = gate_weak_stealth_tower_claim(res)
     _step_done("classify (Nearmap combined)", _brief_pass_result(res))
@@ -3086,7 +3157,12 @@ def scout_candidates(provider: str, clients: dict, label: str,
     views = [(label, img)]
     gemini_model = GEMINI_SCREEN_MODEL if provider == "gemini" else None
     res = classify_site(
-        provider, clients, views, scan=True, gemini_model=gemini_model
+        provider,
+        clients,
+        views,
+        scan=True,
+        gemini_model=gemini_model,
+        image_max_px=SCREEN_IMAGE_MAX_PX,
     )
     return res.get("candidates") or []
 
@@ -3100,6 +3176,36 @@ def _anchor_candidates() -> list[dict]:
         {"box_2d": [480, 380, 680, 620],
          "reason": "coordinate anchor (just below center)"},
     ]
+
+
+def select_zoom_candidates(
+    scouted: list[dict],
+    *,
+    max_crops: int = ZOOM_MAX_CANDIDATES,
+) -> list[dict]:
+    """Prefer scout boxes; fill remaining slots with pin-center anchors."""
+    merged: list[dict] = []
+    seen: set[tuple] = set()
+
+    def _add(cands: list[dict]) -> None:
+        for cand in cands:
+            box = _valid_box(cand.get("box_2d"))
+            if box is None:
+                continue
+            key = tuple(box)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(cand)
+            if len(merged) >= max_crops:
+                return
+
+    _add(list(scouted or []))
+    if len(merged) < max_crops:
+        _add(_anchor_candidates())
+    if not merged:
+        _add([{"box_2d": b, "reason": "grid sweep"} for b in _grid_boxes()])
+    return merged[:max_crops]
 
 
 def build_zoom_views(asset_id: str, source_label: str, source_img: Image.Image,
@@ -3129,15 +3235,11 @@ def run_zoom_stage(provider: str, clients: dict, asset_id: str,
                    max_crops: int = ZOOM_MAX_CANDIDATES) -> tuple[dict, int]:
     """Scout + magnify + re-classify. Returns (result dict, zoom crop count)."""
     scouted = scout_candidates(provider, clients, source_label, source_img)
-    candidates = _anchor_candidates() + scouted
     if not scouted:
         _out(f"  [{asset_id}] scout found no extra candidates")
-    if not candidates:
-        _out(f"  [{asset_id}] no candidates -> {ZOOM_GRID}x{ZOOM_GRID} grid")
-        candidates = [{"box_2d": b, "reason": "grid sweep"} for b in _grid_boxes()]
+    candidates = select_zoom_candidates(scouted, max_crops=max_crops)
 
-    zoom_views = build_zoom_views(asset_id, source_label, source_img,
-                                  candidates[:max_crops])
+    zoom_views = build_zoom_views(asset_id, source_label, source_img, candidates)
     if not zoom_views:
         return {"site_type": "unclear", "site_confidence": 0.0,
                 "site_evidence": "Zoom stage could not build valid crops."}, 0
@@ -4208,10 +4310,6 @@ def main():
 
             fp_provider = (
                 "claude" if escalation_model else primary_provider
-            )
-            res = gate_weak_rooftop_cell_claim(res)
-            res = maybe_recheck_rooftop_cell_false_positive(
-                fp_provider, clients, res, views
             )
             res = gate_weak_rooftop_cell_claim(res)
             res = gate_weak_stealth_tower_claim(res)

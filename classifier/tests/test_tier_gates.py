@@ -7,6 +7,7 @@ import unittest
 from unittest.mock import patch
 
 from classifier.asset_classifier import (
+    _gemini_thinking_budget,
     confident_no_asset,
     confirm_rooftop_cell_with_claude,
     cheap_second_opinion_disagrees,
@@ -16,7 +17,9 @@ from classifier.asset_classifier import (
     maybe_escalate_to_claude,
     needs_flash_confirm,
     needs_naip_rescue,
+    nearmap_point_coverage,
     rooftop_requires_nearmap_tiers,
+    select_zoom_candidates,
     should_skip_claude_for_gemini_tower,
     tier_confident_stop,
     tower_cell_requires_nearmap_obliques,
@@ -594,6 +597,40 @@ class CostGateTests(unittest.TestCase):
         self.assertEqual(model, "claude")
         self.assertEqual(reason, "second_opinion_disagree")
         self.assertEqual(out["site_type"], "tower")
+
+    def test_zoom_candidates_prefer_scout_over_anchors(self):
+        scouted = [
+            {"box_2d": [100, 100, 400, 400], "reason": "mast"},
+            {"box_2d": [500, 500, 800, 800], "reason": "compound"},
+        ]
+        picked = select_zoom_candidates(scouted, max_crops=3)
+        self.assertEqual(len(picked), 3)
+        self.assertEqual(picked[0]["reason"], "mast")
+        self.assertEqual(picked[1]["reason"], "compound")
+        self.assertIn("anchor", picked[2]["reason"])
+
+    def test_thinking_budget_defaults_to_zero(self):
+        with patch("classifier.asset_classifier.GEMINI_THINKING_BUDGET_ENV", ""):
+            self.assertEqual(_gemini_thinking_budget("gemini-2.5-flash"), 0)
+            self.assertEqual(_gemini_thinking_budget("gemini-2.5-flash-lite"), 0)
+
+    def test_nearmap_coverage_skips_when_no_surveys(self):
+        import classifier.asset_classifier as ac
+
+        ac._nearmap_coverage_cache.clear()
+        class _Resp:
+            status_code = 200
+            ok = True
+
+            def json(self):
+                return {"surveys": []}
+
+        with patch.object(ac, "NEARMAP_API_KEY", "x"), patch.object(
+            ac, "_nearmap_get", return_value=_Resp()
+        ):
+            has, date = nearmap_point_coverage(43.0, -89.0)
+        self.assertFalse(has)
+        self.assertIsNone(date)
 
 
 if __name__ == "__main__":
