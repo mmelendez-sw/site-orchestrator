@@ -621,11 +621,11 @@ class CostGateTests(unittest.TestCase):
         thinking = cfg.thinking_config
         self.assertIsNotNone(thinking)
         self.assertIsNone(thinking.thinking_budget)
-        self.assertIn("MINIMAL", str(thinking.thinking_level).upper())
+        self.assertIn("LOW", str(thinking.thinking_level).upper())
 
-    def test_naip_screen_minimal_nearmap_medium(self):
+    def test_naip_screen_low_nearmap_medium(self):
         self.assertEqual(
-            _gemini_thinking_level("gemini-3.5-flash-lite"), "MINIMAL"
+            _gemini_thinking_level("gemini-3.5-flash-lite"), "LOW"
         )
         self.assertEqual(
             _gemini_thinking_level("gemini-3-flash-preview"), "MEDIUM"

@@ -32,7 +32,7 @@ def _refresh_classifier_flags(ac: Any) -> None:
         os.environ.get("GEMINI_SCREEN_MODEL") or ac.GEMINI_SCREEN_MODEL
     ).strip()
     ac.GEMINI_SCREEN_THINKING_LEVEL = ac._parse_thinking_level(
-        os.environ.get("GEMINI_SCREEN_THINKING_LEVEL"), "MINIMAL"
+        os.environ.get("GEMINI_SCREEN_THINKING_LEVEL"), "LOW"
     )
     ac.GEMINI_THINKING_LEVEL = ac._parse_thinking_level(
         os.environ.get("GEMINI_THINKING_LEVEL"), "MEDIUM"

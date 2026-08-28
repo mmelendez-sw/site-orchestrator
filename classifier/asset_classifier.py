@@ -109,7 +109,7 @@ GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3-flash-preview")
 GEMINI_SCREEN_MODEL = os.environ.get(
     "GEMINI_SCREEN_MODEL", "gemini-3.5-flash-lite"
 )
-# Gemini 3.x thinking_level: NAIP screen stays MINIMAL; Nearmap/confirm MEDIUM.
+# Gemini 3.x thinking_level: NAIP screen LOW; Nearmap/confirm MEDIUM.
 _THINKING_LEVELS = frozenset({"MINIMAL", "LOW", "MEDIUM", "HIGH"})
 
 
@@ -119,7 +119,7 @@ def _parse_thinking_level(raw: str | None, default: str) -> str:
 
 
 GEMINI_SCREEN_THINKING_LEVEL = _parse_thinking_level(
-    os.environ.get("GEMINI_SCREEN_THINKING_LEVEL"), "MINIMAL"
+    os.environ.get("GEMINI_SCREEN_THINKING_LEVEL"), "LOW"
 )
 GEMINI_THINKING_LEVEL = _parse_thinking_level(
     os.environ.get("GEMINI_THINKING_LEVEL"), "MEDIUM"
