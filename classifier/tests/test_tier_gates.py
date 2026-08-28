@@ -19,6 +19,8 @@ from classifier.asset_classifier import (
     maybe_escalate_to_claude,
     needs_flash_confirm,
     needs_naip_rescue,
+    scout_result_wins,
+    should_attempt_claude_escalation,
     nearmap_point_coverage,
     rooftop_requires_nearmap_tiers,
     select_zoom_candidates,
@@ -166,6 +168,7 @@ class EscalationReasonTests(unittest.TestCase):
                     "site_type": "rooftop",
                     "site_confidence": 0.85,
                     "cell_equipment": False,
+                    "nearmap_tier": "full",
                 }
             ),
             "rooftop_cell_unconfirmed",
@@ -178,6 +181,7 @@ class EscalationReasonTests(unittest.TestCase):
                     "site_type": "rooftop",
                     "site_confidence": 0.85,
                     "cell_equipment": None,
+                    "nearmap_tier": "full",
                 }
             ),
             "rooftop_cell_unconfirmed",
@@ -191,9 +195,32 @@ class EscalationReasonTests(unittest.TestCase):
                     "site_confidence": 0.9,
                     "cell_equipment": True,
                     "cell_equipment_confidence": 0.6,
+                    "nearmap_tier": "full",
                 }
             ),
             "rooftop_low_cell_confidence",
+        )
+
+    def test_naip_only_rooftop_skips_claude(self):
+        self.assertIsNone(
+            escalation_reason(
+                {
+                    "site_type": "rooftop",
+                    "site_confidence": 0.85,
+                    "cell_equipment": False,
+                    "nearmap_tier": "naip_wide",
+                }
+            )
+        )
+        self.assertFalse(
+            should_attempt_claude_escalation(
+                {
+                    "site_type": "rooftop",
+                    "site_confidence": 0.85,
+                    "cell_equipment": False,
+                    "nearmap_tier": "naip_only",
+                }
+            )
         )
 
     def test_rooftop_confirmed_cell_skips_claude(self):
@@ -204,6 +231,7 @@ class EscalationReasonTests(unittest.TestCase):
                     "site_confidence": 0.9,
                     "cell_equipment": True,
                     "cell_equipment_confidence": 0.85,
+                    "nearmap_tier": "full",
                 }
             )
         )
@@ -261,15 +289,64 @@ class EscalationReasonTests(unittest.TestCase):
             )
         )
 
-    def test_rooftop_cell_unconfirmed_below_0_7_skips_claude(self):
+    def test_nearmap_other_on_claimed_site_escalates(self):
+        self.assertEqual(
+            escalation_reason(
+                {
+                    "site_type": "other",
+                    "site_confidence": 0.8,
+                    "cell_equipment": False,
+                    "nearmap_tier": "full",
+                }
+            ),
+            "nearmap_claimed_site_empty",
+        )
+        self.assertTrue(
+            should_attempt_claude_escalation(
+                {
+                    "site_type": "other",
+                    "site_confidence": 0.8,
+                    "cell_equipment": False,
+                    "nearmap_tier": "full",
+                }
+            )
+        )
+
+    def test_nearmap_other_at_0_9_skips_claude(self):
         self.assertIsNone(
+            escalation_reason(
+                {
+                    "site_type": "other",
+                    "site_confidence": 0.9,
+                    "cell_equipment": False,
+                    "nearmap_tier": "full",
+                }
+            )
+        )
+
+    def test_rooftop_cell_unconfirmed_below_0_6_skips_claude(self):
+        self.assertIsNone(
+            escalation_reason(
+                {
+                    "site_type": "rooftop",
+                    "site_confidence": 0.55,
+                    "cell_equipment": False,
+                    "nearmap_tier": "full",
+                }
+            )
+        )
+
+    def test_rooftop_cell_unconfirmed_at_0_65_with_nearmap_escalates(self):
+        self.assertEqual(
             escalation_reason(
                 {
                     "site_type": "rooftop",
                     "site_confidence": 0.65,
                     "cell_equipment": False,
+                    "nearmap_tier": "full",
                 }
-            )
+            ),
+            "rooftop_cell_unconfirmed",
         )
 
     def test_rooftop_cell_unconfirmed_at_high_conf_still_escalates(self):
@@ -279,6 +356,7 @@ class EscalationReasonTests(unittest.TestCase):
                     "site_type": "rooftop",
                     "site_confidence": 0.95,
                     "cell_equipment": False,
+                    "nearmap_tier": "full",
                 }
             ),
             "rooftop_cell_unconfirmed",
@@ -438,8 +516,23 @@ class CostGateTests(unittest.TestCase):
             needs_flash_confirm({"site_type": "rooftop", "site_confidence": 0.9})
         )
 
-    def test_naip_rescue_only_for_weak_other_or_unclear(self):
-        self.assertTrue(needs_naip_rescue({"site_type": "unclear"}))
+    def test_flash_confirm_skips_low_unclear(self):
+        self.assertFalse(
+            needs_flash_confirm({"site_type": "unclear", "site_confidence": 0.1})
+        )
+        self.assertFalse(needs_flash_confirm({"site_type": "unclear"}))
+        self.assertTrue(
+            needs_flash_confirm({"site_type": "unclear", "site_confidence": 0.6})
+        )
+
+    def test_naip_rescue_only_for_weak_other_or_mid_unclear(self):
+        self.assertFalse(needs_naip_rescue({"site_type": "unclear"}))
+        self.assertFalse(
+            needs_naip_rescue({"site_type": "unclear", "site_confidence": 0.1})
+        )
+        self.assertTrue(
+            needs_naip_rescue({"site_type": "unclear", "site_confidence": 0.6})
+        )
         self.assertTrue(
             needs_naip_rescue({"site_type": "other", "site_confidence": 0.5})
         )
@@ -448,6 +541,36 @@ class CostGateTests(unittest.TestCase):
         )
         self.assertFalse(
             needs_naip_rescue({"site_type": "rooftop", "cell_equipment": False})
+        )
+        self.assertFalse(
+            should_attempt_claude_escalation(
+                {"site_type": "unclear", "site_confidence": 0.1}
+            )
+        )
+
+    def test_scout_does_not_promote_weak_or_lower_conf_rooftop(self):
+        prior = {"site_type": "unclear", "site_confidence": 0.1}
+        self.assertFalse(
+            scout_result_wins(
+                prior, {"site_type": "rooftop", "site_confidence": 0.5}
+            )
+        )
+        self.assertTrue(
+            scout_result_wins(
+                prior, {"site_type": "rooftop", "site_confidence": 0.6}
+            )
+        )
+        self.assertFalse(
+            scout_result_wins(
+                {"site_type": "rooftop", "site_confidence": 0.6},
+                {"site_type": "rooftop", "site_confidence": 0.5},
+            )
+        )
+        self.assertTrue(
+            scout_result_wins(
+                {"site_type": "other", "site_confidence": 0.5},
+                {"site_type": "tower", "site_confidence": 0.65},
+            )
         )
 
     def test_trim_views_keeps_vert_and_two_obliques(self):

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 import time
+from pathlib import Path
 from typing import Any
 
 _run_t0: float | None = None
@@ -105,7 +106,17 @@ def warn(message: str, *, elapsed_s: float | None = None) -> None:
 
 
 def dump_summary(summary: dict[str, Any]) -> None:
-    stage("COMPLETE — RUN SUMMARY")
-    for key, value in summary.items():
-        print(f"    {key}: {value}", flush=True)
+    """Print this-run metrics and cumulative KPIs (same fields as the ledger)."""
+    from enrichment.metrics import KPI_METRIC_KEYS, RUN_METRIC_KEYS, metric_lines
+
+    run = summary.get("run") if isinstance(summary.get("run"), dict) else summary
+    run_id = (run or {}).get("run_id") or Path(str(summary.get("run_dir") or "")).name
+    stage("COMPLETE — THIS RUN", str(run_id or summary.get("run_dir") or ""))
+    for line in metric_lines(run if isinstance(run, dict) else {}, RUN_METRIC_KEYS):
+        print(line, flush=True)
+    kpis = summary.get("kpis") if isinstance(summary.get("kpis"), dict) else None
+    if kpis:
+        stage("CUMULATIVE KPIs", "last Salesforce Id wins")
+        for line in metric_lines(kpis, KPI_METRIC_KEYS):
+            print(line, flush=True)
     print(f"    elapsed: {format_duration(run_elapsed())}", flush=True)

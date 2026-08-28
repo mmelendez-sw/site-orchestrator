@@ -78,6 +78,8 @@ def classify_site_imagery(
     verbose: bool = True,
     pin_lat: float | None = None,
     pin_lon: float | None = None,
+    address_lat: float | None = None,
+    address_lon: float | None = None,
     pin_address_offset_m: float | None = None,
     pin_address_mismatch: bool = False,
     db_backed: bool = False,
@@ -85,13 +87,18 @@ def classify_site_imagery(
     """Classify one coordinate with the full Nearmap + bifurcated AI stack.
 
     Same strategy as `classifier.asset_classifier` main loop for a single pin:
-    NAIP → (optional) Nearmap vert/obliques → wide AOI / zoom → Claude escalate.
+    NAIP → Nearmap vert/obliques → wide AOI / zoom → Claude escalate.
+
+    FCC/TowerSource is the tower path (unique hit ≤25 m skips this). No DB
+    hit is the rooftop path: pick the host building (parking-lot pin vs
+    Census, from ``ROOFTOP_HOST_OFFSET_M``), then buy obliques there.
 
     ``db_backed``: FCC/TowerSource already matched. High-conf Gemini towers
     then skip Vert/obliques. Imagery-only tower+cell still fetches obliques.
 
-    When pin_address_mismatch is set, also save a pin-centered Nearmap Vert chip
-    (`{id}_pin_nearmap_vert.jpg`) so review can compare address vs SF pin.
+    One Nearmap pack at the winner. A second pack at the unused pin/Census
+    point only if the first pack is empty or an unlocked rooftop (no cell
+    lock, no compact oblique HVAC box).
     """
     from enrichment import progress
     from classifier import asset_classifier as ac
@@ -114,32 +121,86 @@ def classify_site_imagery(
         )
         progress.step(mode)
 
-    if verbose:
-        progress.step("NAIP fetch")
-    img, naip_meta, naip_geo = ac.fetch_chip(lat, lon)
-    img_date = (naip_meta or {}).get("image_date")
-    naip_chip_m = (naip_meta or {}).get("naip_chip_m") or ac.CHIP_SIZE_M
+    pin_lat = float(pin_lat) if pin_lat is not None else float(lat)
+    pin_lon = float(pin_lon) if pin_lon is not None else float(lon)
+    classify_coord_source = "sf_pin"
+    unused_point: tuple[float, float] | None = None
+
+    row = {"id": site_id, "input_confidence": input_confidence}
+    prompt = ac.build_classification_prompt(row)
+    input_conf = ac.normalize_input_confidence(input_confidence)
 
     skip_paid_imagery = bool(ac.NAIP_ONLY)
-    if not skip_paid_imagery:
-        try:
-            from enrichment.osm_prefilter import (
-                lookup_osm_features,
-                osm_suggests_empty_chip,
-            )
+    img = None
+    naip_meta = None
+    naip_geo = None
 
-            osm_info = lookup_osm_features(lat, lon)
-            if osm_info.get("communication_tower"):
+    def _osm_at(la: float, lo: float) -> dict:
+        try:
+            from enrichment.osm_prefilter import lookup_osm_features
+
+            return lookup_osm_features(la, lo)
+        except Exception:  # noqa: BLE001
+            return {"ok": False}
+
+    if not skip_paid_imagery:
+        from enrichment.geo import (
+            mismatch_osm_is_decisive,
+            pick_classify_anchor,
+            should_compare_rooftop_hosts,
+        )
+
+        pin_osm = _osm_at(pin_lat, pin_lon)
+        if pin_osm.get("communication_tower"):
+            db_backed = True
+            if verbose:
+                progress.result("OSM communication tower nearby")
+        if (
+            should_compare_rooftop_hosts(
+                pin_address_offset_m, db_backed=db_backed
+            )
+            and address_lat is not None
+            and address_lon is not None
+        ):
+            addr_lat_f = float(address_lat)
+            addr_lon_f = float(address_lon)
+            addr_osm = _osm_at(addr_lat_f, addr_lon_f)
+            if addr_osm.get("communication_tower"):
                 db_backed = True
                 if verbose:
-                    progress.result("OSM communication tower nearby")
-            if osm_suggests_empty_chip(osm_info) and not db_backed:
-                skip_paid_imagery = True
+                    progress.result("OSM communication tower at Census address")
+            if mismatch_osm_is_decisive(pin_osm, addr_osm):
+                pick, reason = pick_classify_anchor(
+                    pin_osm=pin_osm, address_osm=addr_osm
+                )
+                if pick == "address":
+                    lat, lon = addr_lat_f, addr_lon_f
+                    classify_coord_source = "census_address"
+                    unused_point = (pin_lat, pin_lon)
+                else:
+                    unused_point = (addr_lat_f, addr_lon_f)
                 if verbose:
-                    progress.result("OSM: no building/tower — skip Nearmap")
-        except Exception as exc:  # noqa: BLE001
-            if verbose:
-                progress.warn(f"OSM prefilter failed: {exc}")
+                    progress.result(f"rooftop host OSM → {pick} ({reason})")
+            else:
+                # OSM tie: keep the SF pin. Dual NAIP cannot see rooftop gear
+                # and only repeats two Gemini screens before Nearmap.
+                unused_point = (addr_lat_f, addr_lon_f)
+                classify_coord_source = "sf_pin"
+                if verbose:
+                    progress.result(
+                        "rooftop host OSM tie — keep SF pin (skip dual NAIP)"
+                    )
+        elif verbose and pin_osm.get("ok") and not (
+            pin_osm.get("has_building") or pin_osm.get("has_tower_or_mast")
+        ):
+            progress.result("OSM: no building/tower at pin (still using Nearmap)")
+
+    if verbose:
+        progress.step("NAIP fetch")
+    if img is None:
+        img, naip_meta, naip_geo = ac.fetch_chip(lat, lon)
+    img_date = (naip_meta or {}).get("image_date")
+    naip_chip_m = (naip_meta or {}).get("naip_chip_m") or ac.CHIP_SIZE_M
 
     nearmap_views: dict = {}
     nearmap_date = None
@@ -161,10 +222,6 @@ def classify_site_imagery(
             "lat": lat,
             "lon": lon,
         }
-
-    row = {"id": site_id, "input_confidence": input_confidence}
-    prompt = ac.build_classification_prompt(row)
-    input_conf = ac.normalize_input_confidence(input_confidence)
 
     def build_views(nm_views, naip_img=None, chip_m=None):
         views = []
@@ -257,6 +314,121 @@ def classify_site_imagery(
             f"{res.get('site_type')} conf={res.get('site_confidence')} tier={nearmap_tier}"
         )
 
+    # Rooftop path: first Nearmap pack empty or HVAC-without-lock → one pack
+    # at the other pin/Census point. Never both up front. Skip when the first
+    # full+oblique pack already locked empty at >= 0.90.
+    from enrichment.cost_policy import should_spend_second_nearmap
+
+    site_now = str(res.get("site_type") or "").strip().lower()
+    rooftop_unlocked = (
+        site_now == "rooftop"
+        and res.get("cell_equipment") is not True
+        and not ac.has_locked_oblique_asset_box(res)
+    )
+    first_tier = str(nearmap_tier or "").strip().lower()
+    second_nearmap = ""
+    if should_spend_second_nearmap(
+        unused_point=unused_point,
+        skip_paid_imagery=skip_paid_imagery,
+        has_nearmap_key=bool(ac.NEARMAP_API_KEY),
+        site_type=res.get("site_type"),
+        site_confidence=res.get("site_confidence"),
+        nearmap_tier=nearmap_tier,
+        rooftop_unlocked=rooftop_unlocked,
+    ):
+        second_nearmap = "spent"
+        assert unused_point is not None
+        o_lat, o_lon = unused_point
+        if verbose:
+            progress.step("Nearmap at other rooftop-host point")
+        try:
+            other_nm, other_date = ac.fetch_nearmap_views(o_lat, o_lon)
+        except Exception as exc:  # noqa: BLE001
+            other_nm, other_date = {}, None
+            if verbose:
+                progress.warn(f"other-point Nearmap failed: {exc}")
+        if other_nm:
+            other_img, other_meta, other_geo = ac.fetch_chip(o_lat, o_lon)
+            other_views = []
+            other_chip_m = (other_meta or {}).get("naip_chip_m") or ac.CHIP_SIZE_M
+            if other_img is not None:
+                other_views.append((ac._naip_view_label(other_chip_m), other_img))
+                if chip_dir is not None:
+                    other_img.save(
+                        chip_dir / f"{site_id}_NAIP_mismatch.jpg", quality=90
+                    )
+            for name, vimg in other_nm.items():
+                if chip_dir is not None:
+                    vpath = chip_dir / f"{site_id}_nearmap_{name.lower()}.jpg"
+                    vimg.save(vpath, quality=90)
+                label = (
+                    "Nearmap top-down"
+                    if name == "Vert"
+                    else f"Nearmap oblique ({name})"
+                )
+                other_views.append((label, vimg))
+            other_res, _, _, _ = ac.classify_with_routing(
+                primary_provider,
+                clients,
+                other_views,
+                prompt,
+                input_conf,
+                escalate=False,
+            )
+            if ac.scout_result_wins(res, other_res):
+                screen_keep = {
+                    "naip_screen_site_type": res.get("naip_screen_site_type"),
+                    "naip_screen_site_confidence": res.get(
+                        "naip_screen_site_confidence"
+                    ),
+                    "naip_screen_cell_equipment": res.get(
+                        "naip_screen_cell_equipment"
+                    ),
+                }
+                res = other_res
+                for key, value in screen_keep.items():
+                    if value not in (None, ""):
+                        res[key] = value
+                lat, lon = o_lat, o_lon
+                img = other_img if other_img is not None else img
+                naip_geo = other_geo or naip_geo
+                naip_chip_m = other_chip_m
+                if other_meta:
+                    naip_meta = {**(naip_meta or {}), **other_meta}
+                    img_date = other_meta.get("image_date") or img_date
+                nearmap_views = other_nm
+                nearmap_date = other_date or nearmap_date
+                views = other_views
+                has_obliques = any(n != "Vert" for n in nearmap_views)
+                nearmap_tier = "full" if has_obliques else "vert_only"
+                classification_stage = "mismatch_second_look"
+                pin_eps = 1e-5
+                if (
+                    abs(o_lat - pin_lat) < pin_eps
+                    and abs(o_lon - pin_lon) < pin_eps
+                ):
+                    classify_coord_source = "sf_pin"
+                else:
+                    classify_coord_source = "census_address"
+                if verbose:
+                    progress.result(
+                        f"other point → {res.get('site_type')} "
+                        f"conf={res.get('site_confidence')}"
+                    )
+            elif verbose:
+                progress.result("other point did not beat first Nearmap pack")
+    elif unused_point is not None:
+        from enrichment.cost_policy import nearmap_empty_is_locked
+
+        if nearmap_empty_is_locked(
+            res.get("site_type"), res.get("site_confidence"), first_tier
+        ):
+            second_nearmap = "skipped_empty_lock"
+            if verbose:
+                progress.result(
+                    "first Nearmap locked empty @0.90 — skip second pack"
+                )
+
     nearmap_aoi_m = ac.NEARMAP_CHIP_M if nearmap_views else None
     stage_provider = primary_provider
 
@@ -269,25 +441,44 @@ def classify_site_imagery(
     nearmap_blocks_rescue = ac.nearmap_full_blocks_rescue(
         res, nearmap_tier=nearmap_tier, has_obliques=has_obliques
     )
+    nearmap_tier_now = str(nearmap_tier or "").strip().lower()
+    nearmap_looked = nearmap_tier_now in {
+        "full",
+        "vert_only",
+        "wide_aoi",
+    }
+    no_nearmap_coverage = nearmap_tier_now == "no_coverage"
     pin_offset_scout = (
-        not nearmap_blocks_rescue and ac.needs_pin_offset_scout(res)
+        not nearmap_blocks_rescue
+        and not no_nearmap_coverage
+        and ac.needs_pin_offset_scout(res)
     )
     naip_rescue = (
         not nearmap_blocks_rescue
         and not pin_offset_scout
+        and not nearmap_looked
+        and not no_nearmap_coverage
         and ac.needs_naip_rescue(res)
     )
+    site_now = str(res.get("site_type") or "").strip().lower()
     # Snapshot before wide/zoom so a rejected re-center can restore a weak rooftop.
     pre_scout_res = dict(res)
-    if ac.confident_no_asset(res) and verbose:
-        progress.result("Confident NAIP other — skip wide/zoom/Nearmap rescue")
+    if no_nearmap_coverage and verbose:
+        progress.result(
+            "No Nearmap coverage — rooftop cannot be confirmed "
+            "(skip NAIP 500 m / zoom fishing)"
+        )
+    elif nearmap_looked and site_now in ("other", "unclear") and verbose:
+        progress.result("Nearmap already searched this point — skip NAIP wide/zoom")
+    elif ac.confident_no_asset(res) and verbose:
+        progress.result("Confident NAIP other — skip wide/zoom rescue")
     elif nearmap_blocks_rescue and verbose:
         progress.result(
             "Nearmap full+obliques: locked HVAC rooftop — skip wide/zoom rescue"
         )
     elif pin_offset_scout and verbose:
         progress.result(
-            "Rooftop pin may be offset — Nearmap/NAIP scout allowed "
+            "Rooftop cell unconfirmed — Nearmap wide AOI (no 500 m NAIP) "
             f"(cell={res.get('cell_equipment')!r})"
         )
     elif naip_rescue and verbose:
@@ -301,6 +492,7 @@ def classify_site_imagery(
         pin_offset_scout
         and not skip_paid_imagery
         and ac.NEARMAP_API_KEY
+        and not no_nearmap_coverage
     ):
         try:
             if verbose:
@@ -332,15 +524,16 @@ def classify_site_imagery(
                     f"wide → {res.get('site_type')} conf={res.get('site_confidence')}"
                 )
 
-    # NAIP wide chip retry — rooftop pin-offset or weak other/unclear.
+    # NAIP wide — only when Nearmap never ran (coverage miss). Rooftop pin-offset
+    # already bought a wide Nearmap AOI; do not also fish 500 m NAIP.
     wide_was_other = False
     if (
-        (pin_offset_scout or naip_rescue)
+        naip_rescue
         and not ac.confident_no_asset(res)
         and ac.WIDE_AOI_STAGE
         and img is not None
         and ac.NAIP_WIDE_CHIP_M > ac.CHIP_SIZE_M
-        and res.get("site_type") in ("other", "unclear", "rooftop")
+        and res.get("site_type") in ("other", "unclear")
         and res.get("cell_equipment") is not True
     ):
         if verbose:
@@ -360,12 +553,7 @@ def classify_site_imagery(
                 input_conf,
                 escalate=False,
             )
-            prior_conf = res.get("site_confidence") or 0
-            wide_conf = wide_res.get("site_confidence") or 0
-            if (
-                wide_res.get("site_type") in ac._positive_site_types()
-                or wide_conf > prior_conf
-            ):
+            if ac.scout_result_wins(res, wide_res):
                 res = wide_res
                 img = wide_img
                 naip_geo = wide_geo
@@ -386,12 +574,17 @@ def classify_site_imagery(
                 wide_was_other = True
 
     # Zoom stage — skip when wide AOI also returned other.
+    # NAIP rescue zooms only other/unclear. Pin-offset still zooms rooftops
+    # (facade/parapet may sit just outside the pin chip).
+    zoom_types = (
+        ("other", "unclear", "rooftop") if pin_offset_scout else ("other", "unclear")
+    )
     if (
         (pin_offset_scout or naip_rescue)
         and not ac.confident_no_asset(res)
         and not wide_was_other
         and ac.ZOOM_STAGE
-        and res.get("site_type") in ("other", "unclear", "rooftop")
+        and res.get("site_type") in zoom_types
         and res.get("cell_equipment") is not True
     ):
         source_label, source_img = None, None
@@ -411,12 +604,7 @@ def classify_site_imagery(
                 source_img,
                 max_crops=ac.ZOOM_MAX_CANDIDATES,
             )
-            prior_conf = res.get("site_confidence") or 0
-            zoom_conf = zoom_res.get("site_confidence") or 0
-            if (
-                zoom_res.get("site_type") in ac._positive_site_types()
-                or zoom_conf > prior_conf
-            ):
+            if ac.scout_result_wins(res, zoom_res):
                 res = zoom_res
                 classification_stage = "zoom"
                 nearmap_tier = "zoom"
@@ -530,7 +718,7 @@ def classify_site_imagery(
         from_wide_rescue = False
 
     # Claude escalation after imagery stages.
-    if allow_claude_escalation:
+    if allow_claude_escalation and ac.should_attempt_claude_escalation(res):
         if verbose:
             progress.step("Claude escalate?")
         res, escalation_model, escalation_reason_str = ac.maybe_escalate_to_claude(
@@ -614,6 +802,7 @@ def classify_site_imagery(
     return {
         "lat": lat,
         "lon": lon,
+        "classify_coord_source": classify_coord_source,
         "site_type": res.get("site_type"),
         "tower_subtype": res.get("tower_subtype"),
         "site_confidence": res.get("site_confidence"),
@@ -643,6 +832,10 @@ def classify_site_imagery(
         "primary_model": primary_model,
         "escalation_model": escalation_model,
         "escalation_reason": escalation_reason_str,
+        "naip_screen_site_type": res.get("naip_screen_site_type"),
+        "naip_screen_site_confidence": res.get("naip_screen_site_confidence"),
+        "naip_screen_cell_equipment": res.get("naip_screen_cell_equipment"),
+        "second_nearmap": second_nearmap,
         "naip_chip_m": naip_chip_m,
         "image_date": img_date,
         "naip_year": (naip_meta or {}).get("naip_year"),

@@ -1,8 +1,10 @@
 """python -m enrichment
 
 Salesforce blank Site_Type → FCC/TowerSource → NAIP/Nearmap + Gemini/Claude → auto-apply.
-Holdouts dequeue. Optional env: STATES, LIMIT, IDS, CARRIER_LIKE, LLM_CLASSIFIED, APPLY, RUN_DIR, VERBOSE.
+Holdouts dequeue unless DEQUEUE_HOLDOUTS=0. Optional env: STATES, LIMIT,
+IDS, CARRIER_LIKE, LLM_CLASSIFIED, APPLY, DEQUEUE_HOLDOUTS, RUN_DIR, VERBOSE.
 Set APPLY=0 to classify without Salesforce writes.
+Set DEQUEUE_HOLDOUTS=0 to apply successes only and leave failed holdouts as-is.
 """
 
 from __future__ import annotations
@@ -72,9 +74,9 @@ def main() -> int:
         carrier_like=parse_carrier_like(os.environ.get("CARRIER_LIKE")),
         llm_classified=_flag("LLM_CLASSIFIED", "0"),
         apply=_flag("APPLY", "1"),
+        dequeue_holdouts=_flag("DEQUEUE_HOLDOUTS", "1"),
         verbose=_flag("VERBOSE"),
     )
-    print(summary, flush=True)
     failed = (summary.get("apply") or {}).get("failed", 0)
     return 0 if not failed else 2
 

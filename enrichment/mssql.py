@@ -186,8 +186,47 @@ def build_odbc_connection_string(
     return ";".join(parts)
 
 
-def _access_token_struct() -> bytes:
-    """Fetch an Entra token for Azure SQL in the packed form ODBC expects."""
+def _token_via_az_cmd() -> str | None:
+    """Windows fallback: azure-identity often cannot spawn az.cmd without cmd.exe."""
+    import json
+    import shutil
+    import subprocess
+    from pathlib import Path
+
+    az = shutil.which("az") or shutil.which("az.cmd")
+    if not az:
+        candidate = Path(r"C:\Program Files\Microsoft SDKs\Azure\CLI2\wbin\az.cmd")
+        az = str(candidate) if candidate.is_file() else None
+    if not az:
+        return None
+    cmd = [
+        az,
+        "account",
+        "get-access-token",
+        "--resource",
+        "https://database.windows.net/",
+        "-o",
+        "json",
+    ]
+    if az.lower().endswith(".cmd"):
+        cmd = ["cmd", "/c", *cmd]
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=120, check=False
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        data = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return None
+    return (data.get("accessToken") or "").strip() or None
+
+
+def _entra_sql_token() -> str:
+    """Entra token for Azure SQL: DefaultAzureCredential, then az.cmd on Windows."""
     try:
         from azure.identity import DefaultAzureCredential
     except ImportError as exc:  # pragma: no cover
@@ -196,9 +235,20 @@ def _access_token_struct() -> bytes:
             "Install with: pip install azure-identity"
         ) from exc
 
-    credential = DefaultAzureCredential(exclude_interactive_browser_credential=True)
-    token = credential.get_token(AZURE_SQL_SCOPE).token
-    encoded = token.encode("utf-16-le")
+    try:
+        credential = DefaultAzureCredential(exclude_interactive_browser_credential=True)
+        return credential.get_token(AZURE_SQL_SCOPE).token
+    except Exception as first:
+        token = _token_via_az_cmd()
+        if token:
+            logger.info("Azure SQL token acquired via az.cmd fallback")
+            return token
+        raise first
+
+
+def _access_token_struct() -> bytes:
+    """Fetch an Entra token for Azure SQL in the packed form ODBC expects."""
+    encoded = _entra_sql_token().encode("utf-16-le")
     return struct.pack("<I", len(encoded)) + encoded
 
 

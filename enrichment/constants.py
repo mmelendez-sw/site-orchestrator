@@ -24,12 +24,19 @@ PROXIMITY_ADDRESS_AFFINITY_M = float(
 MAX_ASSET_OFFSET_M = 75.0
 ASSET_OFFSET_LEEWAY_M = 10.0
 
+# SF pin vs Census. ≥75 m is a far coerce (CSV flag). Rooftop host compare
+# starts earlier: a parking-lot pin 25 m from the building still needs the roof.
+PIN_ADDRESS_MISMATCH_M = float(os.environ.get("PIN_ADDRESS_MISMATCH_M", "75"))
+ROOFTOP_HOST_OFFSET_M = float(os.environ.get("ROOFTOP_HOST_OFFSET_M", "20"))
+
 # Degrees buffer used for SQL bbox prefilter (~25–30 m at mid-latitudes).
 # Actual fetch buffer scales with PROXIMITY_MAX_M in mssql._buffer_deg_for_radius.
 BBOX_BUFFER_DEG = 0.0003
 
 FCC_TABLE = "dbo.FCCTowerData"
 TOWERSOURCE_TABLE = "dbo.TowerSourceASRTowers"
+ENRICHMENT_RUN_TABLE = "dbo.EnrichmentRun"
+ENRICHMENT_SITE_TABLE = "dbo.EnrichmentSiteOutcome"
 
 SF_QUERY_FIELDS = (
     "Id",
@@ -93,9 +100,13 @@ MIN_UPDATE_CONFIDENCE = 0.6
 MIN_ROOFTOP_CELL_CONFIDENCE = 0.75
 
 # Stricter bars when there is no FCC/TowerSource proximity hit.
-# Slightly below prior 0.85 so strong NAIP rooftops are not lost on conf alone.
-MIN_IMAGERY_ONLY_SITE_CONFIDENCE = 0.80
-MIN_IMAGERY_ONLY_CELL_CONFIDENCE = 0.80
+# 0.70: dual-model / Nearmap still required; 0.80 was dropping real towers.
+MIN_IMAGERY_ONLY_SITE_CONFIDENCE = float(
+    os.environ.get("MIN_IMAGERY_ONLY_SITE_CONFIDENCE", "0.70")
+)
+MIN_IMAGERY_ONLY_CELL_CONFIDENCE = float(
+    os.environ.get("MIN_IMAGERY_ONLY_CELL_CONFIDENCE", "0.80")
+)
 
 # Skip dual-model for towers when Gemini site_confidence is at/above this.
 # Must match classifier.asset_classifier.GEMINI_SOLO_CELL_CONF default.

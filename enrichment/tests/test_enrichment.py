@@ -843,7 +843,7 @@ class BucketTests(unittest.TestCase):
     def test_imagery_only_low_site_conf_held_out(self):
         decision = bucket_classification(
             match_source=MATCH_SOURCE_NONE,
-            classified=_rooftop_ok(site_confidence=0.7),
+            classified=_rooftop_ok(site_confidence=0.69),
             db_lat=None,
             db_lng=None,
             sf_lat=43.0,
@@ -1117,6 +1117,141 @@ class CostPolicyTests(unittest.TestCase):
         self.assertIsNotNone(match)
         self.assertIsNone(find_cluster_match(cache, 43.01, -89.0))
 
+    def test_second_nearmap_skips_locked_empty(self):
+        from enrichment.cost_policy import should_spend_second_nearmap
+
+        unused = (39.0, -94.0)
+        kwargs = dict(
+            unused_point=unused,
+            skip_paid_imagery=False,
+            has_nearmap_key=True,
+            site_type="other",
+            site_confidence=0.9,
+            nearmap_tier="full",
+            rooftop_unlocked=False,
+        )
+        self.assertFalse(should_spend_second_nearmap(**kwargs))
+        kwargs["site_confidence"] = 0.8
+        self.assertTrue(should_spend_second_nearmap(**kwargs))
+        kwargs["site_confidence"] = 0.9
+        kwargs["nearmap_tier"] = "no_coverage"
+        self.assertTrue(should_spend_second_nearmap(**kwargs))
+        kwargs["nearmap_tier"] = "full"
+        kwargs["site_type"] = "rooftop"
+        kwargs["rooftop_unlocked"] = True
+        self.assertTrue(should_spend_second_nearmap(**kwargs))
+
+    def test_metrics_empty_to_rooftop_funnel(self):
+        from enrichment.metrics import outcome_class, snapshot_run
+
+        rows = [
+            {
+                "Id": "a",
+                "naip_screen_site_type": "unclear",
+                "naip_site_type": "rooftop",
+                "naip_site_confidence": 0.8,
+                "nearmap_tier": "full",
+                "bucket": "potential_update",
+                "update_site_type": "Rooftop",
+                "escalation_model": "claude",
+            },
+            {
+                "Id": "b",
+                "naip_screen_site_type": "other",
+                "naip_site_type": "other",
+                "naip_site_confidence": 0.9,
+                "nearmap_tier": "full",
+                "bucket": "other_or_else",
+                "holdout_reason": "other",
+            },
+            {
+                "Id": "c",
+                "naip_screen_site_type": "rooftop",
+                "naip_site_type": "rooftop",
+                "naip_site_confidence": 0.45,
+                "nearmap_tier": "full",
+                "bucket": "potential_rooftop",
+                "holdout_reason": "low_confidence_imagery_only",
+                "escalation_model": "claude",
+            },
+        ]
+        self.assertEqual(outcome_class(rows[0]), "applied_rooftop")
+        self.assertEqual(outcome_class(rows[1]), "holdout_empty_confirmed")
+        self.assertEqual(outcome_class(rows[2]), "holdout_weak_rooftop")
+        snap = snapshot_run(rows, run_id="test")
+        self.assertEqual(snap["naip_empty_to_nearmap"], 2)
+        self.assertEqual(snap["naip_empty_to_rooftop_apply"], 1)
+        self.assertEqual(snap["empty_to_rooftop_apply_rate"], 0.5)
+        self.assertEqual(snap["applied_rooftop"], 1)
+
+    def test_metric_lines_match_ledger_keys(self):
+        from enrichment.metrics import (
+            RUN_METRIC_KEYS,
+            format_metric_value,
+            metric_lines,
+        )
+
+        self.assertEqual(format_metric_value("empty_to_rooftop_apply_rate", 0.333), "33.3%")
+        self.assertEqual(format_metric_value("applied_rooftop", 5), "5")
+        lines = metric_lines(
+            {"sites": 10, "applied_rooftop": 2, "empty_to_rooftop_apply_rate": 0.2},
+            RUN_METRIC_KEYS,
+        )
+        self.assertEqual(lines[0], "    sites: 10")
+        self.assertIn("    applied_rooftop: 2", lines)
+        self.assertIn("    empty_to_rooftop_apply_rate: 20.0%", lines)
+        self.assertFalse(any("holdout_rooftop" in line for line in lines))
+        self.assertFalse(any("gemini_sites" in line for line in lines))
+
+    def test_metrics_sql_row_mapping(self):
+        from enrichment.metrics_store import run_row, site_row
+
+        run = run_row(
+            {
+                "run_id": "2026-08-28_150606_sf_enrichment",
+                "recorded_at": "2026-08-28T19:17:07Z",
+                "sites": 8,
+                "applied_rooftop": 3,
+                "empty_to_rooftop_apply_rate": 0.333,
+            }
+        )
+        self.assertEqual(run[0], "2026-08-28_150606_sf_enrichment")
+        self.assertEqual(run[2], 8)
+        self.assertEqual(run[3], 3)
+        site = site_row(
+            {
+                "run_id": "r1",
+                "Id": "a0ZUq000004cJ72MAE",
+                "nearmap_ran": True,
+                "empty_to_nearmap": 1,
+                "outcome": "applied_rooftop",
+            }
+        )
+        self.assertEqual(site[1], "a0ZUq000004cJ72MAE")
+        self.assertEqual(site[6], 1)
+        self.assertEqual(site[17], "applied_rooftop")
+
+    def test_metrics_rollup_last_id_wins(self):
+        from enrichment.metrics import rollup_kpis
+
+        kpis = rollup_kpis(
+            [
+                {"Id": "a", "outcome": "holdout_empty", "empty_to_nearmap": True},
+                {
+                    "Id": "a",
+                    "outcome": "applied_rooftop",
+                    "empty_to_nearmap": True,
+                    "empty_to_rooftop_apply": True,
+                    "nearmap_ran": True,
+                },
+                {"Id": "b", "outcome": "holdout_empty_confirmed", "nearmap_ran": True},
+            ]
+        )
+        self.assertEqual(kpis["unique_sites"], 2)
+        self.assertEqual(kpis["rooftop_sf_writes"], 1)
+        self.assertEqual(kpis["holdout_empty_confirmed"], 1)
+        self.assertEqual(kpis["naip_empty_to_rooftop_apply"], 1)
+
     def test_osm_empty_chip_and_tower_tags(self):
         from enrichment.osm_prefilter import (
             osm_suggests_empty_chip,
@@ -1212,6 +1347,100 @@ class SimpleClassifyStampTests(unittest.TestCase):
             sf_lng=-115.0852,
         )
         self.assertEqual(decision["bucket"], BUCKET_POTENTIAL_UPDATE)
+
+
+class PinAddressGeocodeTests(unittest.TestCase):
+    def test_build_site_address(self):
+        from enrichment.geo import build_site_address
+
+        self.assertEqual(
+            build_site_address(
+                {
+                    "Site_Street__c": "1598 Cleveland Place",
+                    "Site_City__c": "DENVER",
+                    "Site_State__c": "CO",
+                    "Site_Zip_Code__c": "80202",
+                }
+            ),
+            "1598 Cleveland Place, DENVER, CO 80202",
+        )
+        self.assertIsNone(build_site_address({"Site_City__c": "DENVER"}))
+
+    def test_parse_census_payload_and_mismatch(self):
+        from enrichment.geo import (
+            parse_census_geocode_payload,
+            pin_address_is_mismatch,
+        )
+
+        parsed = parse_census_geocode_payload(
+            {
+                "result": {
+                    "addressMatches": [
+                        {
+                            "matchedAddress": "1598 CLEVELAND PL, DENVER, CO, 80202",
+                            "coordinates": {"x": -104.9879, "y": 39.7417},
+                        }
+                    ]
+                }
+            }
+        )
+        self.assertIsNotNone(parsed)
+        self.assertAlmostEqual(parsed["lat"], 39.7417)
+        self.assertAlmostEqual(parsed["lng"], -104.9879)
+        self.assertEqual(parsed["source"], "census")
+        self.assertFalse(pin_address_is_mismatch(20))
+        self.assertTrue(pin_address_is_mismatch(75))
+        self.assertTrue(pin_address_is_mismatch(180))
+        self.assertIsNone(parse_census_geocode_payload({"result": {"addressMatches": []}}))
+
+    def test_should_compare_rooftop_hosts(self):
+        from enrichment.geo import should_compare_rooftop_hosts
+
+        self.assertTrue(should_compare_rooftop_hosts(25))
+        self.assertFalse(should_compare_rooftop_hosts(10))
+        self.assertFalse(should_compare_rooftop_hosts(25, db_backed=True))
+        self.assertFalse(should_compare_rooftop_hosts(None))
+
+    def test_pick_classify_anchor_prefers_building_and_tower(self):
+        from enrichment.geo import (
+            mismatch_osm_is_decisive,
+            pick_classify_anchor,
+        )
+
+        empty = {
+            "ok": True,
+            "has_building": False,
+            "has_tower_or_mast": False,
+            "communication_tower": False,
+        }
+        building = {
+            "ok": True,
+            "has_building": True,
+            "has_tower_or_mast": False,
+            "communication_tower": False,
+        }
+        tower = {
+            "ok": True,
+            "has_building": False,
+            "has_tower_or_mast": True,
+            "communication_tower": True,
+        }
+        pick, _reason = pick_classify_anchor(pin_osm=empty, address_osm=building)
+        self.assertEqual(pick, "address")
+        self.assertTrue(mismatch_osm_is_decisive(empty, building))
+        pick, _reason = pick_classify_anchor(pin_osm=tower, address_osm=building)
+        self.assertEqual(pick, "pin")
+        pick, reason = pick_classify_anchor(pin_osm=building, address_osm=building)
+        self.assertEqual(pick, "pin")
+        self.assertIn("tie", reason)
+        self.assertFalse(mismatch_osm_is_decisive(building, building))
+        pick, _reason = pick_classify_anchor(
+            pin_osm=empty,
+            address_osm=empty,
+            pin_naip={"site_type": "unclear", "site_confidence": 0.1},
+            address_naip={"site_type": "rooftop", "site_confidence": 0.7},
+        )
+        self.assertEqual(pick, "address")
 
 
 if __name__ == "__main__":

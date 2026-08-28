@@ -140,8 +140,9 @@ GEMINI_SOFT_KEEP_CELL_CONF = float(os.environ.get("GEMINI_SOFT_KEEP_CELL_CONF", 
 GEMINI_SOLO_CELL_CONF = float(os.environ.get("GEMINI_SOLO_CELL_CONF", "0.90"))
 # Do not burn Claude on weak Gemini — below this site_confidence, skip
 # full-scene escalation and dual-model Claude. Weak calls stay holdout.
+# 0.60 matches the NAIP scout floor so imagery-only towers at 0.65 still get Claude.
 CLAUDE_ESCALATE_MIN_SITE_CONF = float(
-    os.environ.get("CLAUDE_ESCALATE_MIN_SITE_CONF", "0.70")
+    os.environ.get("CLAUDE_ESCALATE_MIN_SITE_CONF", "0.60")
 )
 # Min IoU between Gemini and Claude boxes on localize dual-confirm.
 GEMINI_CLAUDE_BOX_IOU = float(os.environ.get("GEMINI_CLAUDE_BOX_IOU", "0.20"))
@@ -1348,9 +1349,9 @@ def maybe_repair_rooftop_asset_box(
         _step_done("box repair", "skipped (weak rooftop, no cell claim)")
         return res
 
-    repair_views = _oblique_views_only(views) or list(views)
+    repair_views = _oblique_views_only(views)
     if not repair_views:
-        _step_done("box repair", "skipped (no views)")
+        _step_done("box repair", "skipped (no Nearmap obliques)")
         return res
 
     repair = classify_site(
@@ -1573,6 +1574,12 @@ def confirm_rooftop_cell_with_claude(
             )
         res["cell_models_agree"] = False
         return res, ("claude" if already_escalated else None), False
+
+    if site == "rooftop" and not _has_nearmap_context(res):
+        res["claude_cell_equipment"] = None
+        res["cell_models_agree"] = False
+        _step_done("dual-model cell", "skipped (NAIP-only rooftop)")
+        return res, None, False
 
     gemini_cell = True
     res["gemini_cell_equipment"] = True
@@ -2072,18 +2079,43 @@ def has_locked_oblique_asset_box(res: dict) -> bool:
 def needs_pin_offset_scout(res: dict) -> bool:
     """True when a rooftop pin may have missed facade/parapet gear.
 
-    Other/unclear sites use cheap NAIP wide/zoom instead of Nearmap recenters.
+    Rooftops buy a Nearmap wide AOI on the host building. Other/unclear
+    without Nearmap coverage use cheap NAIP wide/zoom instead.
     """
     if str(res.get("site_type") or "").strip().lower() != "rooftop":
         return False
     return res.get("cell_equipment") is not True
 
 
-def needs_naip_rescue(res: dict) -> bool:
-    """True when a weak NAIP other/unclear still warrants NAIP wide/zoom."""
-    site = str(res.get("site_type") or "").strip().lower()
-    if site == "unclear":
+def scout_result_wins(prior: dict, scout: dict) -> bool:
+    """True when a wide/zoom/address scout should replace the pin result.
+
+    A rooftop/tower label is not enough: confidence must clear TIER_CONF_MEDIUM
+    and must not drop versus an already-positive prior.
+    """
+    scout_site = str(scout.get("site_type") or "").strip().lower()
+    prior_site = str(prior.get("site_type") or "").strip().lower()
+    scout_conf = normalize_confidence(scout.get("site_confidence")) or 0.0
+    prior_conf = normalize_confidence(prior.get("site_confidence")) or 0.0
+    if scout_site in _positive_site_types():
+        if scout_conf < TIER_CONF_MEDIUM:
+            return False
+        if prior_site in _positive_site_types() and scout_conf < prior_conf:
+            return False
         return True
+    return scout_conf > prior_conf
+
+
+def needs_naip_rescue(res: dict) -> bool:
+    """True when a weak NAIP other/unclear still warrants NAIP wide/zoom.
+
+    Very low-confidence ``unclear`` (below TIER_CONF_MEDIUM) is not a signal —
+    do not spend wide/zoom hunting an empty chip.
+    """
+    site = str(res.get("site_type") or "").strip().lower()
+    conf = normalize_confidence(res.get("site_confidence"))
+    if site == "unclear":
+        return conf is not None and conf >= TIER_CONF_MEDIUM
     if site == "other":
         return not confident_no_asset(res)
     return False
@@ -2097,11 +2129,28 @@ def confident_no_asset(res: dict) -> bool:
     return conf is not None and conf >= TIER_CONF_HIGH
 
 
+def stamp_naip_screen(res: dict) -> dict:
+    """Keep the NAIP-screen label after Nearmap overwrites site_type."""
+    if res.get("naip_screen_site_type") not in (None, ""):
+        return res
+    res["naip_screen_site_type"] = res.get("site_type")
+    res["naip_screen_site_confidence"] = res.get("site_confidence")
+    res["naip_screen_cell_equipment"] = res.get("cell_equipment")
+    return res
+
+
 def needs_flash_confirm(res: dict) -> bool:
-    """Promote the NAIP lite screen to Flash for anything that is not a confident other."""
+    """Promote the NAIP lite screen to Flash for anything that is not a confident other.
+
+    Low-confidence ``unclear`` stays on the screen result — Flash will not invent
+    a tower from a 0.1 chip.
+    """
     site = str(res.get("site_type") or "").strip().lower()
-    if site in _positive_site_types() or site == "unclear":
+    if site in _positive_site_types():
         return True
+    if site == "unclear":
+        conf = normalize_confidence(res.get("site_confidence"))
+        return conf is not None and conf >= TIER_CONF_MEDIUM
     if site == "other":
         return not confident_no_asset(res)
     return False
@@ -2879,13 +2928,35 @@ def naip_age_blocks_early_stop(
     return True
 
 
+def _has_nearmap_context(res: dict) -> bool:
+    """True when this result already used Nearmap (not NAIP-only rescue)."""
+    tier = str(res.get("nearmap_tier") or "").strip().lower()
+    if tier in {"full", "wide_aoi", "vert_only"}:
+        return True
+    views = str(res.get("nearmap_views") or "").strip()
+    if views:
+        return True
+    return has_locked_oblique_asset_box(res)
+
+
 def escalation_reason(res: dict) -> str | None:
     """Why a Gemini result should escalate to Claude; None if no escalation."""
+    site = str(res.get("site_type") or "").strip().lower()
     conf = normalize_confidence(res.get("site_confidence"))
+    # Carrier-claimed site: Gemini "empty" on Nearmap still needs Claude.
+    # Check before the cell=false / conf-floor exits (other@0.8 is common).
+    if site in {"other", "unclear"} and _has_nearmap_context(res):
+        if gemini_confidence_locks_claude(res):
+            return None
+        if conf is not None and conf >= CLAUDE_ESCALATE_MIN_SITE_CONF:
+            return "nearmap_claimed_site_empty"
+        return None
     if conf is None or conf < CLAUDE_ESCALATE_MIN_SITE_CONF:
         return None
-    # Rooftops: burn Claude when cellular gear is not yet confirmed at bar.
+    # Rooftops: Claude is for Nearmap HVAC vs antenna, not a NAIP substitute.
     if _is_rooftop(res):
+        if not _has_nearmap_context(res):
+            return None
         if res.get("cell_equipment") is not True:
             return "rooftop_cell_unconfirmed"
         if not _rooftop_cell_confirmed(res):
@@ -2896,9 +2967,7 @@ def escalation_reason(res: dict) -> str | None:
     # Gemini already locked the call at >= 0.9 — don't overwrite with Claude.
     if gemini_confidence_locks_claude(res):
         return None
-    # other/unclear no longer escalate on type — need a cheaper second opinion
-    # that actually disagrees (see maybe_escalate_to_claude).
-    if str(res.get("site_type") or "").strip().lower() in {"other", "unclear"}:
+    if site in {"other", "unclear"}:
         return None
     if site_confidence_band(res) == "low":
         return "low_confidence"
@@ -2992,11 +3061,13 @@ def classify_with_tiers(lat: float, lon: float, img: Image.Image | None,
                         build_views,
                         naip_age_years: float | None = None,
                         db_backed: bool = False) -> tuple[dict, dict, str | None, str, list]:
-    """Tier 0 (NAIP) -> paid Nearmap only for rooftop / tower-cell.
+    """NAIP screen, then Nearmap Vert+obliques.
 
-    Confident NAIP ``other`` stops immediately. other/unclear otherwise stay
-    on NAIP (wide/zoom happen upstream). When Nearmap is required, Vert and
-    the configured obliques are fetched together and classified once.
+    FCC/TowerSource is the tower path (unique hit ≤25 m skips this). No DB
+    hit is the rooftop path: always buy obliques on the host building. NAIP
+    ``other``/``unclear`` is not evidence of no site — rooftop gear is usually
+    invisible at NAIP GSD. Skip paid imagery only when a DB-backed Gemini
+    tower is already locked, or there is no API key.
     """
     nearmap_views: dict = {}
     nearmap_date = None
@@ -3007,61 +3078,41 @@ def classify_with_tiers(lat: float, lon: float, img: Image.Image | None,
         provider, clients, views, prompt, input_confidence, screen=True
     )
     _step_done("classify (NAIP)", _brief_pass_result(res))
+    stamp_naip_screen(res)
 
-    if confident_no_asset(res):
-        _step_done("Nearmap skipped", f"confident other (>={TIER_CONF_HIGH:g})")
-        return res, nearmap_views, nearmap_date, "naip_only", views
-
-    force_nearmap = rooftop_requires_nearmap_tiers(res)
-    age_blocks = naip_age_blocks_early_stop(res, naip_age_years)
-    need_tower_obliques = tower_cell_requires_nearmap_obliques(
-        res, db_backed=db_backed
-    )
     if (
-        tier_confident_stop(res)
-        and not age_blocks
-        and not force_nearmap
-        and not need_tower_obliques
+        db_backed
+        and should_skip_claude_for_gemini_tower(res)
+        and not rooftop_requires_nearmap_tiers(res)
     ):
-        if db_backed and should_skip_claude_for_gemini_tower(res):
-            _step_done(
-                "Nearmap skipped",
-                f"DB-hit Gemini tower conf>={GEMINI_SOLO_CELL_CONF:g}",
-            )
-        return res, nearmap_views, nearmap_date, "naip_only", views
-
-    if not force_nearmap and not need_tower_obliques:
-        _step_done("Nearmap skipped", "NAIP other/unclear — no paid imagery")
+        _step_done(
+            "Nearmap skipped",
+            f"DB-hit Gemini tower conf>={GEMINI_SOLO_CELL_CONF:g}",
+        )
         return res, nearmap_views, nearmap_date, "naip_only", views
 
     if not db_backed:
         db_backed = _maybe_osm_adjust_before_nearmap(lat, lon, res)
-        need_tower_obliques = tower_cell_requires_nearmap_obliques(
-            res, db_backed=db_backed
-        )
-        if not force_nearmap and not need_tower_obliques:
-            _step_done("Nearmap skipped", "OSM tower + Gemini lock — no obliques")
+        if (
+            db_backed
+            and should_skip_claude_for_gemini_tower(res)
+            and not rooftop_requires_nearmap_tiers(res)
+        ):
+            _step_done(
+                "Nearmap skipped",
+                "OSM tower + Gemini lock — no obliques",
+            )
             return res, nearmap_views, nearmap_date, "naip_only", views
 
-    if force_nearmap and NEARMAP_API_KEY:
+    if rooftop_requires_nearmap_tiers(res):
         _step_done(
             "Nearmap required",
             "rooftop — Vert+obliques for cellular confirmation",
         )
-    elif need_tower_obliques and NEARMAP_API_KEY:
+    else:
         _step_done(
             "Nearmap required",
-            (
-                "imagery-only tower — Vert+obliques"
-                if not db_backed
-                else "DB tower below Gemini lock — Vert+obliques"
-            ),
-        )
-    elif tier_confident_stop(res) and age_blocks:
-        _step_done(
-            "Nearmap required",
-            f"rooftop on NAIP age {naip_age_years}y > {NAIP_MAX_AGE_YEARS:g}y "
-            f"and conf < {NAIP_AGE_HIGH_CONF_OVERRIDE:g}",
+            "claimed site — Vert+obliques (NAIP cannot rule out gear)",
         )
 
     if not NEARMAP_API_KEY:
@@ -3072,7 +3123,7 @@ def classify_with_tiers(lat: float, lon: float, img: Image.Image | None,
     nearmap_date = vert_date or nearmap_date
     if not nearmap_views:
         _step_done("Nearmap vert", "no coverage")
-        return res, nearmap_views, nearmap_date, "naip_only", views
+        return res, nearmap_views, nearmap_date, "no_coverage", views
     _step_done("Nearmap vert")
 
     missing = [v for v in OBLIQUE_VIEWS if v not in nearmap_views]
@@ -3840,6 +3891,23 @@ def cheap_second_opinion_disagrees(
     return str(second.get("site_type") or "").strip().lower() in _positive_site_types()
 
 
+def should_attempt_claude_escalation(res: dict) -> bool:
+    """True when Claude (or a Gemini second opinion) is worth spending.
+
+    Low-confidence NAIP ``unclear`` and NAIP-only rooftops are holdouts, not
+    Claude jobs.
+    """
+    if escalation_reason(res):
+        return True
+    site = str(res.get("site_type") or "").strip().lower()
+    if site not in {"other", "unclear"} or confident_no_asset(res):
+        return False
+    if site == "unclear":
+        conf = normalize_confidence(res.get("site_confidence"))
+        return conf is not None and conf >= TIER_CONF_MEDIUM
+    return True
+
+
 def maybe_escalate_to_claude(res: dict, clients: dict, views: list, prompt: str,
                              input_confidence: str,
                              *, allow: bool
@@ -3847,14 +3915,11 @@ def maybe_escalate_to_claude(res: dict, clients: dict, views: list, prompt: str,
     """Single late Claude escalation after all Gemini imagery stages."""
     if not allow:
         return res, None, None
+    if not should_attempt_claude_escalation(res):
+        return res, None, None
     reason = escalation_reason(res)
     if not reason:
-        site = str(res.get("site_type") or "").strip().lower()
-        if (
-            site in {"other", "unclear"}
-            and not confident_no_asset(res)
-            and cheap_second_opinion_disagrees(res, clients, views, prompt)
-        ):
+        if cheap_second_opinion_disagrees(res, clients, views, prompt):
             reason = "second_opinion_disagree"
         else:
             return res, None, None
@@ -4269,12 +4334,12 @@ def main():
                     classification_stage = "wide_aoi"
                     nearmap_tier = "wide_aoi"
 
-            # NAIP zoom-out: tower may sit just outside the 250 m frame (coords off).
-            # One extra Gemini call — cheap catch for "tower exists but out of picture".
+            # NAIP zoom-out: only when Nearmap never ran (coverage miss).
+            # Rooftop pin-offset already bought a wide Nearmap AOI.
             wide_was_other = False
-            if ((pin_offset_scout or naip_rescue) and WIDE_AOI_STAGE and img is not None
+            if (naip_rescue and WIDE_AOI_STAGE and img is not None
                     and not confident_no_asset(res)
-                    and res.get("site_type") in ("other", "unclear", "rooftop")
+                    and res.get("site_type") in ("other", "unclear")
                     and res.get("cell_equipment") is not True
                     and NAIP_WIDE_CHIP_M > CHIP_SIZE_M):
                 try:
@@ -4293,12 +4358,7 @@ def main():
                         stage_provider, clients, views, prompt,
                         input_confidence, escalate=False)
                     _step_done("classify (NAIP wide)", _brief_pass_result(wide_res))
-                    prior_conf = res.get("site_confidence") or 0
-                    wide_conf = wide_res.get("site_confidence") or 0
-                    wide_wins = (
-                        wide_res.get("site_type") in _positive_site_types()
-                        or wide_conf > prior_conf
-                    )
+                    wide_wins = scout_result_wins(res, wide_res)
                     if wide_wins:
                         res = wide_res
                         img = wide_img
@@ -4315,13 +4375,18 @@ def main():
 
             # Two-stage zoom: scout suspicious regions, magnify, re-classify.
             force_zoom = label_hint == "stealth"
+            zoom_types = (
+                ("other", "unclear", "rooftop")
+                if pin_offset_scout
+                else ("other", "unclear")
+            )
             if ((pin_offset_scout or naip_rescue or force_zoom) and ZOOM_STAGE
                     and not confident_no_asset(res)
                     and not wide_was_other
                     and (
                         force_zoom
                         or (
-                            res.get("site_type") in ("other", "unclear", "rooftop")
+                            res.get("site_type") in zoom_types
                             and res.get("cell_equipment") is not True
                         )
                     )):
@@ -4336,11 +4401,8 @@ def main():
                         source_label, source_img,
                         max_crops=3 if force_zoom else ZOOM_MAX_CANDIDATES)
                     _step_done("zoom crops", _brief_pass_result(zoom_res))
-                    prior_conf = res.get("site_confidence") or 0
-                    zoom_conf = zoom_res.get("site_confidence") or 0
                     zoom_wins = (
-                        zoom_res.get("site_type") in _positive_site_types()
-                        or zoom_conf > prior_conf
+                        scout_result_wins(res, zoom_res)
                         or (force_zoom and zoom_res.get("cell_equipment") is True)
                         or force_zoom
                     )
@@ -4350,7 +4412,7 @@ def main():
                         nearmap_tier = "zoom"
 
             # Claude only after Gemini has exhausted imagery stages.
-            if allow_claude_escalation:
+            if allow_claude_escalation and should_attempt_claude_escalation(res):
                 res, escalation_model, escalation_reason_str = (
                     maybe_escalate_to_claude(
                         res, clients, views, prompt, input_confidence,

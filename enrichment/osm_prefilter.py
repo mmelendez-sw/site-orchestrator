@@ -1,6 +1,8 @@
-"""Cheap OSM Overpass prefilter before Nearmap / extra vision calls.
+"""OSM Overpass lookup for nearby towers/buildings.
 
-Fail-open: any network/parse error means "do not skip paid imagery".
+Used as a positive signal (communication tower nearby). An empty Overpass
+result does **not** skip Nearmap — this queue is carrier-claimed cell sites,
+and OSM misses rooftop/stealth/small monopoles constantly.
 """
 
 from __future__ import annotations
@@ -114,7 +116,10 @@ def lookup_osm_features(
 
 
 def osm_suggests_empty_chip(info: dict[str, Any] | None) -> bool:
-    """True when OSM shows no building and no tower/mast (safe to skip Nearmap)."""
+    """True when OSM shows no building and no tower/mast.
+
+    Informational only — do not use this to skip Nearmap on a claimed site.
+    """
     if not info or not info.get("ok"):
         return False
     return not info.get("has_building") and not info.get("has_tower_or_mast")

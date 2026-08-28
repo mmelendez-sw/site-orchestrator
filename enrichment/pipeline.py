@@ -14,6 +14,7 @@ from enrichment.bucketing import (
     imagery_bucket,
     verified_source_for_match,
 )
+from enrichment.metrics import RUN_METRIC_KEYS, outcome_class, record_run
 from enrichment.naip_classify import classify_site_imagery
 from enrichment.constants import (
     APPLY_LOG_CSV,
@@ -25,6 +26,13 @@ from enrichment.constants import (
     HOLDOUT_CSV,
     MATCH_SOURCE_NONE,
     PROXIMITY_MAX_M,
+)
+from enrichment.geo import (
+    build_site_address,
+    geocode_census,
+    haversine_meters,
+    pin_address_is_mismatch,
+    should_compare_rooftop_hosts,
 )
 from enrichment.cost_policy import (
     find_cluster_match,
@@ -80,8 +88,10 @@ def run_enrichment(
 ) -> dict[str, Any]:
     """Run proximity + NAIP/Nearmap/Claude enrichment, write CSVs, auto-apply.
 
-    Certain rooftops and high-conf towers become Salesforce updates.
-    Remaining rows dequeue (LLM_Classified=false, LLM_Holdout=true).
+    Certain rooftops and high-conf towers become Salesforce updates
+    (LLM_Classified=true, LLM_Holdout=false). Remaining rows dequeue
+    (LLM_Classified=false, LLM_Holdout=true) unless ``dequeue_holdouts``
+    is false — then holdouts are left untouched.
     """
     run_dir.mkdir(parents=True, exist_ok=True)
     chip_dir = run_dir / "chips"
@@ -162,6 +172,7 @@ def run_enrichment(
                 verbose=verbose,
                 cluster_cache=cluster_cache,
             )
+            row["outcome_class"] = outcome_class(row)
             site_elapsed = time.monotonic() - site_t0
             row.setdefault("sf_update_status", "")
             row.setdefault("sf_update_error", "")
@@ -198,25 +209,7 @@ def run_enrichment(
                 f"updates={len(candidates)} holdouts={len(holdouts)} total={len(detail_rows)}"
             )
 
-        summary = {
-            "run_dir": str(run_dir),
-            "total": len(detail_rows),
-            "db_hits": sum(
-                1 for r in detail_rows if r.get("match_source") not in ("", MATCH_SOURCE_NONE)
-            ),
-            "potential_updates": len(candidates),
-            "holdout_rooftop": sum(1 for r in holdouts if r.get("bucket") == BUCKET_ROOFTOP),
-            "holdout_other": sum(1 for r in holdouts if r.get("bucket") == BUCKET_OTHER),
-            "errors": sum(1 for r in detail_rows if r.get("error")),
-            "imagery_naip_only": sum(
-                1 for r in detail_rows if r.get("imagery_used") == "naip"
-            ),
-            "gemini_sites": sum(
-                1
-                for r in detail_rows
-                if str(r.get("primary_model") or "").lower() == "gemini"
-            ),
-        }
+        apply_info: dict[str, Any] | None = None
         if apply:
             apply_rows = list(candidates)
             if dequeue_holdouts:
@@ -228,7 +221,7 @@ def run_enrichment(
             if apply_rows:
                 batch_csv = run_dir / "_apply_batch.csv"
                 write_csv(batch_csv, apply_rows, DETAIL_COLUMNS)
-                summary["apply"] = apply_candidate_csv(
+                apply_info = apply_candidate_csv(
                     sf_client=sf_client,
                     candidate_csv=batch_csv,
                     run_dir=run_dir,
@@ -236,13 +229,50 @@ def run_enrichment(
                     verbose=verbose,
                 )
             else:
-                summary["apply"] = {
+                apply_info = {
                     "total": 0,
                     "success": 0,
                     "dequeued_holdouts": 0,
                     "failed": 0,
                     "apply": True,
                 }
+        run_block: dict[str, Any] = {
+            "sites": len(detail_rows),
+            "applied_rooftop": sum(
+                1 for r in detail_rows if r.get("outcome_class") == "applied_rooftop"
+            ),
+            "applied_tower": sum(
+                1 for r in detail_rows if r.get("outcome_class") == "applied_tower"
+            ),
+            "sf_writes": (apply_info or {}).get("success", 0) if apply else 0,
+            "sf_holdouts_dequeued": (apply_info or {}).get("dequeued_holdouts", 0)
+            if apply
+            else 0,
+            "sf_write_failed": (apply_info or {}).get("failed", 0) if apply else 0,
+        }
+        kpis_block: dict[str, Any] | None = None
+        try:
+            metrics_snap = record_run(
+                run_dir=run_dir,
+                detail_rows=detail_rows,
+                apply_summary=apply_info if apply else None,
+            )
+            run_block = {
+                key: metrics_snap[key]
+                for key in ("run_id", *RUN_METRIC_KEYS)
+                if key in metrics_snap
+            }
+            kpis_block = metrics_snap.get("kpis")
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("metrics ledger skipped: %s", exc)
+            if verbose:
+                progress.warn(f"metrics ledger skipped: {exc}")
+        summary = {
+            "run_dir": str(run_dir),
+            "run": run_block,
+            "kpis": kpis_block,
+            "apply": apply_info or {"failed": 0, "success": 0, "dequeued_holdouts": 0},
+        }
         (run_dir / "summary.json").write_text(
             json.dumps(summary, indent=2), encoding="utf-8"
         )
@@ -318,6 +348,11 @@ def _process_site(
         "primary_model": "",
         "escalation_model": "",
         "escalation_reason": "",
+        "naip_screen_site_type": "",
+        "naip_screen_site_confidence": "",
+        "naip_screen_cell_equipment": "",
+        "second_nearmap": "",
+        "outcome_class": "",
         "asset_lat": "",
         "asset_lon": "",
         "asset_offset_m": "",
@@ -353,6 +388,29 @@ def _process_site(
         progress.stage("PROXIMITY", f"≤{max_m:g} m")
     addr_lat = None
     addr_lng = None
+    address_query = build_site_address(site)
+    if address_query:
+        base["address_query"] = address_query
+        geo = geocode_census(address_query)
+        if geo:
+            addr_lat, addr_lng = geo["lat"], geo["lng"]
+            base["address_lat"] = addr_lat
+            base["address_lng"] = addr_lng
+            base["address_geocode_source"] = geo.get("source") or "census"
+            base["address_matched"] = geo.get("matched") or ""
+            offset_m = haversine_meters(sf_lat, sf_lng, addr_lat, addr_lng)
+            base["pin_address_offset_m"] = round(offset_m, 1)
+            mismatch = pin_address_is_mismatch(offset_m)
+            base["pin_address_mismatch"] = mismatch
+            if verbose:
+                extra = ""
+                if mismatch:
+                    extra = " — far mismatch, pick pin vs Census before Nearmap"
+                elif should_compare_rooftop_hosts(offset_m, db_backed=False):
+                    extra = " — rooftop host compare if no FCC/TS hit"
+                progress.result(
+                    f"Census address {offset_m:.0f} m from pin{extra}"
+                )
     try:
         hit = find_proximity_hit(
             cursor,
@@ -395,7 +453,15 @@ def _process_site(
         classify_lat, classify_lng = sf_lat, sf_lng
         base["classify_coord_source"] = "sf_pin"
         if verbose:
-            progress.result("no DB hit → classify on SF pin")
+            if should_compare_rooftop_hosts(
+                base.get("pin_address_offset_m") or None, db_backed=False
+            ):
+                progress.result(
+                    "no tower DB hit → rooftop path "
+                    "(pick host building before Nearmap)"
+                )
+            else:
+                progress.result("no DB hit → classify on SF pin")
 
     base["classify_lat"] = classify_lat
     base["classify_lng"] = classify_lng
@@ -484,6 +550,8 @@ def _process_site(
         "verbose": verbose,
         "pin_lat": float(sf_lat),
         "pin_lon": float(sf_lng),
+        "address_lat": addr_lat,
+        "address_lon": addr_lng,
         "pin_address_offset_m": (
             float(base["pin_address_offset_m"])
             if base["pin_address_offset_m"] != ""
@@ -541,6 +609,14 @@ def _process_site(
     base["primary_model"] = classified.get("primary_model") or ""
     base["escalation_model"] = classified.get("escalation_model") or ""
     base["escalation_reason"] = classified.get("escalation_reason") or ""
+    base["naip_screen_site_type"] = classified.get("naip_screen_site_type") or ""
+    base["naip_screen_site_confidence"] = (
+        classified.get("naip_screen_site_confidence") or ""
+    )
+    base["naip_screen_cell_equipment"] = classified.get(
+        "naip_screen_cell_equipment"
+    )
+    base["second_nearmap"] = classified.get("second_nearmap") or ""
     base["asset_lat"] = classified.get("asset_lat") or ""
     base["asset_lon"] = classified.get("asset_lon") or ""
     base["asset_offset_m"] = classified.get("asset_offset_m") or ""
@@ -549,6 +625,18 @@ def _process_site(
     base["asset_view"] = classified.get("asset_view") or ""
     if classified.get("error"):
         base["error"] = classified.get("error")
+    if hit is None:
+        src = classified.get("classify_coord_source")
+        if src:
+            base["classify_coord_source"] = src
+        try:
+            if classified.get("lat") is not None and classified.get("lon") is not None:
+                classify_lat = float(classified["lat"])
+                classify_lng = float(classified["lon"])
+                base["classify_lat"] = classify_lat
+                base["classify_lng"] = classify_lng
+        except (TypeError, ValueError):
+            pass
 
     decision = bucket_classification(
         match_source=base["match_source"],
@@ -652,6 +740,8 @@ def apply_candidate_csv(
         "log": str(log_path),
     }
     if verbose:
-        progress.dump_summary(summary)
+        progress.result(
+            f"sf_writes={tower_updated} dequeued_holdouts={dequeued} failed={failed}"
+        )
     logger.info("Apply summary: %s", summary)
     return summary

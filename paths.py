@@ -35,9 +35,20 @@ def chips_dir() -> Path:
     return data_root() / "chips"
 
 
+def metrics_dir() -> Path:
+    return data_root() / "metrics"
+
+
 def ensure_data_layout() -> Path:
     """Create the sibling data tree if missing. Returns the root."""
     root = data_root()
-    for path in (root, inputs_dir(), datasets_dir(), runs_dir(), chips_dir()):
+    for path in (
+        root,
+        inputs_dir(),
+        datasets_dir(),
+        runs_dir(),
+        chips_dir(),
+        metrics_dir(),
+    ):
         path.mkdir(parents=True, exist_ok=True)
     return root
