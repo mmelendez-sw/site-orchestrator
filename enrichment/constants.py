@@ -35,8 +35,6 @@ BBOX_BUFFER_DEG = 0.0003
 
 FCC_TABLE = "dbo.FCCTowerData"
 TOWERSOURCE_TABLE = "dbo.TowerSourceASRTowers"
-ENRICHMENT_RUN_TABLE = "dbo.EnrichmentRun"
-ENRICHMENT_SITE_TABLE = "dbo.EnrichmentSiteOutcome"
 
 SF_QUERY_FIELDS = (
     "Id",

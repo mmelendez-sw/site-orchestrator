@@ -8,17 +8,21 @@ There is no upload-template or CSV-import step. Run CSVs under `../site-orchestr
 python -m enrichment
 ```
 
-Set `APPLY=0` to classify and write CSVs without Salesforce updates. Optional env: `STATES`, `LIMIT`, `IDS`, `CARRIER_LIKE`, `LLM_CLASSIFIED`, `RUN_DIR`, `VERBOSE`.
+Set `APPLY=0` to classify and write CSVs without Salesforce updates. Optional env: `STATES`, `LIMIT`, `IDS`, `CARRIER_LIKE`, `LLM_CLASSIFIED`, `RUN_DIR`, `VERBOSE`, `METRICS_SQL`, `DEQUEUE_HOLDOUTS`.
 
 `CARRIER_LIKE` is the `Carrier_Leasing_Source__c` LIKE needle (default `NFL`). Set `CARRIER_LIKE=none` to pull without a carrier filter. Enrichment does not write that field. The queue defaults to `LLM_Classified__c = false`; set `LLM_CLASSIFIED=1` only to re-pull already-flagged rows.
+
+Leadership KPIs land in Azure SQL (`dbo.EnrichmentRun` / `dbo.EnrichmentSiteOutcome`) at the end of every run. Details: [docs/enrichment-metrics.md](docs/enrichment-metrics.md).
 
 ## Layout
 
 ```
 site-orchestrator/
-├── enrichment/     # pull → proximity → classify → apply
+├── enrichment/     # pull → proximity → classify → apply → metrics upsert
 ├── classifier/     # NAIP + Nearmap imagery, Gemini + Claude, OSM prefilter
 ├── salesforce/     # auth + Site_Type picklist mapping
+├── sql/            # enrichment metrics DDL (Symphony_dev)
+├── docs/           # metrics schema and queries
 ├── paths.py        # sibling data folder
 └── requirements.txt
 ```

@@ -1,125 +1,26 @@
-"""Azure SQL tables for enrichment run/site metrics (Symphony_dev).
+"""Load enrichment metrics DDL from sql/enrichment_metrics.sql (GO batches)."""
 
-Fact grain is (RunId, SalesforceId). Views give last-Id-wins KPIs.
-Idempotent: IF OBJECT_ID ... IS NULL.
-"""
+from __future__ import annotations
 
-DDL_STATEMENTS: tuple[str, ...] = (
-    """
-    IF OBJECT_ID(N'dbo.EnrichmentRun', N'U') IS NULL
-    BEGIN
-        CREATE TABLE dbo.EnrichmentRun (
-            RunId                   nvarchar(80)   NOT NULL,
-            RecordedAt              datetime2(0)   NOT NULL
-                CONSTRAINT DF_EnrichmentRun_RecordedAt DEFAULT (sysutcdatetime()),
-            Sites                   int            NOT NULL CONSTRAINT DF_EnrichmentRun_Sites DEFAULT (0),
-            AppliedRooftop          int            NOT NULL CONSTRAINT DF_EnrichmentRun_AppliedRooftop DEFAULT (0),
-            AppliedTower            int            NOT NULL CONSTRAINT DF_EnrichmentRun_AppliedTower DEFAULT (0),
-            AppliedDbSkip           int            NOT NULL CONSTRAINT DF_EnrichmentRun_AppliedDbSkip DEFAULT (0),
-            HoldoutEmptyConfirmed   int            NOT NULL CONSTRAINT DF_EnrichmentRun_HoldoutEmptyConfirmed DEFAULT (0),
-            HoldoutWeakRooftop      int            NOT NULL CONSTRAINT DF_EnrichmentRun_HoldoutWeakRooftop DEFAULT (0),
-            HoldoutWeakTower        int            NOT NULL CONSTRAINT DF_EnrichmentRun_HoldoutWeakTower DEFAULT (0),
-            HoldoutEmpty            int            NOT NULL CONSTRAINT DF_EnrichmentRun_HoldoutEmpty DEFAULT (0),
-            HoldoutNoNearmap        int            NOT NULL CONSTRAINT DF_EnrichmentRun_HoldoutNoNearmap DEFAULT (0),
-            Errors                  int            NOT NULL CONSTRAINT DF_EnrichmentRun_Errors DEFAULT (0),
-            NearmapSites            int            NOT NULL CONSTRAINT DF_EnrichmentRun_NearmapSites DEFAULT (0),
-            ClaudeSites             int            NOT NULL CONSTRAINT DF_EnrichmentRun_ClaudeSites DEFAULT (0),
-            NaipEmptyToNearmap      int            NOT NULL CONSTRAINT DF_EnrichmentRun_NaipEmptyToNearmap DEFAULT (0),
-            NaipEmptyToRooftop      int            NOT NULL CONSTRAINT DF_EnrichmentRun_NaipEmptyToRooftop DEFAULT (0),
-            NaipEmptyToRooftopApply int            NOT NULL CONSTRAINT DF_EnrichmentRun_NaipEmptyToRooftopApply DEFAULT (0),
-            EmptyToRooftopApplyRate decimal(6,3)   NULL,
-            SfWrites                int            NOT NULL CONSTRAINT DF_EnrichmentRun_SfWrites DEFAULT (0),
-            SfHoldoutsDequeued      int            NOT NULL CONSTRAINT DF_EnrichmentRun_SfHoldoutsDequeued DEFAULT (0),
-            SfWriteFailed           int            NOT NULL CONSTRAINT DF_EnrichmentRun_SfWriteFailed DEFAULT (0),
-            Notes                   nvarchar(400)  NULL,
-            CONSTRAINT PK_EnrichmentRun PRIMARY KEY CLUSTERED (RunId)
-        );
-    END
-    """,
-    """
-    IF OBJECT_ID(N'dbo.EnrichmentSiteOutcome', N'U') IS NULL
-    BEGIN
-        CREATE TABLE dbo.EnrichmentSiteOutcome (
-            RunId                 nvarchar(80)   NOT NULL,
-            SalesforceId          nvarchar(18)   NOT NULL,
-            Address               nvarchar(300)  NULL,
-            ScreenSiteType        nvarchar(32)   NULL,
-            FinalSiteType         nvarchar(32)   NULL,
-            FinalConfidence       decimal(4,3)   NULL,
-            NearmapRan            bit            NOT NULL CONSTRAINT DF_EnrichmentSite_NearmapRan DEFAULT (0),
-            NearmapTier           nvarchar(32)   NULL,
-            ClaudeRan             bit            NOT NULL CONSTRAINT DF_EnrichmentSite_ClaudeRan DEFAULT (0),
-            EscalationReason      nvarchar(80)   NULL,
-            SecondNearmap         nvarchar(32)   NULL,
-            EmptyToNearmap        bit            NOT NULL CONSTRAINT DF_EnrichmentSite_EmptyToNearmap DEFAULT (0),
-            EmptyToRooftop        bit            NOT NULL CONSTRAINT DF_EnrichmentSite_EmptyToRooftop DEFAULT (0),
-            EmptyToRooftopApply   bit            NOT NULL CONSTRAINT DF_EnrichmentSite_EmptyToRooftopApply DEFAULT (0),
-            Bucket                nvarchar(64)   NULL,
-            HoldoutReason         nvarchar(128)  NULL,
-            UpdateSiteType        nvarchar(32)   NULL,
-            Outcome               nvarchar(64)   NOT NULL,
-            SfUpdateStatus        nvarchar(32)   NULL,
-            Notes                 nvarchar(400)  NULL,
-            CONSTRAINT PK_EnrichmentSiteOutcome PRIMARY KEY CLUSTERED (RunId, SalesforceId),
-            CONSTRAINT FK_EnrichmentSiteOutcome_Run
-                FOREIGN KEY (RunId) REFERENCES dbo.EnrichmentRun (RunId)
-        );
-        CREATE INDEX IX_EnrichmentSiteOutcome_SalesforceId
-            ON dbo.EnrichmentSiteOutcome (SalesforceId, RunId);
-        CREATE INDEX IX_EnrichmentSiteOutcome_Outcome
-            ON dbo.EnrichmentSiteOutcome (Outcome, RunId);
-    END
-    """,
-    "IF OBJECT_ID(N'dbo.vEnrichmentKpis', N'V') IS NOT NULL DROP VIEW dbo.vEnrichmentKpis;",
-    "IF OBJECT_ID(N'dbo.vEnrichmentSiteLatest', N'V') IS NOT NULL DROP VIEW dbo.vEnrichmentSiteLatest;",
-    """
-    CREATE VIEW dbo.vEnrichmentSiteLatest
-    AS
-    SELECT o.*
-    FROM dbo.EnrichmentSiteOutcome AS o
-    INNER JOIN (
-        SELECT
-            o2.SalesforceId,
-            o2.RunId,
-            ROW_NUMBER() OVER (
-                PARTITION BY o2.SalesforceId
-                ORDER BY r.RecordedAt DESC, o2.RunId DESC
-            ) AS rn
-        FROM dbo.EnrichmentSiteOutcome AS o2
-        INNER JOIN dbo.EnrichmentRun AS r ON r.RunId = o2.RunId
-    ) AS latest
-        ON latest.SalesforceId = o.SalesforceId
-       AND latest.RunId = o.RunId
-       AND latest.rn = 1
-    """,
-    """
-    CREATE VIEW dbo.vEnrichmentKpis
-    AS
-    SELECT
-        COUNT(*) AS UniqueSites,
-        SUM(CASE WHEN Outcome = N'applied_rooftop' THEN 1 ELSE 0 END) AS RooftopSfWrites,
-        SUM(CASE WHEN Outcome = N'applied_tower' THEN 1 ELSE 0 END) AS TowerSfWrites,
-        SUM(CASE WHEN Outcome = N'applied_db_skip' THEN 1 ELSE 0 END) AS AppliedDbSkip,
-        SUM(CASE WHEN Outcome = N'holdout_empty_confirmed' THEN 1 ELSE 0 END) AS HoldoutEmptyConfirmed,
-        SUM(CASE WHEN Outcome = N'holdout_weak_rooftop' THEN 1 ELSE 0 END) AS HoldoutWeakRooftop,
-        SUM(CASE WHEN Outcome = N'holdout_weak_tower' THEN 1 ELSE 0 END) AS HoldoutWeakTower,
-        SUM(CASE WHEN Outcome = N'holdout_empty' THEN 1 ELSE 0 END) AS HoldoutEmpty,
-        SUM(CASE WHEN Outcome = N'holdout_no_nearmap' THEN 1 ELSE 0 END) AS HoldoutNoNearmap,
-        SUM(CASE WHEN Outcome = N'error' THEN 1 ELSE 0 END) AS Errors,
-        SUM(CASE WHEN NearmapRan = 1 THEN 1 ELSE 0 END) AS NearmapSites,
-        SUM(CASE WHEN ClaudeRan = 1 THEN 1 ELSE 0 END) AS ClaudeSites,
-        SUM(CASE WHEN EmptyToNearmap = 1 THEN 1 ELSE 0 END) AS NaipEmptyToNearmap,
-        SUM(CASE WHEN EmptyToRooftopApply = 1 THEN 1 ELSE 0 END) AS NaipEmptyToRooftopApply,
-        CAST(
-            SUM(CASE WHEN EmptyToRooftopApply = 1 THEN 1 ELSE 0 END) * 1.0
-            / NULLIF(SUM(CASE WHEN EmptyToNearmap = 1 THEN 1 ELSE 0 END), 0)
-            AS decimal(6,3)
-        ) AS EmptyToRooftopApplyRate,
-        CAST(
-            SUM(CASE WHEN Outcome = N'applied_rooftop' THEN 1 ELSE 0 END) * 1.0
-            / NULLIF(COUNT(*), 0)
-            AS decimal(6,3)
-        ) AS RooftopWriteRate
-    FROM dbo.vEnrichmentSiteLatest
-    """,
-)
+import re
+from pathlib import Path
+
+SQL_FILE = Path(__file__).resolve().parents[1] / "sql" / "enrichment_metrics.sql"
+
+_GO = re.compile(r"(?im)^\s*GO\s*;?\s*$")
+
+
+def ddl_statements(sql_text: str | None = None) -> tuple[str, ...]:
+    """Split SSMS batches. CREATE VIEW must be its own batch (after GO)."""
+    text = sql_text if sql_text is not None else SQL_FILE.read_text(encoding="utf-8")
+    batches: list[str] = []
+    for part in _GO.split(text):
+        lines = [
+            line
+            for line in part.splitlines()
+            if line.strip() and not line.strip().startswith("--")
+        ]
+        stmt = "\n".join(lines).strip()
+        if stmt:
+            batches.append(stmt)
+    return tuple(batches)

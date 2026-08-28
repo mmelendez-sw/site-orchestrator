@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from typing import Any, Iterable
 
 from enrichment.metrics import rec_true
-from enrichment.metrics_ddl import DDL_STATEMENTS
+from enrichment.metrics_ddl import ddl_statements
 
 logger = logging.getLogger(__name__)
 
@@ -81,32 +81,45 @@ def run_row(run: dict[str, Any]) -> tuple[Any, ...]:
         _int(run.get("sf_writes")),
         _int(run.get("sf_holdouts_dequeued")),
         _int(run.get("sf_write_failed")),
+        _int(run.get("apply_enabled")),
+        (str(run.get("queue_states") or "") or None),
+        (None if run.get("queue_limit") in (None, "") else _int(run.get("queue_limit"))),
         (str(run.get("notes") or "") or None),
     )
 
 
 def site_row(site: dict[str, Any]) -> tuple[Any, ...]:
+    from enrichment.metrics import apply_slice_fields
+
+    rec = apply_slice_fields(site)
     return (
-        str(site.get("run_id") or "")[:80],
-        str(site.get("Id") or site.get("SalesforceId") or "")[:18],
-        (str(site.get("address") or "") or None),
-        (str(site.get("screen_site_type") or "") or None),
-        (str(site.get("final_site_type") or "") or None),
-        _dec(site.get("final_confidence")),
-        _bit(site.get("nearmap_ran")),
-        (str(site.get("nearmap_tier") or "") or None),
-        _bit(site.get("claude_ran")),
-        (str(site.get("escalation_reason") or "") or None),
-        (str(site.get("second_nearmap") or "") or None),
-        _bit(site.get("empty_to_nearmap")),
-        _bit(site.get("empty_to_rooftop")),
-        _bit(site.get("empty_to_rooftop_apply")),
-        (str(site.get("bucket") or "") or None),
-        (str(site.get("holdout_reason") or "") or None),
-        (str(site.get("update_site_type") or "") or None),
-        str(site.get("outcome") or "holdout_other")[:64],
-        (str(site.get("sf_update_status") or "") or None),
-        (str(site.get("notes") or "") or None),
+        str(rec.get("run_id") or "")[:80],
+        str(rec.get("Id") or rec.get("SalesforceId") or "")[:18],
+        (str(rec.get("address") or "") or None),
+        rec.get("site_state"),
+        rec.get("site_city"),
+        rec.get("carrier"),
+        rec.get("match_source"),
+        rec.get("dual_model_resolution"),
+        rec.get("classify_coord_source"),
+        _dec(rec.get("asset_offset_m")),
+        (str(rec.get("screen_site_type") or "") or None),
+        (str(rec.get("final_site_type") or "") or None),
+        _dec(rec.get("final_confidence")),
+        _bit(rec.get("nearmap_ran")),
+        (str(rec.get("nearmap_tier") or "") or None),
+        _bit(rec.get("claude_ran")),
+        (str(rec.get("escalation_reason") or "") or None),
+        (str(rec.get("second_nearmap") or "") or None),
+        _bit(rec.get("empty_to_nearmap")),
+        _bit(rec.get("empty_to_rooftop")),
+        _bit(rec.get("empty_to_rooftop_apply")),
+        (str(rec.get("bucket") or "") or None),
+        (str(rec.get("holdout_reason") or "") or None),
+        (str(rec.get("update_site_type") or "") or None),
+        str(rec.get("outcome") or "holdout_other")[:64],
+        (str(rec.get("sf_update_status") or "") or None),
+        (str(rec.get("notes") or "") or None),
     )
 
 
@@ -118,7 +131,8 @@ USING (SELECT
     ? AS HoldoutWeakTower, ? AS HoldoutEmpty, ? AS HoldoutNoNearmap, ? AS Errors,
     ? AS NearmapSites, ? AS ClaudeSites, ? AS NaipEmptyToNearmap,
     ? AS NaipEmptyToRooftop, ? AS NaipEmptyToRooftopApply, ? AS EmptyToRooftopApplyRate,
-    ? AS SfWrites, ? AS SfHoldoutsDequeued, ? AS SfWriteFailed, ? AS Notes
+    ? AS SfWrites, ? AS SfHoldoutsDequeued, ? AS SfWriteFailed,
+    ? AS ApplyEnabled, ? AS QueueStates, ? AS QueueLimit, ? AS Notes
 ) AS s
 ON t.RunId = s.RunId
 WHEN MATCHED THEN UPDATE SET
@@ -132,34 +146,39 @@ WHEN MATCHED THEN UPDATE SET
     NaipEmptyToRooftopApply = s.NaipEmptyToRooftopApply,
     EmptyToRooftopApplyRate = s.EmptyToRooftopApplyRate, SfWrites = s.SfWrites,
     SfHoldoutsDequeued = s.SfHoldoutsDequeued, SfWriteFailed = s.SfWriteFailed,
-    Notes = s.Notes
+    ApplyEnabled = s.ApplyEnabled, QueueStates = s.QueueStates,
+    QueueLimit = s.QueueLimit, Notes = s.Notes
 WHEN NOT MATCHED THEN INSERT (
     RunId, RecordedAt, Sites, AppliedRooftop, AppliedTower, AppliedDbSkip,
     HoldoutEmptyConfirmed, HoldoutWeakRooftop, HoldoutWeakTower, HoldoutEmpty,
     HoldoutNoNearmap, Errors, NearmapSites, ClaudeSites, NaipEmptyToNearmap,
     NaipEmptyToRooftop, NaipEmptyToRooftopApply, EmptyToRooftopApplyRate,
-    SfWrites, SfHoldoutsDequeued, SfWriteFailed, Notes
+    SfWrites, SfHoldoutsDequeued, SfWriteFailed, ApplyEnabled, QueueStates,
+    QueueLimit, Notes
 ) VALUES (
     s.RunId, s.RecordedAt, s.Sites, s.AppliedRooftop, s.AppliedTower, s.AppliedDbSkip,
     s.HoldoutEmptyConfirmed, s.HoldoutWeakRooftop, s.HoldoutWeakTower, s.HoldoutEmpty,
     s.HoldoutNoNearmap, s.Errors, s.NearmapSites, s.ClaudeSites, s.NaipEmptyToNearmap,
     s.NaipEmptyToRooftop, s.NaipEmptyToRooftopApply, s.EmptyToRooftopApplyRate,
-    s.SfWrites, s.SfHoldoutsDequeued, s.SfWriteFailed, s.Notes
+    s.SfWrites, s.SfHoldoutsDequeued, s.SfWriteFailed, s.ApplyEnabled, s.QueueStates,
+    s.QueueLimit, s.Notes
 );
 """
 
 _INSERT_SITE = """
 INSERT INTO dbo.EnrichmentSiteOutcome (
-    RunId, SalesforceId, Address, ScreenSiteType, FinalSiteType, FinalConfidence,
+    RunId, SalesforceId, Address, SiteState, SiteCity, Carrier, MatchSource,
+    DualModelResolution, ClassifyCoordSource, AssetOffsetM,
+    ScreenSiteType, FinalSiteType, FinalConfidence,
     NearmapRan, NearmapTier, ClaudeRan, EscalationReason, SecondNearmap,
     EmptyToNearmap, EmptyToRooftop, EmptyToRooftopApply, Bucket, HoldoutReason,
     UpdateSiteType, Outcome, SfUpdateStatus, Notes
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 
 def ensure_tables(cursor) -> None:
-    for stmt in DDL_STATEMENTS:
+    for stmt in ddl_statements():
         cursor.execute(stmt)
 
 

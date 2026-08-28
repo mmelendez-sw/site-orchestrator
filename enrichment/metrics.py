@@ -7,6 +7,7 @@ Each run appends to JSONL under SITE_ORCHESTRATOR_DATA/metrics/.
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -23,7 +24,6 @@ SITES_JSONL = "sites.jsonl"
 KPIS_JSON = "kpis.json"
 
 EMPTY_SCREEN = frozenset({"other", "unclear"})
-POSITIVE_FINAL = frozenset({"rooftop", "tower"})
 
 
 def _lower(value: Any) -> str:
@@ -90,12 +90,77 @@ def outcome_class(row: dict[str, Any]) -> str:
     return "holdout_other"
 
 
+def _opt(value: Any, n: int) -> str | None:
+    text = str(value or "").strip()
+    return text[:n] if text else None
+
+
+def site_state(row: dict[str, Any]) -> str | None:
+    raw = _opt(row.get("site_state") or row.get("Site_State__c"), 8)
+    if raw:
+        return raw.upper()
+    parts = [
+        p.strip()
+        for p in str(row.get("address") or "").split(",")
+        if p.strip()
+    ]
+    if parts:
+        token = parts[-1].replace(".", "")
+        if 2 <= len(token) <= 3 and token.isalpha():
+            return token.upper()
+    return None
+
+
+def site_city(row: dict[str, Any]) -> str | None:
+    raw = _opt(row.get("site_city") or row.get("Site_City__c"), 80)
+    if raw:
+        return raw
+    parts = [
+        p.strip()
+        for p in str(row.get("address") or "").split(",")
+        if p.strip()
+    ]
+    if len(parts) >= 2:
+        return parts[-2][:80]
+    return None
+
+
+def apply_slice_fields(row: dict[str, Any]) -> dict[str, Any]:
+    """Fill Power BI slice keys from a detail row or JSONL record."""
+    rec = dict(row)
+    rec["site_state"] = site_state(rec)
+    rec["site_city"] = site_city(rec)
+    rec["carrier"] = _opt(
+        rec.get("carrier") or rec.get("Carrier_Leasing_Source__c"), 120
+    )
+    rec["match_source"] = _opt(_lower(rec.get("match_source")) or None, 32)
+    rec["dual_model_resolution"] = _opt(rec.get("dual_model_resolution"), 48)
+    rec["classify_coord_source"] = _opt(rec.get("classify_coord_source"), 48)
+    rec["asset_offset_m"] = _conf(rec.get("asset_offset_m"))
+    return rec
+
+
+def _queue_states() -> str | None:
+    return _opt(os.environ.get("STATES"), 80)
+
+
+def _queue_limit() -> int | None:
+    raw = (os.environ.get("LIMIT") or "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
 def site_record(row: dict[str, Any], *, run_id: str) -> dict[str, Any]:
     screen = screen_site_type(row)
     final = final_site_type(row)
     empty_to_nearmap = screen in EMPTY_SCREEN and nearmap_ran(row)
     empty_to_rooftop = empty_to_nearmap and final == "rooftop"
     empty_to_rooftop_apply = empty_to_rooftop and _lower(row.get("bucket")) == BUCKET_POTENTIAL_UPDATE
+    rec = apply_slice_fields(row)
     return {
         "run_id": run_id,
         "Id": str(row.get("Id") or ""),
@@ -108,6 +173,13 @@ def site_record(row: dict[str, Any], *, run_id: str) -> dict[str, Any]:
             )
             if p
         ),
+        "site_state": rec["site_state"],
+        "site_city": rec["site_city"],
+        "carrier": rec["carrier"],
+        "match_source": rec["match_source"],
+        "dual_model_resolution": rec["dual_model_resolution"],
+        "classify_coord_source": rec["classify_coord_source"],
+        "asset_offset_m": rec["asset_offset_m"],
         "screen_site_type": screen,
         "final_site_type": final,
         "final_confidence": _conf(row.get("naip_site_confidence")),
@@ -167,6 +239,9 @@ def snapshot_run(
         "sf_writes": int(apply.get("success") or 0),
         "sf_holdouts_dequeued": int(apply.get("dequeued_holdouts") or 0),
         "sf_write_failed": int(apply.get("failed") or 0),
+        "apply_enabled": 1 if apply_summary else 0,
+        "queue_states": _queue_states(),
+        "queue_limit": _queue_limit(),
         "site_records": sites,
     }
 

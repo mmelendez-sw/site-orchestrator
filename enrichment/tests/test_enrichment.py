@@ -1222,14 +1222,37 @@ class CostPolicyTests(unittest.TestCase):
             {
                 "run_id": "r1",
                 "Id": "a0ZUq000004cJ72MAE",
+                "Site_State__c": "CO",
+                "Site_City__c": "DENVER",
+                "Carrier_Leasing_Source__c": "AR_TMO_jan2025",
+                "match_source": "none",
                 "nearmap_ran": True,
                 "empty_to_nearmap": 1,
                 "outcome": "applied_rooftop",
             }
         )
         self.assertEqual(site[1], "a0ZUq000004cJ72MAE")
-        self.assertEqual(site[6], 1)
-        self.assertEqual(site[17], "applied_rooftop")
+        self.assertEqual(site[3], "CO")
+        self.assertEqual(site[6], "none")
+        self.assertEqual(site[13], 1)
+        self.assertEqual(site[24], "applied_rooftop")
+
+    def test_site_state_from_address(self):
+        from enrichment.metrics import site_state
+
+        self.assertEqual(
+            site_state({"address": "1598 Cleveland Place, DENVER, CO"}), "CO"
+        )
+        self.assertEqual(site_state({"Site_State__c": "ks"}), "KS")
+
+    def test_metrics_ddl_loads_sql_file(self):
+        from enrichment.metrics_ddl import ddl_statements
+
+        batches = ddl_statements()
+        joined = "\n".join(batches)
+        self.assertTrue(any("CREATE TABLE dbo.EnrichmentRun" in b for b in batches))
+        self.assertTrue(any("CREATE VIEW dbo.vEnrichmentKpisByState" in b for b in batches))
+        self.assertIn("SiteState", joined)
 
     def test_metrics_rollup_last_id_wins(self):
         from enrichment.metrics import rollup_kpis
