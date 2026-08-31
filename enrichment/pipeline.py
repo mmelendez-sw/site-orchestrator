@@ -228,6 +228,19 @@ def run_enrichment(
                     apply=True,
                     verbose=verbose,
                 )
+                stamp_apply_status(
+                    detail_rows, apply_info.pop("results", None) or []
+                )
+                write_csv(run_dir / DETAIL_CSV, detail_rows, DETAIL_COLUMNS)
+                write_csv(
+                    run_dir / CANDIDATE_CSV,
+                    [
+                        r
+                        for r in detail_rows
+                        if r.get("bucket") == BUCKET_POTENTIAL_UPDATE
+                    ],
+                    CANDIDATE_COLUMNS,
+                )
             else:
                 apply_info = {
                     "total": 0,
@@ -662,6 +675,44 @@ def _process_site(
     return base
 
 
+def stamp_apply_status(
+    detail_rows: list[dict[str, Any]],
+    apply_results: list[dict[str, Any]] | None,
+) -> None:
+    """Copy Salesforce apply outcomes onto site rows before metrics snapshot.
+
+    ``apply_candidate_csv`` writes ``sf_update_apply_log.csv`` but does not
+    mutate detail rows. Without this, ``record_run`` snapshots
+    ``sf_update_status=pending`` even after a live write.
+    """
+    by_id: dict[str, dict[str, Any]] = {}
+    for entry in apply_results or []:
+        sid = str(entry.get("Id") or "").strip()
+        if sid:
+            by_id[sid] = entry
+    for row in detail_rows:
+        sid = str(row.get("Id") or "").strip()
+        entry = by_id.get(sid)
+        if not entry:
+            continue
+        if entry.get("dry_run"):
+            row["sf_update_status"] = "dry_run"
+            row["sf_update_error"] = ""
+            continue
+        if entry.get("success"):
+            payload = entry.get("payload")
+            if is_enrichment_payload(
+                payload if isinstance(payload, dict) else None
+            ):
+                row["sf_update_status"] = "updated"
+            else:
+                row["sf_update_status"] = "dequeued"
+            row["sf_update_error"] = ""
+        else:
+            row["sf_update_status"] = "failed"
+            row["sf_update_error"] = str(entry.get("error") or "")
+
+
 def apply_candidate_csv(
     *,
     sf_client,
@@ -744,4 +795,5 @@ def apply_candidate_csv(
             f"sf_writes={tower_updated} dequeued_holdouts={dequeued} failed={failed}"
         )
     logger.info("Apply summary: %s", summary)
+    summary["results"] = results
     return summary

@@ -1129,10 +1129,16 @@ class CostPolicyTests(unittest.TestCase):
             site_confidence=0.9,
             nearmap_tier="full",
             rooftop_unlocked=False,
+            cell_equipment=False,
         )
         self.assertFalse(should_spend_second_nearmap(**kwargs))
         kwargs["site_confidence"] = 0.8
+        self.assertFalse(should_spend_second_nearmap(**kwargs))
+        kwargs["cell_equipment"] = None
+        self.assertFalse(should_spend_second_nearmap(**kwargs))
+        kwargs["cell_equipment"] = True
         self.assertTrue(should_spend_second_nearmap(**kwargs))
+        kwargs["cell_equipment"] = False
         kwargs["site_confidence"] = 0.9
         kwargs["nearmap_tier"] = "no_coverage"
         self.assertTrue(should_spend_second_nearmap(**kwargs))
@@ -1140,6 +1146,45 @@ class CostPolicyTests(unittest.TestCase):
         kwargs["site_type"] = "rooftop"
         kwargs["rooftop_unlocked"] = True
         self.assertTrue(should_spend_second_nearmap(**kwargs))
+
+    def test_stamp_apply_status_before_metrics(self):
+        from enrichment.pipeline import stamp_apply_status
+        from enrichment.sf_ops import apply_queue_flags, build_update_payload
+
+        enrich = apply_queue_flags(
+            build_update_payload(
+                latitude=39.0,
+                longitude=-94.0,
+                site_type="Rooftop",
+                verified_site=True,
+                verified_site_source="LLM Imagery",
+            )
+        )
+        holdout = apply_queue_flags({})
+        rows = [
+            {"Id": "a", "sf_update_status": "pending", "sf_update_error": ""},
+            {"Id": "b", "sf_update_status": "pending", "sf_update_error": ""},
+            {"Id": "c", "sf_update_status": "pending", "sf_update_error": ""},
+            {"Id": "d", "sf_update_status": "skipped", "sf_update_error": ""},
+        ]
+        stamp_apply_status(
+            rows,
+            [
+                {"Id": "a", "success": True, "payload": enrich},
+                {"Id": "b", "success": True, "payload": holdout},
+                {
+                    "Id": "c",
+                    "success": False,
+                    "payload": enrich,
+                    "error": "DUPLICATES_DETECTED",
+                },
+            ],
+        )
+        self.assertEqual(rows[0]["sf_update_status"], "updated")
+        self.assertEqual(rows[1]["sf_update_status"], "dequeued")
+        self.assertEqual(rows[2]["sf_update_status"], "failed")
+        self.assertEqual(rows[2]["sf_update_error"], "DUPLICATES_DETECTED")
+        self.assertEqual(rows[3]["sf_update_status"], "skipped")
 
     def test_metrics_empty_to_rooftop_funnel(self):
         from enrichment.metrics import outcome_class, snapshot_run

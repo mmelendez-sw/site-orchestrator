@@ -94,7 +94,9 @@ def classify_site_imagery(
     Census, from ``ROOFTOP_HOST_OFFSET_M``), then buy obliques there.
 
     ``db_backed``: FCC/TowerSource already matched. High-conf Gemini towers
-    then skip Vert/obliques. Imagery-only tower+cell still fetches obliques.
+    then skip Vert/obliques. OSM communication towers skip obliques too, but
+    are not a database hit (MatchSource stays none). Imagery-only tower+cell
+    still fetches obliques.
 
     One Nearmap pack at the winner. A second pack at the unused pin/Census
     point only if the first pack is empty or an unlocked rooftop (no cell
@@ -125,6 +127,7 @@ def classify_site_imagery(
     pin_lon = float(pin_lon) if pin_lon is not None else float(lon)
     classify_coord_source = "sf_pin"
     unused_point: tuple[float, float] | None = None
+    osm_tower = False
 
     row = {"id": site_id, "input_confidence": input_confidence}
     prompt = ac.build_classification_prompt(row)
@@ -151,10 +154,9 @@ def classify_site_imagery(
         )
 
         pin_osm = _osm_at(pin_lat, pin_lon)
-        if pin_osm.get("communication_tower"):
-            db_backed = True
-            if verbose:
-                progress.result("OSM communication tower nearby")
+        osm_tower = bool(pin_osm.get("communication_tower"))
+        if osm_tower and verbose:
+            progress.result("OSM communication tower nearby")
         if (
             should_compare_rooftop_hosts(
                 pin_address_offset_m, db_backed=db_backed
@@ -166,7 +168,7 @@ def classify_site_imagery(
             addr_lon_f = float(address_lon)
             addr_osm = _osm_at(addr_lat_f, addr_lon_f)
             if addr_osm.get("communication_tower"):
-                db_backed = True
+                osm_tower = True
                 if verbose:
                     progress.result("OSM communication tower at Census address")
             if mismatch_osm_is_decisive(pin_osm, addr_osm):
@@ -291,6 +293,7 @@ def classify_site_imagery(
             build_views,
             naip_age_years=(naip_meta or {}).get("image_age_years"),
             db_backed=db_backed,
+            osm_tower=osm_tower,
         )
         primary_model = primary_provider
     else:
@@ -316,7 +319,7 @@ def classify_site_imagery(
 
     # Rooftop path: first Nearmap pack empty or HVAC-without-lock → one pack
     # at the other pin/Census point. Never both up front. Skip when the first
-    # full+oblique pack already locked empty at >= 0.90.
+    # full+oblique pack is already empty with no cell (False or null).
     from enrichment.cost_policy import should_spend_second_nearmap
 
     site_now = str(res.get("site_type") or "").strip().lower()
@@ -335,6 +338,7 @@ def classify_site_imagery(
         site_confidence=res.get("site_confidence"),
         nearmap_tier=nearmap_tier,
         rooftop_unlocked=rooftop_unlocked,
+        cell_equipment=res.get("cell_equipment"),
     ):
         second_nearmap = "spent"
         assert unused_point is not None

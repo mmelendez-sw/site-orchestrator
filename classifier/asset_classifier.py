@@ -2939,14 +2939,28 @@ def _has_nearmap_context(res: dict) -> bool:
     return has_locked_oblique_asset_box(res)
 
 
+def _nearmap_empty_without_cell(res: dict) -> bool:
+    """Full Nearmap other/unclear with no confirmed cell — skip Claude."""
+    from enrichment.cost_policy import nearmap_empty_without_cell
+
+    return nearmap_empty_without_cell(
+        res.get("site_type"),
+        res.get("nearmap_tier"),
+        res.get("cell_equipment"),
+    )
+
+
 def escalation_reason(res: dict) -> str | None:
     """Why a Gemini result should escalate to Claude; None if no escalation."""
     site = str(res.get("site_type") or "").strip().lower()
     conf = normalize_confidence(res.get("site_confidence"))
-    # Carrier-claimed site: Gemini "empty" on Nearmap still needs Claude.
-    # Check before the cell=false / conf-floor exits (other@0.8 is common).
+    # Carrier-claimed site: Gemini "empty" on Nearmap still needs Claude
+    # unless the full pack already said no cell (False or null). Rooftops
+    # still escalate via rooftop_cell_unconfirmed.
     if site in {"other", "unclear"} and _has_nearmap_context(res):
         if gemini_confidence_locks_claude(res):
+            return None
+        if _nearmap_empty_without_cell(res):
             return None
         if conf is not None and conf >= CLAUDE_ESCALATE_MIN_SITE_CONF:
             return "nearmap_claimed_site_empty"
@@ -3038,8 +3052,8 @@ def _maybe_osm_adjust_before_nearmap(
 ) -> bool:
     """OSM lookup only when we are about to buy Nearmap. Fail-open.
 
-    A nearby communication tower counts as DB-backed so strong Gemini towers
-    can skip obliques.
+    A nearby communication tower is not an FCC/TowerSource hit. Strong Gemini
+    towers can still skip obliques, but the skip is labeled OSM, not DB-hit.
     """
     try:
         from enrichment.osm_prefilter import lookup_osm_features
@@ -3049,10 +3063,29 @@ def _maybe_osm_adjust_before_nearmap(
         osm = lookup_osm_features(lat, lon)
     except Exception:
         return False
-    db_backed = bool(osm.get("communication_tower"))
-    if db_backed:
+    osm_tower = bool(osm.get("communication_tower"))
+    if osm_tower:
         _step_done("OSM", "communication tower nearby")
-    return db_backed
+    return osm_tower
+
+
+def locked_gemini_tower_skip_nearmap_reason(
+    res: dict, *, db_backed: bool = False, osm_tower: bool = False
+) -> str | None:
+    """Skip-Nearmap label for a locked Gemini tower, or None.
+
+    FCC/TowerSource (``db_backed``) is a DB-hit. OSM is not — it uses a
+    separate string so terminals and metrics do not count it as a database match.
+    """
+    if not should_skip_claude_for_gemini_tower(res):
+        return None
+    if rooftop_requires_nearmap_tiers(res):
+        return None
+    if db_backed:
+        return f"DB-hit Gemini tower conf>={GEMINI_SOLO_CELL_CONF:g}"
+    if osm_tower:
+        return "OSM tower + Gemini lock — no obliques"
+    return None
 
 
 def classify_with_tiers(lat: float, lon: float, img: Image.Image | None,
@@ -3060,14 +3093,16 @@ def classify_with_tiers(lat: float, lon: float, img: Image.Image | None,
                         input_confidence: str,
                         build_views,
                         naip_age_years: float | None = None,
-                        db_backed: bool = False) -> tuple[dict, dict, str | None, str, list]:
+                        db_backed: bool = False,
+                        osm_tower: bool = False) -> tuple[dict, dict, str | None, str, list]:
     """NAIP screen, then Nearmap Vert+obliques.
 
     FCC/TowerSource is the tower path (unique hit ≤25 m skips this). No DB
     hit is the rooftop path: always buy obliques on the host building. NAIP
     ``other``/``unclear`` is not evidence of no site — rooftop gear is usually
     invisible at NAIP GSD. Skip paid imagery only when a DB-backed Gemini
-    tower is already locked, or there is no API key.
+    tower is already locked, an OSM communication tower plus Gemini lock,
+    or there is no API key.
     """
     nearmap_views: dict = {}
     nearmap_date = None
@@ -3080,28 +3115,21 @@ def classify_with_tiers(lat: float, lon: float, img: Image.Image | None,
     _step_done("classify (NAIP)", _brief_pass_result(res))
     stamp_naip_screen(res)
 
-    if (
-        db_backed
-        and should_skip_claude_for_gemini_tower(res)
-        and not rooftop_requires_nearmap_tiers(res)
-    ):
-        _step_done(
-            "Nearmap skipped",
-            f"DB-hit Gemini tower conf>={GEMINI_SOLO_CELL_CONF:g}",
-        )
+    fcc_skip = locked_gemini_tower_skip_nearmap_reason(
+        res, db_backed=db_backed, osm_tower=False
+    )
+    if fcc_skip:
+        _step_done("Nearmap skipped", fcc_skip)
         return res, nearmap_views, nearmap_date, "naip_only", views
 
     if not db_backed:
-        db_backed = _maybe_osm_adjust_before_nearmap(lat, lon, res)
-        if (
-            db_backed
-            and should_skip_claude_for_gemini_tower(res)
-            and not rooftop_requires_nearmap_tiers(res)
-        ):
-            _step_done(
-                "Nearmap skipped",
-                "OSM tower + Gemini lock — no obliques",
-            )
+        if not osm_tower:
+            osm_tower = _maybe_osm_adjust_before_nearmap(lat, lon, res)
+        osm_skip = locked_gemini_tower_skip_nearmap_reason(
+            res, db_backed=False, osm_tower=osm_tower
+        )
+        if osm_skip:
+            _step_done("Nearmap skipped", osm_skip)
             return res, nearmap_views, nearmap_date, "naip_only", views
 
     if rooftop_requires_nearmap_tiers(res):
@@ -3895,10 +3923,13 @@ def should_attempt_claude_escalation(res: dict) -> bool:
     """True when Claude (or a Gemini second opinion) is worth spending.
 
     Low-confidence NAIP ``unclear`` and NAIP-only rooftops are holdouts, not
-    Claude jobs.
+    Claude jobs. Full Nearmap other/unclear with no cell also skips the
+    cheap second-opinion path — Claude does not recover those.
     """
     if escalation_reason(res):
         return True
+    if _nearmap_empty_without_cell(res):
+        return False
     site = str(res.get("site_type") or "").strip().lower()
     if site not in {"other", "unclear"} or confident_no_asset(res):
         return False

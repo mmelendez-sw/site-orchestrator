@@ -82,6 +82,23 @@ def nearmap_empty_is_locked(
     return conf is not None and conf >= float(lock_conf)
 
 
+def nearmap_empty_without_cell(
+    site_type: Any,
+    nearmap_tier: Any,
+    cell_equipment: Any,
+) -> bool:
+    """Full Nearmap other/unclear with no confirmed cell gear.
+
+    Claude and a second Nearmap pack do not recover these — skip both.
+    ``cell_equipment`` False or null both count as unconfirmed.
+    """
+    if str(nearmap_tier or "").strip().lower() != "full":
+        return False
+    if str(site_type or "").strip().lower() not in {"other", "unclear"}:
+        return False
+    return cell_equipment is not True
+
+
 def should_spend_second_nearmap(
     *,
     unused_point: tuple[float, float] | None,
@@ -91,11 +108,14 @@ def should_spend_second_nearmap(
     site_confidence: Any,
     nearmap_tier: Any,
     rooftop_unlocked: bool,
+    cell_equipment: Any = None,
 ) -> bool:
     """One extra Nearmap pack at the unused pin/Census point.
 
-    Skip when the first full+oblique pack already locked empty (other/unclear
-    at >= GEMINI_SOLO). Still spend on no-coverage probes and unlocked rooftops.
+    Skip when the first full+oblique pack is already empty with no cell
+    (other/unclear and cell is not True), including the 0.90 lock.
+    Still spend on no-coverage probes, unlocked rooftops, and a first pack
+    that still looks like a positive site_type.
     """
     if unused_point is None or skip_paid_imagery or not has_nearmap_key:
         return False
@@ -109,5 +129,7 @@ def should_spend_second_nearmap(
     if str(site_type or "").strip().lower() not in {"other", "unclear"}:
         return False
     if nearmap_empty_is_locked(site_type, site_confidence, tier):
+        return False
+    if nearmap_empty_without_cell(site_type, tier, cell_equipment):
         return False
     return True

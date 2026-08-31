@@ -16,6 +16,7 @@ from classifier.asset_classifier import (
     CLAUDE_CROP_MODEL,
     CLAUDE_ESCALATION_MODEL,
     escalation_reason,
+    locked_gemini_tower_skip_nearmap_reason,
     maybe_escalate_to_claude,
     needs_flash_confirm,
     needs_naip_rescue,
@@ -145,6 +146,47 @@ class TowerObliqueFetchTests(unittest.TestCase):
                     "cell_equipment": False,
                 },
                 db_backed=False,
+            )
+        )
+
+
+class LockedGeminiTowerSkipLabelTests(unittest.TestCase):
+    def test_fcc_hit_is_db_hit_not_osm(self):
+        locked = {
+            "site_type": "tower",
+            "site_confidence": 0.9,
+            "cell_equipment": True,
+        }
+        reason = locked_gemini_tower_skip_nearmap_reason(
+            locked, db_backed=True, osm_tower=True
+        )
+        self.assertIsNotNone(reason)
+        self.assertTrue(reason.startswith("DB-hit Gemini tower"))
+        self.assertNotIn("OSM", reason)
+
+    def test_osm_tower_is_not_db_hit(self):
+        locked = {
+            "site_type": "tower",
+            "site_confidence": 0.9,
+            "cell_equipment": True,
+        }
+        self.assertEqual(
+            locked_gemini_tower_skip_nearmap_reason(
+                locked, db_backed=False, osm_tower=True
+            ),
+            "OSM tower + Gemini lock — no obliques",
+        )
+
+    def test_no_lock_does_not_skip(self):
+        self.assertIsNone(
+            locked_gemini_tower_skip_nearmap_reason(
+                {
+                    "site_type": "tower",
+                    "site_confidence": 0.85,
+                    "cell_equipment": True,
+                },
+                db_backed=True,
+                osm_tower=True,
             )
         )
 
@@ -289,28 +331,33 @@ class EscalationReasonTests(unittest.TestCase):
             )
         )
 
-    def test_nearmap_other_on_claimed_site_escalates(self):
-        self.assertEqual(
-            escalation_reason(
-                {
-                    "site_type": "other",
-                    "site_confidence": 0.8,
-                    "cell_equipment": False,
-                    "nearmap_tier": "full",
-                }
-            ),
-            "nearmap_claimed_site_empty",
-        )
-        self.assertTrue(
-            should_attempt_claude_escalation(
-                {
-                    "site_type": "other",
-                    "site_confidence": 0.8,
-                    "cell_equipment": False,
-                    "nearmap_tier": "full",
-                }
-            )
-        )
+    def test_nearmap_other_on_claimed_site_skips_claude_without_cell(self):
+        empty_false = {
+            "site_type": "other",
+            "site_confidence": 0.8,
+            "cell_equipment": False,
+            "nearmap_tier": "full",
+        }
+        self.assertIsNone(escalation_reason(empty_false))
+        self.assertFalse(should_attempt_claude_escalation(empty_false))
+        empty_null = {
+            "site_type": "other",
+            "site_confidence": 0.8,
+            "cell_equipment": None,
+            "nearmap_tier": "full",
+        }
+        self.assertIsNone(escalation_reason(empty_null))
+        self.assertFalse(should_attempt_claude_escalation(empty_null))
+
+    def test_nearmap_other_with_cell_still_escalates(self):
+        res = {
+            "site_type": "other",
+            "site_confidence": 0.8,
+            "cell_equipment": True,
+            "nearmap_tier": "full",
+        }
+        self.assertEqual(escalation_reason(res), "nearmap_claimed_site_empty")
+        self.assertTrue(should_attempt_claude_escalation(res))
 
     def test_nearmap_other_at_0_9_skips_claude(self):
         self.assertIsNone(

@@ -7,6 +7,7 @@ import math
 import os
 import struct
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 from enrichment.geo import haversine_meters
@@ -95,6 +96,10 @@ _TOKEN_AUTH_MODES = {"", "accesstoken", "default", "activedirectorydefault"}
 
 SQL_COPT_SS_ACCESS_TOKEN = 1256
 AZURE_SQL_SCOPE = "https://database.windows.net/.default"
+_AZ_SQL_RESOURCE = "https://database.windows.net/"
+_AZ_CMD_CANDIDATE = Path(r"C:\Program Files\Microsoft SDKs\Azure\CLI2\wbin\az.cmd")
+
+_cached_sql_token: str | None = None
 
 
 def resolve_authentication(authentication: str | None = None) -> str:
@@ -187,32 +192,32 @@ def build_odbc_connection_string(
 
 
 def _token_via_az_cmd() -> str | None:
-    """Windows fallback: azure-identity often cannot spawn az.cmd without cmd.exe."""
+    """Windows: azure-identity cannot spawn az.cmd; call it through cmd.exe."""
     import json
     import shutil
     import subprocess
-    from pathlib import Path
+    import sys
 
+    if sys.platform != "win32":
+        return None
     az = shutil.which("az") or shutil.which("az.cmd")
-    if not az:
-        candidate = Path(r"C:\Program Files\Microsoft SDKs\Azure\CLI2\wbin\az.cmd")
-        az = str(candidate) if candidate.is_file() else None
+    if not az and _AZ_CMD_CANDIDATE.is_file():
+        az = str(_AZ_CMD_CANDIDATE)
     if not az:
         return None
-    cmd = [
-        az,
-        "account",
-        "get-access-token",
-        "--resource",
-        "https://database.windows.net/",
-        "-o",
-        "json",
-    ]
-    if az.lower().endswith(".cmd"):
-        cmd = ["cmd", "/c", *cmd]
+    quoted = f'"{az}"' if " " in az else az
+    cmdline = (
+        f"{quoted} account get-access-token "
+        f"--resource {_AZ_SQL_RESOURCE} -o json"
+    )
     try:
         proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=120, check=False
+            cmdline,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+            shell=True,
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
@@ -226,7 +231,16 @@ def _token_via_az_cmd() -> str | None:
 
 
 def _entra_sql_token() -> str:
-    """Entra token for Azure SQL: DefaultAzureCredential, then az.cmd on Windows."""
+    """Entra token for Azure SQL. Prefer az.cmd on Windows; cache for the process."""
+    global _cached_sql_token
+    if _cached_sql_token:
+        return _cached_sql_token
+
+    token = _token_via_az_cmd()
+    if token:
+        _cached_sql_token = token
+        return token
+
     try:
         from azure.identity import DefaultAzureCredential
     except ImportError as exc:  # pragma: no cover
@@ -235,15 +249,13 @@ def _entra_sql_token() -> str:
             "Install with: pip install azure-identity"
         ) from exc
 
-    try:
-        credential = DefaultAzureCredential(exclude_interactive_browser_credential=True)
-        return credential.get_token(AZURE_SQL_SCOPE).token
-    except Exception as first:
-        token = _token_via_az_cmd()
-        if token:
-            logger.info("Azure SQL token acquired via az.cmd fallback")
-            return token
-        raise first
+    # AzureCliCredential looks for `az.exe` and dumps a WARNING on Windows.
+    credential = DefaultAzureCredential(
+        exclude_interactive_browser_credential=True,
+        exclude_azure_cli_credential=True,
+    )
+    _cached_sql_token = credential.get_token(AZURE_SQL_SCOPE).token
+    return _cached_sql_token
 
 
 def _access_token_struct() -> bytes:
