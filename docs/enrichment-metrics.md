@@ -37,7 +37,7 @@ Do not store last-wins KPIs on `EnrichmentRun`. That header is **this run only**
 **`EnrichmentRun` (ops header)**
 
 - This-run counts: sites, applied rooftop/tower/DB-skip, holdouts, errors
-- Spend proxies: `NearmapSites`, `ClaudeSites`
+- Spend proxies (sites where paid imagery/model **ran**, not applies): `NearmapSites`, `ClaudeSites`
 - Funnel: NAIP-empty → Nearmap → rooftop apply + rate
 - Salesforce: `SfWrites`, `SfHoldoutsDequeued`, `SfWriteFailed`
 - Queue: `ApplyEnabled`, `QueueStates`, `QueueLimit`

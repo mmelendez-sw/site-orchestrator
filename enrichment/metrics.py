@@ -363,6 +363,14 @@ def format_metric_value(key: str, value: Any) -> str:
     return str(value)
 
 
+# Terminal labels. Keep JSON/SQL keys (nearmap_sites / claude_sites) stable;
+# those counts are spend (imagery/model ran), not successful applies.
+METRIC_DISPLAY_NAMES: dict[str, str] = {
+    "nearmap_sites": "nearmap_imagery_ran",
+    "claude_sites": "claude_ai_ran",
+}
+
+
 def metric_lines(data: dict[str, Any] | None, keys: tuple[str, ...]) -> list[str]:
     if not data:
         return []
@@ -370,7 +378,8 @@ def metric_lines(data: dict[str, Any] | None, keys: tuple[str, ...]) -> list[str
     for key in keys:
         if key not in data:
             continue
-        lines.append(f"    {key}: {format_metric_value(key, data.get(key))}")
+        label = METRIC_DISPLAY_NAMES.get(key, key)
+        lines.append(f"    {label}: {format_metric_value(key, data.get(key))}")
     return lines
 
 

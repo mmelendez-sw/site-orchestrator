@@ -1269,6 +1269,14 @@ class CostPolicyTests(unittest.TestCase):
         self.assertEqual(lines[0], "    sites: 10")
         self.assertIn("    applied_rooftop: 2", lines)
         self.assertIn("    empty_to_rooftop_apply_rate: 20.0%", lines)
+        spend = metric_lines(
+            {"nearmap_sites": 49, "claude_sites": 31},
+            RUN_METRIC_KEYS,
+        )
+        self.assertIn("    nearmap_imagery_ran: 49", spend)
+        self.assertIn("    claude_ai_ran: 31", spend)
+        self.assertFalse(any("nearmap_sites:" in line for line in spend))
+        self.assertFalse(any("claude_sites:" in line for line in spend))
         self.assertFalse(any("holdout_rooftop" in line for line in lines))
         self.assertFalse(any("gemini_sites" in line for line in lines))
 
