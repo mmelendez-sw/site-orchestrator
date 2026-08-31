@@ -6,6 +6,7 @@ import logging
 import math
 import os
 import struct
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -99,7 +100,10 @@ AZURE_SQL_SCOPE = "https://database.windows.net/.default"
 _AZ_SQL_RESOURCE = "https://database.windows.net/"
 _AZ_CMD_CANDIDATE = Path(r"C:\Program Files\Microsoft SDKs\Azure\CLI2\wbin\az.cmd")
 
-_cached_sql_token: str | None = None
+# (token, unix expiry). Access tokens last ~1h; a long enrichment run must refresh.
+_cached_sql_token: tuple[str, float] | None = None
+_TOKEN_REFRESH_SKEW_S = 300.0
+_TOKEN_FALLBACK_TTL_S = 3300.0
 
 
 def resolve_authentication(authentication: str | None = None) -> str:
@@ -227,18 +231,85 @@ def _token_via_az_cmd() -> str | None:
         data = json.loads(proc.stdout)
     except json.JSONDecodeError:
         return None
-    return (data.get("accessToken") or "").strip() or None
+    parsed = _parse_az_token_payload(data)
+    if parsed is None:
+        return None
+    token, expires_at = parsed
+    _store_sql_token(token, expires_at)
+    return token
+
+
+def _parse_az_token_payload(
+    data: dict[str, Any] | None, *, now: float | None = None
+) -> tuple[str, float] | None:
+    """Return (access_token, unix_expiry) from `az account get-access-token` JSON."""
+    if not isinstance(data, dict):
+        return None
+    token = str(data.get("accessToken") or "").strip()
+    if not token:
+        return None
+    clock = time.time() if now is None else now
+    raw = data.get("expires_on")
+    if raw is None:
+        raw = data.get("expiresOn")
+    expires_at: float | None = None
+    if isinstance(raw, (int, float)):
+        expires_at = float(raw)
+    elif isinstance(raw, str) and raw.strip():
+        text = raw.strip()
+        if text.isdigit():
+            expires_at = float(text)
+        else:
+            from datetime import datetime
+
+            try:
+                expires_at = datetime.strptime(
+                    text.split(".")[0], "%Y-%m-%d %H:%M:%S"
+                ).timestamp()
+            except ValueError:
+                expires_at = None
+    if expires_at is None:
+        expires_at = clock + _TOKEN_FALLBACK_TTL_S
+    return token, expires_at
+
+
+def _cached_token_if_fresh(*, now: float | None = None) -> str | None:
+    global _cached_sql_token
+    if not _cached_sql_token:
+        return None
+    token, expires_at = _cached_sql_token
+    clock = time.time() if now is None else now
+    if clock + _TOKEN_REFRESH_SKEW_S >= expires_at:
+        _cached_sql_token = None
+        return None
+    return token
+
+
+def _store_sql_token(token: str, expires_at: float) -> None:
+    global _cached_sql_token
+    _cached_sql_token = (token, float(expires_at))
+
+
+def _invalidate_sql_token() -> None:
+    global _cached_sql_token
+    _cached_sql_token = None
+
+
+def _is_expired_sql_login(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return "token is expired" in text or (
+        "18456" in text and "token" in text
+    )
 
 
 def _entra_sql_token() -> str:
-    """Entra token for Azure SQL. Prefer az.cmd on Windows; cache for the process."""
-    global _cached_sql_token
-    if _cached_sql_token:
-        return _cached_sql_token
+    """Entra token for Azure SQL. Prefer az.cmd on Windows; refresh before expiry."""
+    cached = _cached_token_if_fresh()
+    if cached:
+        return cached
 
     token = _token_via_az_cmd()
     if token:
-        _cached_sql_token = token
         return token
 
     try:
@@ -254,8 +325,9 @@ def _entra_sql_token() -> str:
         exclude_interactive_browser_credential=True,
         exclude_azure_cli_credential=True,
     )
-    _cached_sql_token = credential.get_token(AZURE_SQL_SCOPE).token
-    return _cached_sql_token
+    issued = credential.get_token(AZURE_SQL_SCOPE)
+    _store_sql_token(issued.token, float(issued.expires_on))
+    return issued.token
 
 
 def _access_token_struct() -> bytes:
@@ -277,13 +349,24 @@ def connect_mssql(connection_string: str | None = None):
     conn_str = connection_string or build_odbc_connection_string()
     use_token = connection_string is None and not resolve_authentication()
     logger.info("Connecting to Azure SQL...")
-    if use_token:
+    if not use_token:
+        return pyodbc.connect(conn_str, timeout=30)
+    try:
         return pyodbc.connect(
             conn_str,
             timeout=30,
             attrs_before={SQL_COPT_SS_ACCESS_TOKEN: _access_token_struct()},
         )
-    return pyodbc.connect(conn_str, timeout=30)
+    except Exception as exc:
+        if not _is_expired_sql_login(exc):
+            raise
+        logger.warning("Azure SQL token expired; refreshing and retrying once")
+        _invalidate_sql_token()
+        return pyodbc.connect(
+            conn_str,
+            timeout=30,
+            attrs_before={SQL_COPT_SS_ACCESS_TOKEN: _access_token_struct()},
+        )
 
 
 def _to_float(value: Any) -> float | None:

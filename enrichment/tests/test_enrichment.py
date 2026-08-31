@@ -1535,5 +1535,59 @@ class PinAddressGeocodeTests(unittest.TestCase):
         self.assertEqual(pick, "address")
 
 
+class SqlTokenCacheTests(unittest.TestCase):
+    def tearDown(self):
+        from enrichment import mssql
+
+        mssql._invalidate_sql_token()
+
+    def test_parse_az_expires_on_unix(self):
+        from enrichment.mssql import _parse_az_token_payload
+
+        token, exp = _parse_az_token_payload(
+            {"accessToken": "abc", "expires_on": 1_700_000_000},
+            now=1_699_000_000,
+        )
+        self.assertEqual(token, "abc")
+        self.assertEqual(exp, 1_700_000_000)
+
+    def test_parse_az_expires_on_datetime_string(self):
+        from datetime import datetime
+
+        from enrichment.mssql import _parse_az_token_payload
+
+        stamp = "2030-01-15 12:00:00.123456"
+        token, exp = _parse_az_token_payload(
+            {"accessToken": "abc", "expiresOn": stamp},
+            now=0.0,
+        )
+        self.assertEqual(token, "abc")
+        self.assertAlmostEqual(
+            exp, datetime.strptime("2030-01-15 12:00:00", "%Y-%m-%d %H:%M:%S").timestamp()
+        )
+
+    def test_cached_token_refreshes_near_expiry(self):
+        from enrichment import mssql
+
+        now = 1_000_000.0
+        mssql._store_sql_token("stale", now + 60)
+        self.assertIsNone(mssql._cached_token_if_fresh(now=now))
+        mssql._store_sql_token("fresh", now + 3600)
+        self.assertEqual(mssql._cached_token_if_fresh(now=now), "fresh")
+
+    def test_expired_login_error_detection(self):
+        from enrichment.mssql import _is_expired_sql_login
+
+        self.assertTrue(
+            _is_expired_sql_login(
+                Exception(
+                    "[28000] Login failed for user '<token-identified principal>'. "
+                    "Token is expired. (18456)"
+                )
+            )
+        )
+        self.assertFalse(_is_expired_sql_login(Exception("Login timeout expired")))
+
+
 if __name__ == "__main__":
     unittest.main()
