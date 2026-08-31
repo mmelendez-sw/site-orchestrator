@@ -79,7 +79,7 @@ def run_enrichment(
     classify_fn: Callable[..., dict[str, Any]] | None = None,
     sites: list[dict[str, Any]] | None = None,
     site_ids: list[str] | None = None,
-    carrier_like: str | None = "NFL",
+    carrier_like: str | None = None,
     metro_classification: str | None = "Major NFL Metro",
     states: list[str] | None = None,
     llm_classified: bool = False,

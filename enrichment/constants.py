@@ -59,6 +59,7 @@ DEFAULT_STAGE_FILTER = (
     "Enhanced/Unreviewed",
     "New/Unreviewed",
     "Outreach",
+    "Outreach - Verified",
 )
 
 # Hard exclusion applied independently of the caller-provided stage filter.
@@ -69,7 +70,6 @@ EXCLUDED_STAGE_FILTER = (
 
 DEFAULT_OWNER_FILTER = (
     "Site Acquisition Team",
-    "Matthew Melendez",
     "Marketing Campaign",
 )
 

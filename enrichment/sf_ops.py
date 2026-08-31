@@ -37,10 +37,11 @@ def is_enrichment_payload(payload: dict[str, Any] | None) -> bool:
     return bool(ENRICHMENT_FIELDS.intersection(payload))
 
 
-def parse_carrier_like(raw: str | None, *, default: str = "NFL") -> str | None:
+def parse_carrier_like(raw: str | None, *, default: str | None = None) -> str | None:
     """Carrier_Leasing_Source__c LIKE needle from env/CLI.
 
-    Unset/blank → ``default`` (NFL). ``none`` / ``all`` / ``*`` omit the filter.
+    Unset/blank → no carrier filter. Set ``CARRIER_LIKE=NFL`` (or any needle)
+    to add LIKE '%value%'. ``none`` / ``all`` / ``*`` also omit the filter.
     """
     return _parse_optional_filter(raw, default=default)
 
@@ -56,10 +57,12 @@ def parse_metro_classification(
     return _parse_optional_filter(raw, default=default)
 
 
-def _parse_optional_filter(raw: str | None, *, default: str) -> str | None:
+def _parse_optional_filter(raw: str | None, *, default: str | None) -> str | None:
     text = "" if raw is None else str(raw).strip()
     if not text:
-        text = default
+        if default is None or not str(default).strip():
+            return None
+        text = str(default).strip()
     if text.lower() in {"none", "all", "*"}:
         return None
     return text
@@ -78,7 +81,7 @@ def build_blank_site_type_query(
     stages: Sequence[str] = DEFAULT_STAGE_FILTER,
     owners: Sequence[str] = DEFAULT_OWNER_FILTER,
     fields: Sequence[str] = SF_QUERY_FIELDS,
-    carrier_like: str | None = "NFL",
+    carrier_like: str | None = None,
     metro_classification: str | None = "Major NFL Metro",
     states: Sequence[str] | None = None,
     llm_classified: bool = False,
@@ -86,7 +89,7 @@ def build_blank_site_type_query(
     """SOQL for blank Site_Type__c sites in the enrichment queue.
 
     `carrier_like` filters Carrier_Leasing_Source__c with LIKE '%value%'.
-    Pass None/"" to skip the carrier filter (e.g. non-NFL test batches).
+    Pass None/"" to skip the carrier filter (the default).
     `metro_classification` filters Metro_Classification__c with an exact
     match (default Major NFL Metro). Pass None/"" to skip.
     `states` filters Site_State__c IN (...); pass None/empty for all states.
@@ -155,7 +158,7 @@ def query_blank_site_type_sites(
     *,
     stages: Sequence[str] = DEFAULT_STAGE_FILTER,
     owners: Sequence[str] = DEFAULT_OWNER_FILTER,
-    carrier_like: str | None = "NFL",
+    carrier_like: str | None = None,
     metro_classification: str | None = "Major NFL Metro",
     states: Sequence[str] | None = None,
     llm_classified: bool = False,

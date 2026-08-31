@@ -854,10 +854,13 @@ class BucketTests(unittest.TestCase):
 
 
 class SoqlTests(unittest.TestCase):
-    def test_blank_site_type_query_contains_nfl_and_coords(self):
+    def test_blank_site_type_query_contains_metro_and_coords(self):
         soql = build_blank_site_type_query()
-        self.assertIn("Carrier_Leasing_Source__c LIKE '%NFL%'", soql)
+        self.assertNotIn("Carrier_Leasing_Source__c LIKE", soql)
         self.assertIn("Metro_Classification__c = 'Major NFL Metro'", soql)
+        self.assertIn("Stage__c IN ('Enhanced/Unreviewed', 'New/Unreviewed', 'Outreach', 'Outreach - Verified')", soql)
+        self.assertIn("Owner__c IN ('Site Acquisition Team', 'Marketing Campaign')", soql)
+        self.assertNotIn("Matthew Melendez", soql)
         self.assertIn("Site_Latitude__c != null", soql)
         self.assertIn("LLM_Classified__c = false", soql)
         self.assertIn("(LLM_Holdout__c = false OR LLM_Holdout__c = null)", soql)
@@ -882,12 +885,17 @@ class SoqlTests(unittest.TestCase):
     def test_blank_site_type_query_can_omit_metro(self):
         soql = build_blank_site_type_query(metro_classification=None)
         self.assertNotIn("Metro_Classification__c =", soql)
+        self.assertNotIn("Carrier_Leasing_Source__c LIKE", soql)
+
+    def test_blank_site_type_query_can_add_carrier(self):
+        soql = build_blank_site_type_query(carrier_like="NFL")
         self.assertIn("Carrier_Leasing_Source__c LIKE '%NFL%'", soql)
 
     def test_parse_carrier_like_env(self):
-        self.assertEqual(parse_carrier_like(None), "NFL")
-        self.assertEqual(parse_carrier_like(""), "NFL")
+        self.assertIsNone(parse_carrier_like(None))
+        self.assertIsNone(parse_carrier_like(""))
         self.assertEqual(parse_carrier_like("PermittingSites"), "PermittingSites")
+        self.assertEqual(parse_carrier_like("NFL"), "NFL")
         self.assertIsNone(parse_carrier_like("none"))
         self.assertIsNone(parse_carrier_like("ALL"))
 
@@ -907,7 +915,7 @@ class SoqlTests(unittest.TestCase):
     def test_blank_site_type_query_states_filter(self):
         soql = build_blank_site_type_query(states=["CA", "fl", "NV", "MA"])
         self.assertIn("Site_State__c IN ('CA', 'FL', 'NV', 'MA')", soql)
-        self.assertIn("Carrier_Leasing_Source__c LIKE '%NFL%'", soql)
+        self.assertNotIn("Carrier_Leasing_Source__c LIKE", soql)
 
 
 class PayloadTests(unittest.TestCase):

@@ -10,7 +10,7 @@ python -m enrichment
 
 Set `APPLY=0` to classify and write CSVs without Salesforce updates. Optional env: `STATES`, `LIMIT`, `IDS`, `CARRIER_LIKE`, `METRO_CLASSIFICATION`, `LLM_CLASSIFIED`, `RUN_DIR`, `VERBOSE`, `METRICS_SQL`, `DEQUEUE_HOLDOUTS`.
 
-`CARRIER_LIKE` is the `Carrier_Leasing_Source__c` LIKE needle (default `NFL`). Set `CARRIER_LIKE=none` to pull without a carrier filter. `METRO_CLASSIFICATION` is an exact `Metro_Classification__c` match (default `Major NFL Metro`). Set `METRO_CLASSIFICATION=none` to omit it. Enrichment does not write those fields. The queue defaults to `LLM_Classified__c = false`; set `LLM_CLASSIFIED=1` only to re-pull already-flagged rows.
+`CARRIER_LIKE` is the `Carrier_Leasing_Source__c` LIKE needle (unset = no carrier filter). Set `CARRIER_LIKE=NFL` to restrict to NFL sources. `METRO_CLASSIFICATION` is an exact `Metro_Classification__c` match (default `Major NFL Metro`). Set `METRO_CLASSIFICATION=none` to omit it. Enrichment does not write those fields. The queue defaults to `LLM_Classified__c = false`; set `LLM_CLASSIFIED=1` only to re-pull already-flagged rows.
 
 Leadership KPIs land in Azure SQL (`dbo.EnrichmentRun` / `dbo.EnrichmentSiteOutcome`) at the end of every run. Details: [docs/enrichment-metrics.md](docs/enrichment-metrics.md).
 
