@@ -17,6 +17,7 @@ DETAIL_COLUMNS: tuple[str, ...] = (
     "Stage__c",
     "Owner__c",
     "Carrier_Leasing_Source__c",
+    "Metro_Classification__c",
     "match_source",
     "match_distance_m",
     "match_selection_reason",

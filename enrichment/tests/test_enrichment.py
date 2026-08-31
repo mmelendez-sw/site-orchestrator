@@ -22,6 +22,7 @@ from enrichment.sf_ops import (
     build_sites_by_ids_query,
     build_update_payload,
     parse_carrier_like,
+    parse_metro_classification,
 )
 
 
@@ -856,9 +857,11 @@ class SoqlTests(unittest.TestCase):
     def test_blank_site_type_query_contains_nfl_and_coords(self):
         soql = build_blank_site_type_query()
         self.assertIn("Carrier_Leasing_Source__c LIKE '%NFL%'", soql)
+        self.assertIn("Metro_Classification__c = 'Major NFL Metro'", soql)
         self.assertIn("Site_Latitude__c != null", soql)
         self.assertIn("LLM_Classified__c = false", soql)
         self.assertIn("(LLM_Holdout__c = false OR LLM_Holdout__c = null)", soql)
+        self.assertIn("Metro_Classification__c", soql.split(" FROM ")[0])
 
     def test_blank_site_type_query_can_select_already_classified(self):
         soql = build_blank_site_type_query(
@@ -872,8 +875,14 @@ class SoqlTests(unittest.TestCase):
     def test_blank_site_type_query_can_omit_carrier(self):
         soql = build_blank_site_type_query(carrier_like=None)
         self.assertNotIn("Carrier_Leasing_Source__c LIKE", soql)
+        self.assertIn("Metro_Classification__c = 'Major NFL Metro'", soql)
         self.assertIn("LLM_Classified__c = false", soql)
         self.assertIn("LLM_Holdout__c", soql)
+
+    def test_blank_site_type_query_can_omit_metro(self):
+        soql = build_blank_site_type_query(metro_classification=None)
+        self.assertNotIn("Metro_Classification__c =", soql)
+        self.assertIn("Carrier_Leasing_Source__c LIKE '%NFL%'", soql)
 
     def test_parse_carrier_like_env(self):
         self.assertEqual(parse_carrier_like(None), "NFL")
@@ -881,6 +890,13 @@ class SoqlTests(unittest.TestCase):
         self.assertEqual(parse_carrier_like("PermittingSites"), "PermittingSites")
         self.assertIsNone(parse_carrier_like("none"))
         self.assertIsNone(parse_carrier_like("ALL"))
+
+    def test_parse_metro_classification_env(self):
+        self.assertEqual(parse_metro_classification(None), "Major NFL Metro")
+        self.assertEqual(parse_metro_classification(""), "Major NFL Metro")
+        self.assertEqual(parse_metro_classification("Secondary Metro"), "Secondary Metro")
+        self.assertIsNone(parse_metro_classification("none"))
+        self.assertIsNone(parse_metro_classification("ALL"))
 
     def test_sites_by_ids_query(self):
         soql = build_sites_by_ids_query(["a0Z1", "a0Z2"])

@@ -46,6 +46,7 @@ SF_QUERY_FIELDS = (
     "Site_Zip_Code__c",
     "Site_Type__c",
     "Carrier_Leasing_Source__c",
+    "Metro_Classification__c",
     "Stage__c",
     "Owner__c",
     "Verified_Site__c",

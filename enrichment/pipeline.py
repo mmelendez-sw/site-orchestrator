@@ -80,6 +80,7 @@ def run_enrichment(
     sites: list[dict[str, Any]] | None = None,
     site_ids: list[str] | None = None,
     carrier_like: str | None = "NFL",
+    metro_classification: str | None = "Major NFL Metro",
     states: list[str] | None = None,
     llm_classified: bool = False,
     verbose: bool = True,
@@ -129,12 +130,14 @@ def run_enrichment(
                     progress.stage(
                         "2/4 QUERY SALESFORCE",
                         f"blank Site_Type | carrier_like={carrier_like!r} | "
+                        f"metro={metro_classification!r} | "
                         f"llm_classified={str(llm_classified).lower()} | "
                         f"states={state_label}",
                     )
                 sites = query_blank_site_type_sites(
                     sf_client,
                     carrier_like=carrier_like,
+                    metro_classification=metro_classification,
                     states=states,
                     llm_classified=llm_classified,
                 )
@@ -324,6 +327,7 @@ def _process_site(
         "Stage__c": site.get("Stage__c") or "",
         "Owner__c": site.get("Owner__c") or "",
         "Carrier_Leasing_Source__c": site.get("Carrier_Leasing_Source__c") or "",
+        "Metro_Classification__c": site.get("Metro_Classification__c") or "",
         "match_source": MATCH_SOURCE_NONE,
         "match_distance_m": "",
         "match_selection_reason": "",

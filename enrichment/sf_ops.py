@@ -42,6 +42,21 @@ def parse_carrier_like(raw: str | None, *, default: str = "NFL") -> str | None:
 
     Unset/blank → ``default`` (NFL). ``none`` / ``all`` / ``*`` omit the filter.
     """
+    return _parse_optional_filter(raw, default=default)
+
+
+def parse_metro_classification(
+    raw: str | None, *, default: str = "Major NFL Metro"
+) -> str | None:
+    """Metro_Classification__c exact value from env/CLI.
+
+    Unset/blank → ``default`` (Major NFL Metro). ``none`` / ``all`` / ``*``
+    omit the filter.
+    """
+    return _parse_optional_filter(raw, default=default)
+
+
+def _parse_optional_filter(raw: str | None, *, default: str) -> str | None:
     text = "" if raw is None else str(raw).strip()
     if not text:
         text = default
@@ -64,6 +79,7 @@ def build_blank_site_type_query(
     owners: Sequence[str] = DEFAULT_OWNER_FILTER,
     fields: Sequence[str] = SF_QUERY_FIELDS,
     carrier_like: str | None = "NFL",
+    metro_classification: str | None = "Major NFL Metro",
     states: Sequence[str] | None = None,
     llm_classified: bool = False,
 ) -> str:
@@ -71,6 +87,8 @@ def build_blank_site_type_query(
 
     `carrier_like` filters Carrier_Leasing_Source__c with LIKE '%value%'.
     Pass None/"" to skip the carrier filter (e.g. non-NFL test batches).
+    `metro_classification` filters Metro_Classification__c with an exact
+    match (default Major NFL Metro). Pass None/"" to skip.
     `states` filters Site_State__c IN (...); pass None/empty for all states.
     `llm_classified` defaults False (sites not yet LLM-classified). True selects
     the already-flagged NFL re-queue.
@@ -91,6 +109,9 @@ def build_blank_site_type_query(
     if carrier:
         escaped = carrier.replace("\\", "\\\\").replace("'", "\\'")
         clauses.insert(1, f"Carrier_Leasing_Source__c LIKE '%{escaped}%'")
+    metro = (metro_classification or "").strip()
+    if metro:
+        clauses.insert(1, f"Metro_Classification__c = {_soql_quote(metro)}")
     clean_states = [
         str(s).strip().upper() for s in (states or []) if str(s).strip()
     ]
@@ -135,6 +156,7 @@ def query_blank_site_type_sites(
     stages: Sequence[str] = DEFAULT_STAGE_FILTER,
     owners: Sequence[str] = DEFAULT_OWNER_FILTER,
     carrier_like: str | None = "NFL",
+    metro_classification: str | None = "Major NFL Metro",
     states: Sequence[str] | None = None,
     llm_classified: bool = False,
 ) -> list[dict[str, Any]]:
@@ -142,6 +164,7 @@ def query_blank_site_type_sites(
         stages=stages,
         owners=owners,
         carrier_like=carrier_like,
+        metro_classification=metro_classification,
         states=states,
         llm_classified=llm_classified,
     )

@@ -2,7 +2,8 @@
 
 Salesforce blank Site_Type → FCC/TowerSource → NAIP/Nearmap + Gemini/Claude → auto-apply.
 Holdouts dequeue unless DEQUEUE_HOLDOUTS=0. Optional env: STATES, LIMIT,
-IDS, CARRIER_LIKE, LLM_CLASSIFIED, APPLY, DEQUEUE_HOLDOUTS, RUN_DIR, VERBOSE.
+IDS, CARRIER_LIKE, METRO_CLASSIFICATION, LLM_CLASSIFIED, APPLY,
+DEQUEUE_HOLDOUTS, RUN_DIR, VERBOSE.
 Set APPLY=0 to classify without Salesforce writes.
 Set DEQUEUE_HOLDOUTS=0 to apply successes only and leave failed holdouts as-is.
 """
@@ -23,7 +24,7 @@ if str(ROOT) not in sys.path:
 load_dotenv(ROOT / ".env")
 
 from enrichment.pipeline import default_run_dir, run_enrichment  # noqa: E402
-from enrichment.sf_ops import parse_carrier_like  # noqa: E402
+from enrichment.sf_ops import parse_carrier_like, parse_metro_classification  # noqa: E402
 from paths import ensure_data_layout, runs_dir  # noqa: E402
 from salesforce.sf_client import SalesforceClient  # noqa: E402
 
@@ -72,6 +73,9 @@ def main() -> int:
         site_ids=_csv_env("IDS"),
         states=states,
         carrier_like=parse_carrier_like(os.environ.get("CARRIER_LIKE")),
+        metro_classification=parse_metro_classification(
+            os.environ.get("METRO_CLASSIFICATION")
+        ),
         llm_classified=_flag("LLM_CLASSIFIED", "0"),
         apply=_flag("APPLY", "1"),
         dequeue_holdouts=_flag("DEQUEUE_HOLDOUTS", "1"),
