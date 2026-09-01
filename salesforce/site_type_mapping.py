@@ -166,6 +166,37 @@ def map_site_type_for_upload(
     return ""
 
 
+def site_type_from_db_asset_type(value: Any) -> str:
+    """Map FCC/TowerSource asset_type to Site_Type__c for imagery-skip writes.
+
+    Unique close DB hits skip NAIP, so there is no vision site_type. Use the
+    tower-database label. Unknown values (including FCC ``REG``) default to
+    Self Support / Lattice Tower — never blank.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return "Self Support / Lattice Tower"
+    known = {item.lower(): item for item in _ALL_SF_SITE_TYPES()}
+    if text.lower() in known:
+        return known[text.lower()]
+    subtype = normalize_tower_subtype(text)
+    if subtype:
+        return TOWER_SUBTYPE_TO_SF[subtype]
+    lowered = text.lower()
+    if "monopole" in lowered or lowered in {"pole", "mtower"}:
+        return "Monopole"
+    if "guyed" in lowered:
+        return "Guyed Tower"
+    if "rooftop" in lowered:
+        return "Rooftop"
+    if any(
+        token in lowered
+        for token in ("lattice", "self support", "self-support", "ltower", "tower")
+    ):
+        return "Self Support / Lattice Tower"
+    return "Self Support / Lattice Tower"
+
+
 def _ALL_SF_SITE_TYPES() -> tuple[str, ...]:
     values = set(SITE_TYPE_TO_SF.values()) | set(TOWER_SUBTYPE_TO_SF.values())
     return tuple(sorted(values))

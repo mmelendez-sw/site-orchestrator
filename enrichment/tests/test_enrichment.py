@@ -1045,6 +1045,49 @@ class DuplicateFallbackTests(unittest.TestCase):
         self.assertFalse(entry["payload"]["LLM_Holdout__c"])
         self.assertEqual(entry["payload"]["Site_Type__c"], "Rooftop")
 
+    def test_db_skip_blank_naip_writes_site_type(self):
+        from enrichment.sf_ops import apply_one_update
+
+        site = _FakeSiteSObject()
+        entry = apply_one_update(
+            _FakeClient(site),
+            {
+                "Id": "a0ZTEST000000006",
+                "naip_site_type": "",
+                "holdout_reason": "skip_classify_db_hit",
+                "update_lat": 39.63517,
+                "update_lng": -105.01095,
+                "update_site_type": "Monopole",
+                "update_verified_site": True,
+                "update_verified_site_source": "TowerSource",
+            },
+            dry_run=False,
+            verbose=False,
+        )
+        self.assertTrue(entry["success"])
+        self.assertEqual(entry["payload"]["Site_Type__c"], "Monopole")
+
+    def test_db_skip_blank_naip_without_site_type_still_fails(self):
+        from enrichment.sf_ops import apply_one_update
+
+        entry = apply_one_update(
+            _FakeClient(_FakeSiteSObject()),
+            {
+                "Id": "a0ZTEST000000007",
+                "naip_site_type": "",
+                "holdout_reason": "skip_classify_db_hit",
+                "update_lat": 42.639722,
+                "update_lng": -71.336667,
+                "update_site_type": "",
+                "update_verified_site": True,
+                "update_verified_site_source": "FCC",
+            },
+            dry_run=False,
+            verbose=False,
+        )
+        self.assertFalse(entry["success"])
+        self.assertIn("got blank", entry["error"])
+
 
 class GoldenRegressionTests(unittest.TestCase):
     def test_all_golden_cases(self):
@@ -1131,6 +1174,40 @@ class CostPolicyTests(unittest.TestCase):
             candidate_count=1,
         )
         self.assertFalse(should_auto_skip_classify(hit))
+
+    def test_auto_skip_on_structure_collocation(self):
+        from enrichment.cost_policy import (
+            auto_skip_classify_reason,
+            should_auto_skip_classify,
+        )
+        from enrichment.mssql import ProximityHit
+
+        hit = ProximityHit(
+            source="TowerSource",
+            distance_m=0.3,
+            latitude=41.177783,
+            longitude=-75.278199,
+            distance_to_pin_m=0.3,
+            candidate_count=3,
+            runner_up_gap_m=0.0,
+        )
+        self.assertTrue(should_auto_skip_classify(hit))
+        self.assertIn("on-structure", auto_skip_classify_reason(hit) or "")
+
+    def test_auto_skip_on_structure_ignores_nearby_other_tower(self):
+        from enrichment.cost_policy import should_auto_skip_classify
+        from enrichment.mssql import ProximityHit
+
+        hit = ProximityHit(
+            source="TowerSource",
+            distance_m=0.3,
+            latitude=41.177783,
+            longitude=-75.278199,
+            distance_to_pin_m=0.3,
+            candidate_count=2,
+            runner_up_gap_m=8.0,
+        )
+        self.assertTrue(should_auto_skip_classify(hit))
 
     def test_cluster_match_within_50m(self):
         from enrichment.cost_policy import find_cluster_match

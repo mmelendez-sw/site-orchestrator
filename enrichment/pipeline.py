@@ -36,8 +36,8 @@ from enrichment.geo import (
     should_compare_rooftop_hosts,
 )
 from enrichment.cost_policy import (
+    auto_skip_classify_reason,
     find_cluster_match,
-    should_auto_skip_classify,
 )
 from enrichment.mssql import connect_mssql, describe_match, find_proximity_hit
 from enrichment.outputs import (
@@ -54,6 +54,7 @@ from enrichment.sf_ops import (
     query_blank_site_type_sites,
     query_sites_by_ids,
 )
+from salesforce.site_type_mapping import site_type_from_db_asset_type
 from paths import runs_dir
 
 
@@ -491,20 +492,26 @@ def _process_site(
     base["classify_lat"] = classify_lat
     base["classify_lng"] = classify_lng
 
-    auto_skip = skip_classify or should_auto_skip_classify(hit)
+    skip_reason = None if skip_classify else auto_skip_classify_reason(hit)
+    auto_skip = skip_classify or skip_reason is not None
     if auto_skip:
         if verbose:
             progress.step(
                 "skip classify"
                 if skip_classify
-                else "auto skip classify (unique DB hit ≤25 m)"
+                else f"auto skip classify ({skip_reason})"
             )
         if hit is not None:
+            sf_type = site_type_from_db_asset_type(hit.asset_type)
             base["bucket"] = BUCKET_POTENTIAL_UPDATE
             base["holdout_reason"] = "skip_classify_db_hit"
+            base["naip_site_type"] = (
+                "rooftop" if sf_type == "Rooftop" else "tower"
+            )
             base["update_lat"] = classify_lat
             base["update_lng"] = classify_lng
             base["update_coord_source"] = f"db:{base['match_source']}"
+            base["update_site_type"] = sf_type
             base["update_verified_site"] = True
             base["update_verified_site_source"] = verified_source_for_match(
                 base["match_source"]

@@ -7,6 +7,7 @@ from typing import Any, Sequence
 
 from enrichment.geo import haversine_meters
 from enrichment.constants import (
+    AUTO_SKIP_ON_STRUCTURE_M,
     GEMINI_TOWER_SKIP_CLAUDE_CONF,
     PROXIMITY_AMBIGUITY_GAP_M,
     PROXIMITY_CONFIDENT_M,
@@ -20,22 +21,59 @@ def _env_flag(name: str, default: str = "1") -> bool:
     return os.environ.get(name, default).strip().lower() in ("1", "true", "yes")
 
 
+def _hit_pin_distance_m(hit: ProximityHit) -> float:
+    if hit.distance_to_pin_m is not None:
+        return float(hit.distance_to_pin_m)
+    return float(hit.distance_m)
+
+
+def auto_skip_classify_reason(
+    hit: ProximityHit | None,
+    *,
+    confident_m: float = PROXIMITY_CONFIDENT_M,
+    on_structure_m: float = AUTO_SKIP_ON_STRUCTURE_M,
+    ambiguity_gap_m: float = PROXIMITY_AMBIGUITY_GAP_M,
+) -> str | None:
+    """Operator label when imagery can be skipped, else None.
+
+    Unique ≤25 m still skips. A pin on the structure (≤5 m) also skips when
+    extra FCC/TowerSource rows share the pad — that is collocation, not a
+    wrong-neighbor choice. 10–25 m clusters still need the 75 m gap.
+    """
+    if not _env_flag("AUTO_SKIP_CLASSIFY", default="1") or hit is None:
+        return None
+    dist = float(hit.distance_m)
+    if dist > float(confident_m):
+        return None
+    pin_dist = _hit_pin_distance_m(hit)
+    if pin_dist <= float(on_structure_m):
+        return f"DB hit on-structure ≤{float(on_structure_m):g} m"
+    n = hit.candidate_count
+    if n is None or n <= 1:
+        return f"unique DB hit ≤{float(confident_m):g} m"
+    gap = hit.runner_up_gap_m
+    if gap is not None and float(gap) >= float(ambiguity_gap_m):
+        return f"unique DB hit ≤{float(confident_m):g} m"
+    return None
+
+
 def should_auto_skip_classify(
     hit: ProximityHit | None,
     *,
     confident_m: float = PROXIMITY_CONFIDENT_M,
+    on_structure_m: float = AUTO_SKIP_ON_STRUCTURE_M,
     ambiguity_gap_m: float = PROXIMITY_AMBIGUITY_GAP_M,
 ) -> bool:
-    """True when a unique FCC/TowerSource hit is close enough to skip imagery."""
-    if not _env_flag("AUTO_SKIP_CLASSIFY", default="1") or hit is None:
-        return False
-    if float(hit.distance_m) > float(confident_m):
-        return False
-    n = hit.candidate_count
-    if n is None or n <= 1:
-        return True
-    gap = hit.runner_up_gap_m
-    return gap is not None and float(gap) >= float(ambiguity_gap_m)
+    """True when a unique or on-structure FCC/TowerSource hit can skip imagery."""
+    return (
+        auto_skip_classify_reason(
+            hit,
+            confident_m=confident_m,
+            on_structure_m=on_structure_m,
+            ambiguity_gap_m=ambiguity_gap_m,
+        )
+        is not None
+    )
 
 
 def find_cluster_match(

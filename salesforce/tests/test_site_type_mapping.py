@@ -3,6 +3,7 @@
 from salesforce.site_type_mapping import (
     map_site_type_for_upload,
     normalize_tower_subtype,
+    site_type_from_db_asset_type,
     site_type_from_permit_text,
 )
 
@@ -49,3 +50,11 @@ def test_permit_text_fallback_for_tower_without_subtype():
 
 def test_site_type_from_permit_text_small_cell():
     assert site_type_from_permit_text("5G small cell on utility pole") == "Small Cell"
+
+
+def test_db_asset_type_maps_to_sf():
+    assert site_type_from_db_asset_type("Monopole") == "Monopole"
+    assert site_type_from_db_asset_type("lattice") == "Self Support / Lattice Tower"
+    assert site_type_from_db_asset_type("REG") == "Self Support / Lattice Tower"
+    assert site_type_from_db_asset_type("") == "Self Support / Lattice Tower"
+    assert site_type_from_db_asset_type("guyed") == "Guyed Tower"

@@ -343,11 +343,14 @@ def apply_one_update(
         naip_site_type = str(row.get("naip_site_type") or "").strip().lower()
         has_enrichment = is_enrichment_payload(payload)
         allowed_types = {"tower", "rooftop"}
+        payload_site_type = str(payload.get("Site_Type__c") or "").strip()
+        db_skip = str(row.get("holdout_reason") or "").strip() == "skip_classify_db_hit"
         if has_enrichment and naip_site_type not in allowed_types:
-            raise ValueError(
-                f"Salesforce updates require NAIP site_type=tower|rooftop; got "
-                f"{naip_site_type or 'blank'}"
-            )
+            if not (db_skip and payload_site_type):
+                raise ValueError(
+                    f"Salesforce updates require NAIP site_type=tower|rooftop; got "
+                    f"{naip_site_type or 'blank'}"
+                )
         if not payload:
             raise ValueError("Empty update payload")
         if dry_run:

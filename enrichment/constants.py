@@ -10,6 +10,10 @@ PROXIMITY_MAX_M = float(os.environ.get("PROXIMITY_MAX_M", "500"))
 # uniqueness checks — same spirit as the old 25 m default.
 PROXIMITY_CONFIDENT_M = float(os.environ.get("PROXIMITY_CONFIDENT_M", "25"))
 
+# Pin is on the structure: skip imagery even when other FCC/TowerSource rows
+# sit on the same pad (collocation). 10–25 m clusters still need the 75 m gap.
+AUTO_SKIP_ON_STRUCTURE_M = float(os.environ.get("AUTO_SKIP_ON_STRUCTURE_M", "5"))
+
 # Extended-range (confident..max) hits must beat the runner-up by this gap, or
 # sit within ADDRESS_AFFINITY_M of the geocoded address, to avoid wrong neighbors.
 PROXIMITY_AMBIGUITY_GAP_M = float(os.environ.get("PROXIMITY_AMBIGUITY_GAP_M", "75"))
