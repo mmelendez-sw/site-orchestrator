@@ -26,6 +26,7 @@ from enrichment.constants import (
     HOLDOUT_CSV,
     MATCH_SOURCE_NONE,
     PROXIMITY_MAX_M,
+    DEFAULT_STAGE_FILTER,
 )
 from enrichment.geo import (
     build_site_address,
@@ -82,6 +83,7 @@ def run_enrichment(
     carrier_like: str | None = None,
     metro_classification: str | None = "Major NFL Metro",
     states: list[str] | None = None,
+    stages: list[str] | None = None,
     llm_classified: bool = False,
     verbose: bool = True,
     apply: bool = True,
@@ -101,7 +103,9 @@ def run_enrichment(
     if verbose:
         progress.stage(
             "START",
-            f"limit={limit!s} | run_dir={run_dir.name}",
+            f"limit={limit!s} | "
+            f"stages={','.join(stages or list(DEFAULT_STAGE_FILTER))} | "
+            f"run_dir={run_dir.name}",
         )
 
     own_sql = False
@@ -126,16 +130,20 @@ def run_enrichment(
                 sites = query_sites_by_ids(sf_client, site_ids)
             else:
                 state_label = ",".join(states) if states else "all"
+                stage_filter = stages or list(DEFAULT_STAGE_FILTER)
+                stage_label = ",".join(stage_filter)
                 if verbose:
                     progress.stage(
                         "2/4 QUERY SALESFORCE",
-                        f"blank Site_Type | carrier_like={carrier_like!r} | "
+                        f"blank Site_Type | stages={stage_label} | "
+                        f"carrier_like={carrier_like!r} | "
                         f"metro={metro_classification!r} | "
                         f"llm_classified={str(llm_classified).lower()} | "
                         f"states={state_label}",
                     )
                 sites = query_blank_site_type_sites(
                     sf_client,
+                    stages=stage_filter,
                     carrier_like=carrier_like,
                     metro_classification=metro_classification,
                     states=states,

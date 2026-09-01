@@ -1,8 +1,8 @@
 """python -m enrichment
 
 Salesforce blank Site_Type → FCC/TowerSource → NAIP/Nearmap + Gemini/Claude → auto-apply.
-Holdouts dequeue unless DEQUEUE_HOLDOUTS=0. Optional env: STATES, LIMIT,
-IDS, CARRIER_LIKE, METRO_CLASSIFICATION, LLM_CLASSIFIED, APPLY,
+Holdouts dequeue unless DEQUEUE_HOLDOUTS=0. Optional env: STATES, STAGES,
+LIMIT, IDS, CARRIER_LIKE, METRO_CLASSIFICATION, LLM_CLASSIFIED, APPLY,
 DEQUEUE_HOLDOUTS, RUN_DIR, VERBOSE.
 Set APPLY=0 to classify without Salesforce writes.
 Set DEQUEUE_HOLDOUTS=0 to apply successes only and leave failed holdouts as-is.
@@ -61,6 +61,7 @@ def main() -> int:
     states = _csv_env("STATES")
     if states:
         states = [s.upper() for s in states]
+    stages = _csv_env("STAGES")
 
     print("=== AUTHENTICATE SALESFORCE ===", flush=True)
     sf_client = SalesforceClient()
@@ -72,6 +73,7 @@ def main() -> int:
         limit=int(limit_raw) if limit_raw else None,
         site_ids=_csv_env("IDS"),
         states=states,
+        stages=stages,
         carrier_like=parse_carrier_like(os.environ.get("CARRIER_LIKE")),
         metro_classification=parse_metro_classification(
             os.environ.get("METRO_CLASSIFICATION")

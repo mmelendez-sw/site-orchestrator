@@ -56,9 +56,6 @@ SF_QUERY_FIELDS = (
 )
 
 DEFAULT_STAGE_FILTER = (
-    "Enhanced/Unreviewed",
-    "New/Unreviewed",
-    "Outreach",
     "Outreach - Verified",
 )
 

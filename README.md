@@ -8,7 +8,7 @@ There is no upload-template or CSV-import step. Run CSVs under `../site-orchestr
 python -m enrichment
 ```
 
-Set `APPLY=0` to classify and write CSVs without Salesforce updates. Optional env: `STATES`, `LIMIT`, `IDS`, `CARRIER_LIKE`, `METRO_CLASSIFICATION`, `LLM_CLASSIFIED`, `RUN_DIR`, `VERBOSE`, `METRICS_SQL`, `DEQUEUE_HOLDOUTS`.
+Set `APPLY=0` to classify and write CSVs without Salesforce updates. Optional env: `STATES`, `STAGES`, `LIMIT`, `IDS`, `CARRIER_LIKE`, `METRO_CLASSIFICATION`, `LLM_CLASSIFIED`, `RUN_DIR`, `VERBOSE`, `METRICS_SQL`, `DEQUEUE_HOLDOUTS`. The queue defaults to `Stage__c = 'Outreach - Verified'` with no `LIMIT`. Set `STAGES` to a comma-separated picklist list to widen it.
 
 `CARRIER_LIKE` is the `Carrier_Leasing_Source__c` LIKE needle (unset = no carrier filter). Set `CARRIER_LIKE=NFL` to restrict to NFL sources. `METRO_CLASSIFICATION` is an exact `Metro_Classification__c` match (default `Major NFL Metro`). Set `METRO_CLASSIFICATION=none` to omit it. Enrichment does not write those fields. The queue defaults to `LLM_Classified__c = false`; set `LLM_CLASSIFIED=1` only to re-pull already-flagged rows.
 

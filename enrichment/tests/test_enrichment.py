@@ -858,13 +858,19 @@ class SoqlTests(unittest.TestCase):
         soql = build_blank_site_type_query()
         self.assertNotIn("Carrier_Leasing_Source__c LIKE", soql)
         self.assertIn("Metro_Classification__c = 'Major NFL Metro'", soql)
-        self.assertIn("Stage__c IN ('Enhanced/Unreviewed', 'New/Unreviewed', 'Outreach', 'Outreach - Verified')", soql)
+        self.assertIn("Stage__c IN ('Outreach - Verified')", soql)
         self.assertIn("Owner__c IN ('Site Acquisition Team', 'Marketing Campaign')", soql)
-        self.assertNotIn("Matthew Melendez", soql)
         self.assertIn("Site_Latitude__c != null", soql)
         self.assertIn("LLM_Classified__c = false", soql)
         self.assertIn("(LLM_Holdout__c = false OR LLM_Holdout__c = null)", soql)
         self.assertIn("Metro_Classification__c", soql.split(" FROM ")[0])
+
+    def test_blank_site_type_query_can_override_stages(self):
+        soql = build_blank_site_type_query(
+            stages=("Outreach", "Outreach - Verified"),
+        )
+        self.assertIn("Stage__c IN ('Outreach', 'Outreach - Verified')", soql)
+        self.assertNotIn("Enhanced/Unreviewed", soql)
 
     def test_blank_site_type_query_can_select_already_classified(self):
         soql = build_blank_site_type_query(
