@@ -1351,12 +1351,17 @@ class CostPolicyTests(unittest.TestCase):
                     "nearmap_ran": True,
                 },
                 {"Id": "b", "outcome": "holdout_empty_confirmed", "nearmap_ran": True},
+                {"Id": "c", "outcome": "applied_tower"},
             ]
         )
-        self.assertEqual(kpis["unique_sites"], 2)
+        self.assertEqual(kpis["unique_sites"], 3)
         self.assertEqual(kpis["rooftop_sf_writes"], 1)
+        self.assertEqual(kpis["tower_sf_writes"], 1)
         self.assertEqual(kpis["holdout_empty_confirmed"], 1)
         self.assertEqual(kpis["naip_empty_to_rooftop_apply"], 1)
+        self.assertEqual(kpis["rooftop_write_rate"], 0.333)
+        self.assertEqual(kpis["tower_write_rate"], 0.333)
+        self.assertEqual(kpis["total_write_rate"], 0.667)
 
     def test_osm_empty_chip_and_tower_tags(self):
         from enrichment.osm_prefilter import (

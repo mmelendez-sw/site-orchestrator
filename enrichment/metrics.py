@@ -286,10 +286,12 @@ def rollup_kpis(site_rows: list[dict[str, Any]]) -> dict[str, Any]:
         key = str(rec.get("outcome") or "unknown")
         by_outcome[key] = by_outcome.get(key, 0) + 1
     rooftop_writes = by_outcome.get("applied_rooftop", 0)
+    tower_writes = by_outcome.get("applied_tower", 0)
+    total_writes = rooftop_writes + tower_writes
     return {
         "unique_sites": n,
         "rooftop_sf_writes": rooftop_writes,
-        "tower_sf_writes": by_outcome.get("applied_tower", 0),
+        "tower_sf_writes": tower_writes,
         "holdout_empty_confirmed": by_outcome.get("holdout_empty_confirmed", 0),
         "holdout_weak_rooftop": by_outcome.get("holdout_weak_rooftop", 0),
         "holdout_weak_tower": by_outcome.get("holdout_weak_tower", 0),
@@ -303,6 +305,8 @@ def rollup_kpis(site_rows: list[dict[str, Any]]) -> dict[str, Any]:
             round(empty_rt_apply / empty_nm, 3) if empty_nm else None
         ),
         "rooftop_write_rate": round(rooftop_writes / n, 3) if n else None,
+        "tower_write_rate": round(tower_writes / n, 3) if n else None,
+        "total_write_rate": round(total_writes / n, 3) if n else None,
         "outcomes": by_outcome,
         "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
@@ -339,6 +343,8 @@ KPI_METRIC_KEYS: tuple[str, ...] = (
     "rooftop_sf_writes",
     "tower_sf_writes",
     "rooftop_write_rate",
+    "tower_write_rate",
+    "total_write_rate",
     "naip_empty_to_nearmap",
     "naip_empty_to_rooftop_apply",
     "empty_to_rooftop_apply_rate",

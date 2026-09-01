@@ -173,7 +173,20 @@ SELECT
         SUM(CASE WHEN Outcome = N'applied_rooftop' THEN 1 ELSE 0 END) * 1.0
         / NULLIF(COUNT(*), 0)
         AS decimal(6,3)
-    ) AS RooftopWriteRate
+    ) AS RooftopWriteRate,
+    CAST(
+        SUM(CASE WHEN Outcome = N'applied_tower' THEN 1 ELSE 0 END) * 1.0
+        / NULLIF(COUNT(*), 0)
+        AS decimal(6,3)
+    ) AS TowerWriteRate,
+    CAST(
+        (
+            SUM(CASE WHEN Outcome = N'applied_rooftop' THEN 1 ELSE 0 END)
+            + SUM(CASE WHEN Outcome = N'applied_tower' THEN 1 ELSE 0 END)
+        ) * 1.0
+        / NULLIF(COUNT(*), 0)
+        AS decimal(6,3)
+    ) AS TotalWriteRate
 FROM dbo.vEnrichmentSiteLatest
 GO
 
@@ -204,7 +217,20 @@ SELECT
         SUM(CASE WHEN Outcome = N'applied_rooftop' THEN 1 ELSE 0 END) * 1.0
         / NULLIF(COUNT(*), 0)
         AS decimal(6,3)
-    ) AS RooftopWriteRate
+    ) AS RooftopWriteRate,
+    CAST(
+        SUM(CASE WHEN Outcome = N'applied_tower' THEN 1 ELSE 0 END) * 1.0
+        / NULLIF(COUNT(*), 0)
+        AS decimal(6,3)
+    ) AS TowerWriteRate,
+    CAST(
+        (
+            SUM(CASE WHEN Outcome = N'applied_rooftop' THEN 1 ELSE 0 END)
+            + SUM(CASE WHEN Outcome = N'applied_tower' THEN 1 ELSE 0 END)
+        ) * 1.0
+        / NULLIF(COUNT(*), 0)
+        AS decimal(6,3)
+    ) AS TotalWriteRate
 FROM dbo.vEnrichmentSiteLatest
 GROUP BY SiteState
 GO
@@ -236,7 +262,20 @@ SELECT
         SUM(CASE WHEN Outcome = N'applied_rooftop' THEN 1 ELSE 0 END) * 1.0
         / NULLIF(COUNT(*), 0)
         AS decimal(6,3)
-    ) AS RooftopWriteRate
+    ) AS RooftopWriteRate,
+    CAST(
+        SUM(CASE WHEN Outcome = N'applied_tower' THEN 1 ELSE 0 END) * 1.0
+        / NULLIF(COUNT(*), 0)
+        AS decimal(6,3)
+    ) AS TowerWriteRate,
+    CAST(
+        (
+            SUM(CASE WHEN Outcome = N'applied_rooftop' THEN 1 ELSE 0 END)
+            + SUM(CASE WHEN Outcome = N'applied_tower' THEN 1 ELSE 0 END)
+        ) * 1.0
+        / NULLIF(COUNT(*), 0)
+        AS decimal(6,3)
+    ) AS TotalWriteRate
 FROM dbo.vEnrichmentSiteLatest
 GROUP BY MatchSource
 GO
