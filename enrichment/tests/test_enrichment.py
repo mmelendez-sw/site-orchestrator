@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import tempfile
 import unittest
+from pathlib import Path
 
 from enrichment.bucketing import bucket_classification
 from enrichment.constants import (
@@ -728,6 +730,36 @@ class BucketTests(unittest.TestCase):
             sf_lng=-115.0852,
         )
         self.assertEqual(decision["holdout_reason"], "tower_needs_dual_model_cell")
+
+    def test_claimed_site_keep_gemini_stealth_writes(self):
+        decision = bucket_classification(
+            match_source=MATCH_SOURCE_NONE,
+            classified={
+                "site_type": "tower",
+                "tower_subtype": "stealth",
+                "site_confidence": 0.8,
+                "cell_equipment": True,
+                "cell_equipment_confidence": 0.85,
+                "cell_equipment_evidence": (
+                    "Canister shroud at the mast top. | claimed-site keep Gemini"
+                ),
+                "site_evidence": (
+                    "A slim flagpole-style tower with a canister shroud "
+                    "in the vacant lot."
+                ),
+                "nearmap_tier": "full",
+                "nearmap_views": "Vert,North,East",
+                "cell_models_agree": False,
+                "dual_model_resolution": "claimed_site_keep_gemini",
+                "escalation_model": "claude",
+            },
+            db_lat=None,
+            db_lng=None,
+            sf_lat=33.974293,
+            sf_lng=-118.311989,
+        )
+        self.assertEqual(decision["bucket"], BUCKET_POTENTIAL_UPDATE)
+        self.assertEqual(decision["update_site_type"], "Stealth")
 
     def test_tower_gemini_high_conf_solo_is_ready(self):
         """Gemini tower at >= 0.9 skips Claude and can write (DB or imagery)."""
@@ -1683,6 +1715,89 @@ class SqlTokenCacheTests(unittest.TestCase):
             )
         )
         self.assertFalse(_is_expired_sql_login(Exception("Login timeout expired")))
+
+
+class HoldoutRerunTests(unittest.TestCase):
+    def test_holdout_ids_from_run_folder(self):
+        from enrichment.outputs import holdout_ids_from_run_specs, write_csv
+        from enrichment.constants import HOLDOUT_CSV
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run = root / "2026-09-01_example"
+            run.mkdir()
+            write_csv(
+                run / HOLDOUT_CSV,
+                [
+                    {"Id": "a0Zaaa", "holdout_reason": "other"},
+                    {"Id": "a0Zbbb", "holdout_reason": "tower_no_cell_equipment"},
+                    {"Id": "a0Zaaa", "holdout_reason": "other"},
+                ],
+                ("Id", "holdout_reason"),
+            )
+            ids = holdout_ids_from_run_specs([run.name], runs_root=root)
+        self.assertEqual(ids, ["a0Zaaa", "a0Zbbb"])
+
+    def test_site_ids_from_run_date_prefix(self):
+        from enrichment.constants import DETAIL_CSV
+        from enrichment.outputs import site_ids_from_run_specs, write_csv
+        from enrichment.naip_classify import resolve_reuse_chips_dirs
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            older = root / "2026-09-01_100000_sf_enrichment"
+            newer = root / "2026-09-01_163825_sf_enrichment"
+            skipped = root / "2026-08-31_155100_sf_enrichment"
+            for run in (older, newer, skipped):
+                (run / "chips").mkdir(parents=True)
+            write_csv(
+                older / DETAIL_CSV,
+                [
+                    {"Id": "a0Zold", "Stage__c": "Outreach - Verified"},
+                    {"Id": "a0Zshared", "Stage__c": "Outreach - Verified"},
+                    {"Id": "a0Zworking", "Stage__c": "Working-Connected"},
+                ],
+                ("Id", "Stage__c"),
+            )
+            write_csv(
+                newer / DETAIL_CSV,
+                [
+                    {"Id": "a0Znew", "Stage__c": "Outreach - Verified"},
+                    {"Id": "a0Zshared", "Stage__c": "Outreach - Verified"},
+                ],
+                ("Id", "Stage__c"),
+            )
+            write_csv(
+                skipped / DETAIL_CSV,
+                [{"Id": "a0Zaug", "Stage__c": "Outreach - Verified"}],
+                ("Id", "Stage__c"),
+            )
+            ids = site_ids_from_run_specs(["2026-09-01"], runs_root=root)
+            chips = resolve_reuse_chips_dirs(["2026-09-01"], runs_root=root)
+        self.assertEqual(ids, ["a0Znew", "a0Zshared", "a0Zold"])
+        self.assertEqual(
+            [path.parent.name for path in chips],
+            ["2026-09-01_163825_sf_enrichment", "2026-09-01_100000_sf_enrichment"],
+        )
+
+    def test_load_saved_chip_pack(self):
+        from PIL import Image
+
+        from enrichment.naip_classify import load_saved_chip_pack, saved_chip_pack_usable
+
+        with tempfile.TemporaryDirectory() as tmp:
+            chips = Path(tmp) / "chips"
+            chips.mkdir()
+            Image.new("RGB", (8, 8), "red").save(chips / "a0Ztest_nearmap_vert.jpg")
+            Image.new("RGB", (8, 8), "blue").save(chips / "a0Ztest_nearmap_north.jpg")
+            Image.new("RGB", (8, 8), "green").save(chips / "a0Ztest_NAIP.jpg")
+            pack = load_saved_chip_pack([chips], "a0Ztest")
+            empty = load_saved_chip_pack([chips], "missing")
+        self.assertTrue(saved_chip_pack_usable(pack))
+        self.assertIn("Vert", pack["nearmap_views"])
+        self.assertIn("North", pack["nearmap_views"])
+        self.assertIsNotNone(pack["naip"])
+        self.assertFalse(saved_chip_pack_usable(empty))
 
 
 if __name__ == "__main__":

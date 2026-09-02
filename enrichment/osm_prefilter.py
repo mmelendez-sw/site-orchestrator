@@ -1,8 +1,10 @@
 """OSM Overpass lookup for nearby towers/buildings.
 
-Used as a positive signal (communication tower nearby). An empty Overpass
-result does **not** skip Nearmap — this queue is carrier-claimed cell sites,
-and OSM misses rooftop/stealth/small monopoles constantly.
+Used as a positive signal (communication tower nearby) and, after an empty
+NAIP screen, as a cheap skip: no building and no tower/mast means do not
+buy Nearmap. A failed Overpass lookup never skips (fail-open). OSM still
+misses rooftop/stealth gear when a building is present — those still buy
+Nearmap.
 """
 
 from __future__ import annotations
@@ -116,9 +118,10 @@ def lookup_osm_features(
 
 
 def osm_suggests_empty_chip(info: dict[str, Any] | None) -> bool:
-    """True when OSM shows no building and no tower/mast.
+    """True when a successful OSM lookup shows no building and no tower/mast.
 
-    Informational only — do not use this to skip Nearmap on a claimed site.
+    Used to skip Nearmap after an empty NAIP screen. Failed lookups
+    (``ok`` False) never skip.
     """
     if not info or not info.get("ok"):
         return False

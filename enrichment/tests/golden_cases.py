@@ -129,6 +129,31 @@ GOLDEN_CASES: list[GoldenCase] = [
         {"holdout_reason": "tower_no_cell_equipment"},
     ),
     (
+        "florence_monopalm_claimed_keep",
+        MATCH_SOURCE_NONE,
+        _tower(
+            tower_subtype="stealth",
+            site_confidence=0.8,
+            cell_equipment=True,
+            cell_equipment_confidence=0.85,
+            cell_equipment_evidence=(
+                "Canister shroud at the mast top. | claimed-site keep Gemini"
+            ),
+            site_evidence=(
+                "A slim flagpole-style tower with a canister shroud "
+                "in the vacant lot east of a billboard."
+            ),
+            dual_model_resolution="claimed_site_keep_gemini",
+            cell_models_agree=False,
+            escalation_model="claude",
+        ),
+        None,
+        None,
+        33.974293,
+        -118.311989,
+        {"bucket": BUCKET_POTENTIAL_UPDATE},
+    ),
+    (
         "southeast_financial_vert_box_agree_crop",
         MATCH_SOURCE_NONE,
         _rooftop(

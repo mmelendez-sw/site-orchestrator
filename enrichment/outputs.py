@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import csv
+import re
 from pathlib import Path
 from typing import Any, Iterable, Sequence
+
+_RUN_DATE_PREFIX = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 DETAIL_COLUMNS: tuple[str, ...] = (
     "Id",
@@ -137,3 +140,116 @@ def write_csv(path: Path, rows: Iterable[dict[str, Any]], columns: Sequence[str]
         writer.writeheader()
         for row in materialised:
             writer.writerow({col: row.get(col, "") for col in columns})
+
+
+def expand_run_specs(specs: Sequence[str] | None, *, runs_root: Path) -> list[Path]:
+    """Resolve run-folder names or ``YYYY-MM-DD`` prefixes to existing directories.
+
+    Date prefixes expand to matching folders under ``runs_root``, newest name
+    first so later chip reuse prefers the latest JPEGs.
+    """
+    found: list[Path] = []
+    seen: set[Path] = set()
+    for raw in specs or []:
+        text = str(raw or "").strip()
+        if not text:
+            continue
+        if _RUN_DATE_PREFIX.match(text):
+            matches = sorted(
+                (path for path in runs_root.glob(f"{text}*") if path.is_dir()),
+                key=lambda path: path.name,
+                reverse=True,
+            )
+            if not matches:
+                raise FileNotFoundError(
+                    f"No run folders matching {text}* under {runs_root}"
+                )
+            candidates = matches
+        else:
+            path = Path(text)
+            if not path.is_absolute():
+                path = runs_root / text
+            if not path.is_dir():
+                raise FileNotFoundError(f"Run folder not found: {path}")
+            candidates = [path]
+        for candidate in candidates:
+            resolved = candidate.resolve()
+            if resolved not in seen:
+                seen.add(resolved)
+                found.append(resolved)
+    return found
+
+
+def holdout_ids_from_run_specs(specs: Sequence[str], *, runs_root: Path) -> list[str]:
+    """Load unique Salesforce Ids from holdout CSVs of one or more run folders.
+
+    Each spec is a run directory name under ``runs_root``, a ``YYYY-MM-DD``
+    prefix, or a path to a directory / holdout CSV. ``IDS=`` can then
+    re-classify dequeued holdouts (the by-Id query ignores LLM_Holdout).
+    """
+    from enrichment.constants import HOLDOUT_CSV
+
+    seen: set[str] = set()
+    ordered: list[str] = []
+    csv_paths: list[Path] = []
+    leftover: list[str] = []
+    for raw in specs:
+        text = str(raw or "").strip()
+        if not text:
+            continue
+        path = Path(text)
+        if not path.is_absolute() and not _RUN_DATE_PREFIX.match(text):
+            path = runs_root / text
+        if path.is_file():
+            csv_paths.append(path)
+        else:
+            leftover.append(text)
+    for run_dir in expand_run_specs(leftover, runs_root=runs_root) if leftover else []:
+        holdout = run_dir / HOLDOUT_CSV
+        if holdout.is_file():
+            csv_paths.append(holdout)
+    for path in csv_paths:
+        with path.open(newline="", encoding="utf-8") as handle:
+            for row in csv.DictReader(handle):
+                sf_id = str(row.get("Id") or row.get("sf_id") or "").strip()
+                if sf_id and sf_id not in seen:
+                    seen.add(sf_id)
+                    ordered.append(sf_id)
+    return ordered
+
+
+def site_ids_from_run_specs(
+    specs: Sequence[str],
+    *,
+    runs_root: Path,
+    stages: Sequence[str] | None = None,
+) -> list[str]:
+    """Load unique Salesforce Ids from enrichment_detail.csv of prior runs.
+
+    Defaults to Outreach - Verified. Newest matching run folders are read
+    first; a site classified in multiple runs is kept once.
+    """
+    from enrichment.constants import DEFAULT_STAGE_FILTER, DETAIL_CSV
+
+    stage_set = {
+        str(stage).strip()
+        for stage in (DEFAULT_STAGE_FILTER if stages is None else stages)
+        if str(stage).strip()
+    }
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for run_dir in expand_run_specs(specs, runs_root=runs_root):
+        path = run_dir / DETAIL_CSV
+        if not path.is_file():
+            continue
+        with path.open(newline="", encoding="utf-8") as handle:
+            for row in csv.DictReader(handle):
+                if stage_set:
+                    stage = str(row.get("Stage__c") or "").strip()
+                    if stage not in stage_set:
+                        continue
+                sf_id = str(row.get("Id") or row.get("sf_id") or "").strip()
+                if sf_id and sf_id not in seen:
+                    seen.add(sf_id)
+                    ordered.append(sf_id)
+    return ordered

@@ -175,20 +175,29 @@ def query_blank_site_type_sites(
     return query_all(client, soql)
 
 
+# Stay under Salesforce SOQL length limits on large chip-reuse reruns.
+_SF_ID_QUERY_CHUNK = 200
+
+
 def query_sites_by_ids(
     client: SalesforceClient,
     ids: Sequence[str],
 ) -> list[dict[str, Any]]:
     """Fetch Site__c rows by Id, preserving the requested order."""
-    soql = build_sites_by_ids_query(ids)
-    logger.info("Salesforce SOQL: %s", soql)
-    rows = query_all(client, soql)
-    by_id = {str(r.get("Id") or ""): r for r in rows}
+    clean = [str(sid).strip() for sid in ids if str(sid).strip()]
+    by_id: dict[str, dict[str, Any]] = {}
+    for start in range(0, len(clean), _SF_ID_QUERY_CHUNK):
+        chunk = clean[start : start + _SF_ID_QUERY_CHUNK]
+        soql = build_sites_by_ids_query(chunk)
+        logger.info("Salesforce SOQL: %s", soql)
+        for row in query_all(client, soql):
+            key = str(row.get("Id") or "").strip()
+            if key:
+                by_id[key] = row
     ordered: list[dict[str, Any]] = []
-    for sid in ids:
-        key = str(sid).strip()
-        if key in by_id:
-            ordered.append(by_id[key])
+    for sid in clean:
+        if sid in by_id:
+            ordered.append(by_id[sid])
     return ordered
 
 

@@ -17,6 +17,90 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+_NEARMAP_CHIP_FILES: tuple[tuple[str, str], ...] = (
+    ("Vert", "vert"),
+    ("North", "north"),
+    ("East", "east"),
+    ("South", "south"),
+    ("West", "west"),
+)
+
+
+def resolve_reuse_chips_dirs(
+    specs: list[str] | None, *, runs_root: Path
+) -> list[Path]:
+    """Turn run-folder names, date prefixes, or chip paths into chips/ directories."""
+    from enrichment.outputs import expand_run_specs
+
+    dirs: list[Path] = []
+    seen: set[Path] = set()
+    leftover: list[str] = []
+    for raw in specs or []:
+        text = str(raw or "").strip()
+        if not text:
+            continue
+        path = Path(text)
+        if not path.is_absolute():
+            path = runs_root / text
+        if path.is_dir() and path.name.lower() == "chips":
+            resolved = path.resolve()
+            if resolved not in seen:
+                seen.add(resolved)
+                dirs.append(resolved)
+            continue
+        leftover.append(text)
+    for run_dir in expand_run_specs(leftover, runs_root=runs_root) if leftover else []:
+        chips = run_dir / "chips"
+        if not chips.is_dir():
+            continue
+        resolved = chips.resolve()
+        if resolved not in seen:
+            seen.add(resolved)
+            dirs.append(resolved)
+    if specs and not dirs:
+        raise FileNotFoundError(
+            f"Saved chips directory not found for: {', '.join(str(s) for s in specs)}"
+        )
+    return dirs
+
+
+def load_saved_chip_pack(chip_dirs: list[Path], site_id: str) -> dict[str, Any]:
+    """Load NAIP + Nearmap JPEGs saved under ``{site_id}_nearmap_*.jpg``.
+
+    Searches chip_dirs in order and returns the first pack that has any image.
+    """
+    from PIL import Image
+
+    empty: dict[str, Any] = {"naip": None, "nearmap_views": {}, "source_dir": None}
+    sid = str(site_id or "").strip()
+    if not sid:
+        return empty
+    for chip_dir in chip_dirs:
+        naip = None
+        naip_path = chip_dir / f"{sid}_NAIP.jpg"
+        if naip_path.is_file():
+            with Image.open(naip_path) as im:
+                naip = im.convert("RGB")
+        nearmap_views: dict[str, Any] = {}
+        for name, suffix in _NEARMAP_CHIP_FILES:
+            path = chip_dir / f"{sid}_nearmap_{suffix}.jpg"
+            if path.is_file():
+                with Image.open(path) as im:
+                    nearmap_views[name] = im.convert("RGB")
+        if naip is not None or nearmap_views:
+            return {
+                "naip": naip,
+                "nearmap_views": nearmap_views,
+                "source_dir": chip_dir,
+            }
+    return empty
+
+
+def saved_chip_pack_usable(pack: dict[str, Any] | None) -> bool:
+    if not pack:
+        return False
+    return pack.get("naip") is not None or bool(pack.get("nearmap_views"))
+
 
 def _refresh_classifier_flags(ac: Any) -> None:
     """Re-bind module flags from current env (enrichment may import after .env load)."""
@@ -83,20 +167,25 @@ def classify_site_imagery(
     pin_address_offset_m: float | None = None,
     pin_address_mismatch: bool = False,
     db_backed: bool = False,
+    reuse_chips_dirs: list[Path] | None = None,
 ) -> dict[str, Any]:
     """Classify one coordinate with the full Nearmap + bifurcated AI stack.
 
     Same strategy as `classifier.asset_classifier` main loop for a single pin:
     NAIP → Nearmap vert/obliques → wide AOI / zoom → Claude escalate.
 
+    ``reuse_chips_dirs``: classify already-saved JPEGs (no Nearmap fetch).
+    Sites with no matching chips return ``error=no_saved_chips``.
+
     FCC/TowerSource is the tower path (unique hit ≤25 m skips this). No DB
     hit is the rooftop path: pick the host building (parking-lot pin vs
     Census, from ``ROOFTOP_HOST_OFFSET_M``), then buy obliques there.
 
-    ``db_backed``: FCC/TowerSource already matched. High-conf Gemini towers
-    then skip Vert/obliques. OSM communication towers skip obliques too, but
-    are not a database hit (MatchSource stays none). Imagery-only tower+cell
-    still fetches obliques.
+    ``db_backed``: FCC/TowerSource already matched. NAIP towers that already
+    decided cell at medium+ confidence skip Vert/obliques. OSM communication
+    towers skip obliques too, but are not a database hit (MatchSource stays
+    none). Imagery-only tower+cell still fetches obliques. Empty NAIP plus
+    OSM with no building/tower skips Nearmap.
 
     One Nearmap pack at the winner. A second pack at the unused pin/Census
     point only if the first pack is empty or an unlocked rooftop (no cell
@@ -134,6 +223,28 @@ def classify_site_imagery(
     input_conf = ac.normalize_input_confidence(input_confidence)
 
     skip_paid_imagery = bool(ac.NAIP_ONLY)
+    reuse_dirs = [Path(p) for p in (reuse_chips_dirs or []) if p]
+    reuse_saved = bool(reuse_dirs)
+    skip_nearmap_fetch = skip_paid_imagery or reuse_saved
+    saved_pack: dict[str, Any] | None = None
+    if reuse_saved:
+        saved_pack = load_saved_chip_pack(reuse_dirs, site_id)
+        if not saved_chip_pack_usable(saved_pack):
+            if verbose:
+                progress.warn("no saved chips — skip (no Nearmap fetch)")
+            return {
+                "site_type": "no_imagery",
+                "error": "no_saved_chips",
+                "lat": lat,
+                "lon": lon,
+            }
+        if verbose:
+            n_nm = len(saved_pack.get("nearmap_views") or {})
+            progress.step(
+                f"reuse saved chips ({n_nm} Nearmap"
+                f"{' + NAIP' if saved_pack.get('naip') is not None else ''})"
+            )
+
     img = None
     naip_meta = None
     naip_geo = None
@@ -146,7 +257,7 @@ def classify_site_imagery(
         except Exception:  # noqa: BLE001
             return {"ok": False}
 
-    if not skip_paid_imagery:
+    if not skip_nearmap_fetch:
         from enrichment.geo import (
             mismatch_osm_is_decisive,
             pick_classify_anchor,
@@ -195,18 +306,29 @@ def classify_site_imagery(
         elif verbose and pin_osm.get("ok") and not (
             pin_osm.get("has_building") or pin_osm.get("has_tower_or_mast")
         ):
-            progress.result("OSM: no building/tower at pin (still using Nearmap)")
+            progress.result(
+                "OSM: no building/tower at pin (Nearmap only if NAIP finds a site)"
+            )
 
-    if verbose:
-        progress.step("NAIP fetch")
-    if img is None:
-        img, naip_meta, naip_geo = ac.fetch_chip(lat, lon)
-    img_date = (naip_meta or {}).get("image_date")
-    naip_chip_m = (naip_meta or {}).get("naip_chip_m") or ac.CHIP_SIZE_M
+    if reuse_saved and saved_pack is not None:
+        img = saved_pack.get("naip")
+        naip_chip_m = ac.CHIP_SIZE_M
+        img_date = None
+        if verbose:
+            progress.result("skip NAIP fetch (saved chips)")
+    else:
+        if verbose:
+            progress.step("NAIP fetch")
+        if img is None:
+            img, naip_meta, naip_geo = ac.fetch_chip(lat, lon)
+        img_date = (naip_meta or {}).get("image_date")
+        naip_chip_m = (naip_meta or {}).get("naip_chip_m") or ac.CHIP_SIZE_M
 
     nearmap_views: dict = {}
     nearmap_date = None
-    if not skip_paid_imagery and not ac.NEARMAP_TIERED:
+    if reuse_saved and saved_pack is not None:
+        nearmap_views = dict(saved_pack.get("nearmap_views") or {})
+    elif not skip_nearmap_fetch and not ac.NEARMAP_TIERED:
         try:
             nearmap_views, nearmap_date = ac.fetch_nearmap_views(lat, lon)
         except Exception as exc:  # noqa: BLE001
@@ -214,7 +336,7 @@ def classify_site_imagery(
                 progress.warn(f"Nearmap fetch failed: {exc}")
 
     if img is None and not nearmap_views and not (
-        not skip_paid_imagery and ac.NEARMAP_TIERED and ac.NEARMAP_API_KEY
+        not skip_nearmap_fetch and ac.NEARMAP_TIERED and ac.NEARMAP_API_KEY
     ):
         if verbose:
             progress.warn("No imagery")
@@ -256,7 +378,30 @@ def classify_site_imagery(
     nearmap_tier = "naip_only"
     views: list = []
 
-    if skip_paid_imagery:
+    if reuse_saved:
+        views = build_views(nearmap_views)
+        if verbose:
+            progress.step("classify saved chips (no Nearmap fetch)")
+        res, primary_model, escalation_model, escalation_reason_str = (
+            ac.classify_with_routing(
+                primary_provider,
+                clients,
+                views,
+                prompt,
+                input_conf,
+                escalate=False,
+                screen=False,
+            )
+        )
+        has_obliques = any(name != "Vert" for name in nearmap_views)
+        if has_obliques:
+            nearmap_tier = "full"
+        elif nearmap_views:
+            nearmap_tier = "vert_only"
+        else:
+            nearmap_tier = "naip_only"
+        classification_stage = "chip_reuse"
+    elif skip_paid_imagery:
         if img is None:
             return {
                 "site_type": "no_imagery",
@@ -332,7 +477,7 @@ def classify_site_imagery(
     second_nearmap = ""
     if should_spend_second_nearmap(
         unused_point=unused_point,
-        skip_paid_imagery=skip_paid_imagery,
+        skip_paid_imagery=skip_nearmap_fetch,
         has_nearmap_key=bool(ac.NEARMAP_API_KEY),
         site_type=res.get("site_type"),
         site_confidence=res.get("site_confidence"),
@@ -453,12 +598,14 @@ def classify_site_imagery(
     }
     no_nearmap_coverage = nearmap_tier_now == "no_coverage"
     pin_offset_scout = (
-        not nearmap_blocks_rescue
+        not reuse_saved
+        and not nearmap_blocks_rescue
         and not no_nearmap_coverage
         and ac.needs_pin_offset_scout(res)
     )
     naip_rescue = (
-        not nearmap_blocks_rescue
+        not reuse_saved
+        and not nearmap_blocks_rescue
         and not pin_offset_scout
         and not nearmap_looked
         and not no_nearmap_coverage
@@ -494,7 +641,7 @@ def classify_site_imagery(
     # Wide Nearmap AOI — rooftops only (not empty-field hunting).
     if (
         pin_offset_scout
-        and not skip_paid_imagery
+        and not skip_nearmap_fetch
         and ac.NEARMAP_API_KEY
         and not no_nearmap_coverage
     ):

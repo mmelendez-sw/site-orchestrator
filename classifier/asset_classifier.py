@@ -264,15 +264,24 @@ clearly here. Weight them heavily in every task.
 
 Definitions:
 - TOWER SITE: a ground-based, purpose-built vertical structure carrying \
-antennas - monopole, lattice/self-support tower, or guyed mast. Top-down cues: \
-tiny footprint, long thin linear shadow, lattice cross-pattern, guy wires, \
-small cleared/fenced compound with equipment cabinets. Oblique cues: a tall \
-thin structure rising far above its surroundings.
+antennas - monopole, lattice/self-support tower, guyed mast, or a disguised \
+mast (monopalm / monopine / canister shroud). Top-down cues: tiny footprint, \
+long thin linear shadow, lattice cross-pattern, guy wires, small \
+cleared/fenced compound with equipment cabinets, or a palm/pine that is \
+far taller and straighter than its neighbors. Oblique cues: a tall thin \
+structure rising far above its surroundings — including a faux palm/pine.
 - ROOFTOP SITE: a building whose roof hosts cellular telecom equipment. True \
 cues: panel antennas / sector frames at roof corners or edges (often 3 sectors), \
 triangular or steel antenna mounts, microwave backhaul dishes, RRUs, telecom \
 cabinets with cable trays, short masts or poles carrying panel antennas on the \
 parapet. Ordinary building mechanicals alone are NOT a rooftop cell site.
+- STEALTH TREE / DISGUISED MAST: a purpose-built telecom mast camouflaged as \
+a palm (monopalm) or pine (monopine), or a slim canister/flagpole shroud. \
+Cues: unnaturally straight/thick trunk, crown taller and more regular than \
+nearby real trees, antenna cylinder or panel bulge in the fronds, equipment \
+cabinets or a fenced pad at the base. Often sits at a lot edge, behind a \
+billboard, or in a corner of the chip — search edges. Natural palms/pines \
+have tapered trunks, irregular fronds, and no cabinets; those are not towers.
 - STEALTH / BUILDING-TOWER SITE: a structure that looks like a building but \
 has a tall narrow tower section - church steeple, clock tower, faux-building \
 monopole, or a tower segment rising from one corner of a larger footprint. \
@@ -288,9 +297,12 @@ empty pavement, driveway, or landscaping next to a larger commercial / mall \
 building, search adjacent rooftops and tower compounds in the chip for cellular \
 gear — do not stop at "other" just because the pin itself is pavement.
 - "tower": a PURPOSE-BUILT cellular/telecom tower is visible. Must show cell \
-platforms, sector racks, microwave dishes, or a fenced telecom compound — NOT \
-a wood utility pole, street light, traffic signal, power transmission lattice, \
-or tree. Power/transmission lattices and bare utility poles are "other".
+platforms, sector racks, microwave dishes, a fenced telecom compound, or a \
+disguised mast (monopalm/monopine/canister) — NOT a wood utility pole, street \
+light, traffic signal, power transmission lattice, or a natural tree. A \
+too-tall straight palm/pine with a regular crown and cabinets or an antenna \
+bulge is stealth, not "other". Power/transmission lattices and bare utility \
+poles are "other".
 - "rooftop": no tower present, and a building roof hosts (or most plausibly \
 hosts) the equipment.
 - "other": neither applies (water tank, silo, bare field, power lattice, \
@@ -302,21 +314,27 @@ When site_type is "tower", also set tower_subtype to the best match:
 - "self_support": lattice or solid self-supporting tower legs
 - "stealth": ONLY a purpose-built disguised telecom mast — e.g. monopalm \
 (faux palm), monopine (faux pine), slim flagpole/canister shroud, or a \
-freestanding faux-steeple mast with visible antenna bays/slots. Do NOT use \
-stealth for ordinary church steeples, cupolas, elevator penthouses, \
-decorative parking-lot towers, building corners, or architecture that merely \
-"could" hide antennas. If unsure, use other_tower or unclear — never guess \
-stealth.
+freestanding faux-steeple mast with visible antenna bays/slots. A palm- or \
+pine-disguised mast is stealth, never flagpole. Do NOT use stealth for \
+ordinary church steeples, cupolas, elevator penthouses, decorative \
+parking-lot towers, building corners, real trees, or architecture that \
+merely "could" hide antennas. If unsure, use other_tower or unclear — never \
+guess stealth.
 - "water_tower": elevated tank on legs
 - "silo": agricultural/industrial silo hosting antennas
-- "flagpole": flagpole-style slim mast
+- "flagpole": slim mast with a flag or ball finial and no foliage disguise \
+and no RF canister/shroud. A cylindrical telecom shroud is stealth; faux \
+fronds/needles are stealth.
 - "smokestack": industrial stack
 - "other_tower": tower present but subtype unclear
 - "unclear": tower confirmed but subtype not discernible
 When site_type is not "tower", set tower_subtype to null.
 Never set cell_equipment=true on a stealth call from "likely conceals" or \
-"typical for stealth" alone — you must see antenna panels, dishes, RRUs, or \
-clear shroud/bay hardware.
+"typical for stealth" alone. For monopalm/monopine, true when you see \
+equipment cabinets or a fenced pad at the base, a cylindrical antenna bay \
+or panel bulge in the crown, or panels/dishes through the fronds — do not \
+require exposed sector racks like a bare monopole. Real trees with no \
+cabinets or bulge stay cell_equipment=false.
 Set site_confidence to at most 0.6 unless two or more independent cues or \
 views corroborate the call.
 
@@ -347,6 +365,8 @@ on the roof, parapet, or building facade / wall (side-mounted)
 - Short masts or poles on the parapet carrying antennas
 - Rooftop or wall-mounted radio panels / sector frames (not HVAC condensers)
 - Telecom equipment cabinets clearly paired with antenna mounts (not alone)
+- Monopalm/monopine/canister mast with cabinets or a fenced pad at the base, \
+or an antenna cylinder/panel bulge in the faux crown
 Default when unsure: cell_equipment=null (not true). Do not mark cell_equipment \
 true from Nearmap Vert / top-down alone unless sector panels or dishes are \
 unmistakable; prefer an oblique confirmation. Never set cell_equipment=true \
@@ -371,7 +391,8 @@ Use none when cell_equipment is false; unclear only when you cannot tell.
 
 Field meanings: site_evidence and cell_equipment_evidence are one short \
 sentence each, citing the specific views and cues used. For cell_equipment true, \
-evidence must name the antenna/dish/mount cue — not "equipment on roof". \
+evidence must name the antenna/dish/mount cue, or for stealth the cabinets/\
+shroud/crown bulge — not "equipment on roof". \
 site_evidence describes the host structure only; it must NOT claim cellular \
 gear unless cell_equipment is also true. If cell_equipment is false/null, \
 site_evidence must not say "cellular site" / "sector panels" / "antenna mounts".
@@ -386,10 +407,11 @@ ANYWHERE in the chip, not just at the center.
 
 Definitions:
 - TOWER: a ground-based, purpose-built vertical structure carrying antennas - \
-monopole, lattice/self-support tower, guyed mast, stealth steeple/clock tower, \
-water tower on legs, silo, flagpole, or smokestack with telecom gear. Top-down \
-cues: tiny footprint, long thin shadow, lattice cross-pattern, guy wires, small \
-fenced compound with equipment cabinets.
+monopole, lattice/self-support tower, guyed mast, stealth monopalm/monopine/\
+canister, stealth steeple/clock tower, water tower on legs, silo, flagpole, \
+or smokestack with telecom gear. Top-down cues: tiny footprint, long thin \
+shadow, lattice cross-pattern, guy wires, small fenced compound with \
+equipment cabinets, or a palm/pine far taller and straighter than neighbors.
 - NOT A TOWER: rooftop cellular hosts, bare fields, unrelated buildings, parking \
 lots, or structures with no vertical tower mast. Classify those as "other".
 
@@ -450,11 +472,14 @@ Set site_confidence to at most 0.7 unless zoom crops show an unambiguous tower.
 
 INPUT_CONFIDENCE_PROMPTS = {
     "high": (
-        "\n\nSOURCE TRUST: HIGH. The coordinate comes from a trusted source that "
-        "expects an active cellular asset at this location. Prioritize finding "
-        "the host structure and any cellular equipment. Inspect roof edges, "
-        "parapets, and shaded areas on oblique views. Prefer null over false "
-        "when imagery is ambiguous — but never mark HVAC or ordinary roof "
+        "\n\nSOURCE TRUST: HIGH. This is an outreach-verified / carrier-claimed "
+        "site — an active cellular asset is likely present somewhere in the "
+        "chip, often tens of meters off the pin and sometimes in a corner or "
+        "lot edge. Search EVERY view including edges. Expect rooftop gear, a "
+        "ground mast, or stealth (monopalm / monopine / canister) mixed with "
+        "real trees. Do not call other just because the pin is pavement or "
+        "the center building looks empty. Prefer null over false when "
+        "imagery is ambiguous — but never mark HVAC or ordinary roof "
         "mechanicals as cell_equipment true."
     ),
     "medium": (
@@ -470,20 +495,24 @@ INPUT_CONFIDENCE_PROMPTS = {
 }
 
 EQUIPMENT_RECHECK_PROMPT = """\
-You are re-checking ONLY for visible cellular equipment at a trusted site. \
-The first pass called cell_equipment false, but the data source expects gear \
-here.
+You are re-checking ONLY for visible cellular equipment at a trusted \
+outreach-verified site. The first pass called cell_equipment false, but an \
+asset is expected here.
 
-Re-examine every view - especially Nearmap obliques and shaded roof/facade areas:
+Re-examine every view — especially Nearmap obliques, chip edges/corners, \
+vacant-lot margins, and tree clusters:
 - Thin rectangular panel antennas on parapets, short masts, or building walls
 - Sector frames at roof corners (often three sectors) or facade mounts
 - Microwave dishes, RRUs, cable trays, telecom cabinets paired with mounts
+- A monopalm/monopine (too-tall straight palm/pine with a regular crown, \
+cabinets or antenna bulge) or a canister/flagpole shroud — not a natural tree
 
-Do NOT flip to true for HVAC condensers, vents, pipes, skylights, drains, or \
-rows of identical mechanical units. Prefer null over true when ambiguous.
+Do NOT flip to true for HVAC condensers, vents, pipes, skylights, drains, \
+rows of identical mechanical units, or ordinary street palms. Prefer null \
+over true when ambiguous.
 
-Return the same JSON schema. If any clear cellular equipment is visible, \
-set cell_equipment true and explain which view shows the antenna/dish/mount.
+Return the same JSON schema. If any clear cellular equipment or disguised \
+mast is visible, set cell_equipment true and explain which view shows it.
 """
 
 EQUIPMENT_FALSE_POSITIVE_RECHECK_PROMPT = """\
@@ -578,34 +607,54 @@ hosts WITH antennas are towers — never treat those as HVAC.
 
 If the crop is foliage, a tank rim, the mast base, or otherwise inconclusive \
 but the source view shows the tower and its antenna array, vote true from the \
-source view. Satellite-only earth-station dishes without cellular arrays → false. \
+source view. A monopalm/monopine crop that shows the faux crown, cabinets, or \
+antenna bulge is still a tower — do not vote false as "just a tree". \
+Satellite-only earth-station dishes without cellular arrays → false. \
 Leave asset_box_2d null — the prior box is fixed.
 Return the same JSON schema.
 """
 
 TOWER_CELL_LOCALIZE_CONFIRM_PROMPT = """\
 Independent confirmation of a candidate GROUND-BASED telecom tower (not a \
-rooftop HVAC check). Search EVERY view, including edges and corners.
+rooftop HVAC check). Search EVERY view, including edges and corners — \
+monopalm/monopine masts are often at a lot edge or in a corner cluster of \
+real trees.
 
 A tower may be a monopole, lattice/self-support, guyed mast, stealth \
 monopine/palm/canister, water tower, silo, flagpole, or smokestack with \
 telecom gear.
 
 1. site_type: "tower" if a purpose-built tower/mast is visible; "rooftop" only \
-if there is no tower and a building hosts gear; "other" if neither.
+if there is no tower and a building hosts gear; "other" if neither. A \
+too-tall straight palm/pine with a regular synthetic crown is a stealth \
+tower, not a natural tree.
 2. cell_equipment: true when cellular or microwave gear is visible on that \
-tower (sector panels, RRUs, dishes, antenna platforms/arrays, or side-arm \
-mounts consistent with cellular). Satellite-only earth-station dishes without \
-cellular arrays → false. HVAC, trees, bare tanks, and vehicles are not cell gear.
+tower (sector panels, RRUs, dishes, antenna platforms/arrays, side-arm \
+mounts, a canister/antenna bulge in faux fronds, or equipment cabinets / \
+fenced pad at a disguised mast). Satellite-only earth-station dishes without \
+cellular arrays → false. HVAC, natural trees, bare tanks, and vehicles are \
+not cell gear — but do not dismiss a monopalm/monopine as a tree.
 3. If cell_equipment=true, draw a tight asset_box_2d on the clearest view \
 (prefer the antenna array; the full mast is OK) and set asset_view to that \
 view's exact label.
 
-Do NOT classify a visible lattice/monopole/guyed/water tower as rooftop or \
-other. Do NOT vote false merely because individual panels are small or the \
-top is slightly soft — platforms, arrays, and mounts count. Prefer false only \
-when no tower is present, or the structure has no telecom gear.
+Do NOT classify a visible lattice/monopole/guyed/water/stealth tower as \
+rooftop or other. Do NOT vote false merely because individual panels are \
+small, hidden in fronds, or the top is slightly soft — platforms, arrays, \
+shrouds, and cabinets count. Prefer false only when no tower is present, or \
+the structure has no telecom gear.
 Return the same JSON schema.
+"""
+
+
+CLAIMED_SITE_TOWER_CONFIRM_NOTE = """
+
+CLAIMED SITE: an outreach-verified record expects an asset here. Search \
+edges and corners for a monopalm/monopine/canister mixed with real trees. \
+Do not vote cell_equipment false with "no tower exists" unless you have \
+checked lot edges and tree clusters. Prefer null over false when a tall \
+straight palm/pine or canister mast is visible but panels are hidden in \
+the crown.
 """
 
 
@@ -769,15 +818,17 @@ SCAN_PROMPT = """\
 You are reviewing a single top-down aerial image where a cellular tower or \
 rooftop site is expected, but a first-pass classifier could not identify it. \
 The asset may be anywhere in the frame and is often subtle: a small lattice \
-mast, monopole shadow, fenced compound, rooftop antenna cluster, or a stealth \
+mast, monopole shadow, fenced compound, rooftop antenna cluster, a stealth \
 tower disguised as a building with a tall tower section (steeple, clock tower, \
-faux-building cell site). Check the area just below image center especially \
-when coordinates are approximate.
+faux-building cell site), or a monopalm/monopine (too-tall straight palm/pine \
+in a lot corner or tree cluster). Check the area just below image center \
+especially when coordinates are approximate.
 
 Search the ENTIRE image - especially edges and corners - and return up to four \
 candidate regions that could plausibly be a tower site or rooftop cellular host. \
 Prioritize: tiny footprints with long shadows, lattice cross-patterns, fenced \
-pads with equipment cabinets, or building roofs with sector-frame mounts.
+pads with equipment cabinets, a palm/pine that is taller and straighter than \
+its neighbors, or building roofs with sector-frame mounts.
 
 Return ONLY JSON with a "candidates" array. Each entry needs:
 - box_2d: [ymin, xmin, ymax, xmax] in 0-1000 normalized coordinates
@@ -838,10 +889,11 @@ top-down image. Also included may be the original wide "NAIP top-down" or \
 "Nearmap top-down" view for context.
 
 Use the zoom crops as primary evidence. A tower site often appears as a \
-lattice mast, monopole, guyed structure, or small fenced compound with \
-equipment. A stealth site may be a building with a tall tower block or steeple \
-on one corner and a long shadow from that tower section. A rooftop site shows \
-panel antennas, sector frames, or dishes on a building roof.
+lattice mast, monopole, guyed structure, small fenced compound with \
+equipment, or a monopalm/monopine (straight trunk, regular crown, cabinets \
+at the base). A stealth site may also be a building with a tall tower block \
+or steeple on one corner and a long shadow from that tower section. A \
+rooftop site shows panel antennas, sector frames, or dishes on a building roof.
 
 Perform the same three tasks as the primary classifier:
 1. site_type: tower | rooftop | other | unclear
@@ -860,6 +912,14 @@ def _active_scan_prompt() -> str:
 
 def _active_zoom_prompt() -> str:
     return TOWER_ONLY_ZOOM_CLASSIFICATION_PROMPT if TOWER_ONLY else ZOOM_CLASSIFICATION_PROMPT
+
+
+def source_expects_asset(res: dict | None = None, *, input_confidence: str | None = None) -> bool:
+    """True when outreach-verified / high source trust says an asset is likely."""
+    conf = input_confidence
+    if conf is None and res is not None:
+        conf = res.get("input_confidence")
+    return normalize_input_confidence(conf) == "high"
 
 
 def normalize_input_confidence(value) -> str:
@@ -927,11 +987,12 @@ def build_classification_prompt(row) -> str:
     label_hint = str(row.get("label", "")).strip().lower()
     if label_hint == "stealth":
         prompt += (
-            "\n\nNOTE: This site is tagged STEALTH. Expect a tower "
-            "disguised as or integrated into a building - steeple, "
-            "clock tower, faux facade, or tower segment on a corner. "
-            "Do not dismiss a tall narrow shadow or tower block as "
-            "merely architectural unless clearly non-telecom."
+            "\n\nNOTE: This site is tagged STEALTH. Expect a disguised mast "
+            "(monopalm, monopine, canister shroud) or a tower integrated into "
+            "a building (steeple, clock tower, faux facade, corner tower "
+            "block). Do not dismiss a too-tall palm/pine, a tall narrow "
+            "shadow, or a tower block as merely a tree or architecture "
+            "unless clearly non-telecom."
         )
     prompt += INPUT_CONFIDENCE_PROMPTS[normalize_input_confidence(
         row.get("input_confidence"))]
@@ -941,9 +1002,13 @@ def build_classification_prompt(row) -> str:
 def maybe_recheck_equipment(provider: str, clients: dict, res: dict, views: list,
                             input_confidence: str) -> dict:
     """Second pass when a trusted source expects gear but the model said false."""
-    if input_confidence != "high":
+    if not source_expects_asset(res, input_confidence=input_confidence):
         return res
-    if res.get("cell_equipment") is not False:
+    if res.get("cell_equipment") is True:
+        return res
+    site = str(res.get("site_type") or "").strip().lower()
+    # Claimed-site empties and false cell calls get a second look.
+    if res.get("cell_equipment") is not False and site not in {"other", "unclear"}:
         return res
     if len(views) < 2:
         return res
@@ -968,6 +1033,50 @@ def maybe_recheck_equipment(provider: str, clients: dict, res: dict, views: list
     return res
 
 
+_STEALTH_FORM_CUES = (
+    "monopalm",
+    "mono-palm",
+    "monopine",
+    "mono-pine",
+    "faux palm",
+    "faux-pine",
+    "faux pine",
+    "palm frond",
+    "pine frond",
+    "canister",
+    "antenna bay",
+    "antenna bays",
+    "stealth canister",
+    "pine-needle",
+    "pine needle",
+    "faux frond",
+    "synthetic frond",
+    "artificial palm",
+    "artificial pine",
+    "disguised as a palm",
+    "disguised as a pine",
+    "palm-style",
+    "pine-style",
+    "palm tower",
+    "pine tower",
+    "fake palm",
+    "fake pine",
+)
+
+_STEALTH_HARDWARE_CUES = (
+    "cabinet",
+    "cabinets",
+    "compound",
+    "fenced pad",
+    "equipment pad",
+    "shroud",
+    "canister",
+    "antenna bulge",
+    "antenna bay",
+    "antenna bays",
+)
+
+
 def _text_has_telecom_cue(text: str) -> bool:
     lowered = (text or "").lower()
     cues = (
@@ -982,6 +1091,22 @@ def _text_has_telecom_cue(text: str) -> bool:
         "telecom",
     )
     return any(cue in lowered for cue in cues)
+
+
+def _text_has_stealth_form(text: str) -> bool:
+    lowered = (text or "").lower()
+    if any(cue in lowered for cue in _STEALTH_FORM_CUES):
+        return True
+    # Pairing "palm"/"pine" with stealth is specific; "palm"+"tower" is not
+    # (street palms next to a real monopole).
+    if "stealth" in lowered and ("palm" in lowered or "pine" in lowered):
+        return True
+    return False
+
+
+def _text_has_stealth_hardware(text: str) -> bool:
+    lowered = (text or "").lower()
+    return any(cue in lowered for cue in _STEALTH_HARDWARE_CUES)
 
 
 def _text_denies_telecom(text: str) -> bool:
@@ -1112,42 +1237,39 @@ def maybe_recheck_rooftop_cell_false_positive(
     return res
 
 
+_PROMOTE_TO_STEALTH_SUBTYPES = frozenset(
+    {"flagpole", "other_tower", "monopole", "unclear"}
+)
+
+
 def gate_weak_stealth_tower_claim(res: dict) -> dict:
     """Demote speculative stealth tower calls (common Gemini false positive).
 
-    Stealth requires a purpose-built disguise (monopalm/monopine/canister) plus
-    real telecom cues — not "likely conceals" on ordinary architecture.
+    Stealth requires a purpose-built disguise (monopalm/monopine/canister).
+    Architecture "likely conceals" guesses are demoted. A flagpole/monopole
+    described as a palm/pine/canister mast is promoted to stealth so it is
+    not uploaded as Flagpole.
     """
     if str(res.get("site_type") or "").strip().lower() != "tower":
-        return res
-    subtype = str(res.get("tower_subtype") or "").strip().lower()
-    if subtype != "stealth":
         return res
 
     evidence = " ".join(
         str(res.get(key) or "")
         for key in ("cell_equipment_evidence", "site_evidence")
     ).lower()
-    strong_form = any(
-        cue in evidence
-        for cue in (
-            "monopalm",
-            "mono-palm",
-            "monopine",
-            "mono-pine",
-            "faux palm",
-            "faux-pine",
-            "faux pine",
-            "palm frond",
-            "pine frond",
-            "canister",
-            "antenna bay",
-            "antenna bays",
-            "stealth canister",
-            "pine-needle",
-            "pine needle",
-        )
-    )
+    strong_form = _text_has_stealth_form(evidence)
+    subtype = str(res.get("tower_subtype") or "").strip().lower()
+    if subtype in _PROMOTE_TO_STEALTH_SUBTYPES and strong_form:
+        res["tower_subtype"] = "stealth"
+        subtype = "stealth"
+        prior = str(res.get("site_evidence") or "").strip()
+        note = "stealth gate: disguised mast (palm/pine/canister)"
+        res["site_evidence"] = f"{prior} | {note}".strip(" |")
+        _step_done("stealth gate", note)
+
+    if subtype != "stealth":
+        return res
+
     speculative = any(
         phrase in evidence
         for phrase in (
@@ -1161,9 +1283,15 @@ def gate_weak_stealth_tower_claim(res: dict) -> dict:
             "could conceal",
         )
     )
-    has_cues = _text_has_telecom_cue(evidence)
+    has_cues = _text_has_telecom_cue(evidence) or _text_has_stealth_hardware(
+        evidence
+    )
 
-    if strong_form and has_cues and not speculative:
+    # Keep a described monopalm/monopine/canister. Speculative architecture
+    # without those forms still gets demoted.
+    if strong_form and not speculative:
+        return res
+    if strong_form and has_cues:
         return res
 
     prior = str(res.get("site_evidence") or "").strip()
@@ -1521,6 +1649,36 @@ def confirm_rooftop_cell_with_claude(
 
     def _apply_claude_veto(claude_res: dict, *, reason: str) -> tuple[dict, str | None, bool]:
         # Crop veto: never soft-keep the same boxed region Claude rejected.
+        can_claimed = (
+            not used_crop
+            and should_keep_claimed_gemini_tower(
+                res, from_wide_rescue=from_wide_rescue
+            )
+        )
+        if can_claimed:
+            if gemini_evidence or claude_res.get("cell_equipment_evidence"):
+                res["cell_equipment_evidence"] = (
+                    f"{gemini_evidence or ''} | claimed-site keep Gemini "
+                    f"(Claude missed disguised mast); Claude: "
+                    f"{claude_res.get('cell_equipment_evidence') or 'cell=false'}"
+                ).strip(" |")
+            res["cell_equipment"] = True
+            pre_conf = res.get("gemini_pre_escalation_cell_conf")
+            pre_gear = res.get("gemini_pre_escalation_gear")
+            if pre_conf is not None:
+                res["cell_equipment_confidence"] = pre_conf
+            if pre_gear:
+                res["cell_gear_kind"] = pre_gear
+            res["gemini_cell_equipment"] = True
+            res["claude_cell_equipment"] = claude_res.get("cell_equipment")
+            res["cell_models_agree"] = False
+            res["dual_model_resolution"] = "claimed_site_keep_gemini"
+            normalize_model_result(res)
+            _step_done(
+                "dual-model cell",
+                "claimed-site keep Gemini (stealth/canister mast)",
+            )
+            return res, "claude", False
         can_soft = (
             allow_soft_keep
             and not used_crop
@@ -1653,6 +1811,8 @@ def confirm_rooftop_cell_with_claude(
     else:
         prompt = cell_confirm_prompt(site, used_crop=False)
         mode = "localize_iou"
+    if site == "tower" and source_expects_asset(res):
+        prompt += CLAIMED_SITE_TOWER_CONFIRM_NOTE
 
     claude_res = classify_site(
         "claude",
@@ -2122,11 +2282,22 @@ def needs_naip_rescue(res: dict) -> bool:
 
 
 def confident_no_asset(res: dict) -> bool:
-    """True when Gemini already locked a high-confidence empty/other chip."""
+    """True when Gemini already locked a high-confidence empty/other chip.
+
+    Outreach-verified (high source trust) only locks empty at the Gemini
+    solo bar (0.90). Weaker other calls still get zoom/Claude.
+    """
     if str(res.get("site_type") or "").strip().lower() != "other":
         return False
     conf = normalize_confidence(res.get("site_confidence"))
-    return conf is not None and conf >= TIER_CONF_HIGH
+    if conf is None:
+        return False
+    lock = (
+        GEMINI_SOLO_CELL_CONF
+        if source_expects_asset(res)
+        else TIER_CONF_HIGH
+    )
+    return conf >= lock
 
 
 def stamp_naip_screen(res: dict) -> dict:
@@ -2163,6 +2334,34 @@ def asset_view_is_nearmap_oblique(asset_view: str | None) -> bool:
     if "oblique" in view:
         return True
     return any(d in view for d in ("north", "east", "south", "west"))
+
+
+def should_keep_claimed_gemini_tower(res: dict, *, from_wide_rescue: bool = False) -> bool:
+    """True when outreach-verified Gemini found a disguised mast Claude missed.
+
+    Rooftop HVAC vetoes still stand. Only keep a ground tower whose evidence
+    already names a monopalm/monopine/canister (or equivalent stealth form).
+    """
+    if from_wide_rescue:
+        return False
+    if not source_expects_asset(res):
+        return False
+    if str(res.get("site_type") or "").strip().lower() != "tower":
+        return False
+    if (
+        res.get("cell_equipment") is not True
+        and res.get("gemini_pre_escalation_cell") is not True
+    ):
+        return False
+    evidence = " ".join(
+        str(res.get(key) or "")
+        for key in (
+            "gemini_pre_escalation_evidence",
+            "cell_equipment_evidence",
+            "site_evidence",
+        )
+    )
+    return _text_has_stealth_form(evidence) or _text_has_stealth_hardware(evidence)
 
 
 def should_soft_keep_gemini_cell(res: dict, *, from_wide_rescue: bool) -> bool:
@@ -2859,11 +3058,94 @@ def tier_confident_stop(res: dict) -> bool:
     return True
 
 
-def rooftop_requires_nearmap_tiers(res: dict) -> bool:
-    """Rooftops always take Vert + obliques when Nearmap is available.
+def db_backed_naip_tower_skip_nearmap_reason(
+    res: dict, *, db_backed: bool = False
+) -> str | None:
+    """Skip Nearmap when FCC/TowerSource plus NAIP already decided a tower.
 
-    Even a strong NAIP/Vert cell=true call still pulls obliques so facade
-    mounts can raise (or challenge) cell confidence before SF write.
+    Medium+ site confidence and cell_equipment true/false is enough — the
+    database anchors the pin. Imagery-only towers still buy obliques.
+    """
+    if not db_backed:
+        return None
+    if str(res.get("site_type") or "").strip().lower() != "tower":
+        return None
+    if not tier_confident_stop(res):
+        return None
+    return "DB-hit NAIP tower medium+ cell decided"
+
+
+def rooftop_naip_cell_skip_nearmap_reason(
+    res: dict, naip_age_years: float | None = None
+) -> str | None:
+    """Skip Nearmap when NAIP already locked rooftop cell at the Gemini solo bar."""
+    if not _is_rooftop(res):
+        return None
+    if res.get("cell_equipment") is not True:
+        return None
+    cell_conf = normalize_confidence(res.get("cell_equipment_confidence"))
+    if cell_conf is None or cell_conf < GEMINI_SOLO_CELL_CONF:
+        return None
+    if site_confidence_band(res) == "low":
+        return None
+    if naip_age_blocks_early_stop(res, naip_age_years):
+        return None
+    return f"NAIP rooftop cell conf>={GEMINI_SOLO_CELL_CONF:g}"
+
+
+def naip_empty_osm_skip_nearmap_reason(
+    res: dict, *, db_backed: bool = False, osm_info: dict | None = None
+) -> str | None:
+    """Skip Nearmap when NAIP is empty and OSM shows no building or tower.
+
+    Fail-open: missing/failed OSM does not skip. DB-backed claimed towers
+    still buy Nearmap if NAIP saw nothing.
+    """
+    if db_backed:
+        return None
+    site = str(res.get("site_type") or "").strip().lower()
+    if site not in {"other", "unclear"}:
+        return None
+    try:
+        from enrichment.osm_prefilter import osm_suggests_empty_chip
+    except Exception:
+        return None
+    if not osm_suggests_empty_chip(osm_info):
+        return None
+    return "NAIP empty + OSM no building/tower"
+
+
+def skip_nearmap_after_naip_reason(
+    res: dict,
+    *,
+    db_backed: bool = False,
+    osm_tower: bool = False,
+    osm_info: dict | None = None,
+    naip_age_years: float | None = None,
+) -> str | None:
+    """First skip-Nearmap reason after the NAIP pass, else None."""
+    locked = locked_gemini_tower_skip_nearmap_reason(
+        res, db_backed=db_backed, osm_tower=osm_tower
+    )
+    if locked:
+        return locked
+    medium = db_backed_naip_tower_skip_nearmap_reason(res, db_backed=db_backed)
+    if medium:
+        return medium
+    roof = rooftop_naip_cell_skip_nearmap_reason(res, naip_age_years)
+    if roof:
+        return roof
+    return naip_empty_osm_skip_nearmap_reason(
+        res, db_backed=db_backed, osm_info=osm_info
+    )
+
+
+def rooftop_requires_nearmap_tiers(res: dict) -> bool:
+    """True when the remaining rooftop path should fetch Vert + obliques.
+
+    Locked NAIP rooftop cell (>= GEMINI_SOLO_CELL_CONF) skips earlier via
+    rooftop_naip_cell_skip_nearmap_reason. Callers that reach this point
+    still need paid imagery for facade confirmation.
     """
     return _is_rooftop(res)
 
@@ -2876,16 +3158,17 @@ def tower_cell_requires_nearmap_obliques(
     Imagery-only (no FCC/TowerSource) always continues: pin-centered Vert
     often frames a neighbor rooftop or a different pole than the SF pin.
 
-    DB-hit Gemini towers at >= GEMINI_SOLO_CELL_CONF may stop on NAIP or
-    Vert — the database already anchors the site. Below that bar, still
-    pull obliques so Claude can confirm. Rooftops are handled separately
-    by rooftop_requires_nearmap_tiers.
+    DB-hit Gemini towers that already decided cell at medium+ site conf
+    may stop on NAIP. Rooftops are handled separately by
+    rooftop_requires_nearmap_tiers.
     """
     if str(res.get("site_type") or "").strip().lower() != "tower":
         return False
     if res.get("cell_equipment") is not True:
         return False
-    if db_backed and should_skip_claude_for_gemini_tower(res):
+    if db_backed and db_backed_naip_tower_skip_nearmap_reason(
+        res, db_backed=True
+    ):
         return False
     return True
 
@@ -2903,8 +3186,8 @@ def naip_age_blocks_early_stop(
     NAIP_MAX_AGE_YEARS continue to Nearmap, unless confidence is at/above
     NAIP_AGE_HIGH_CONF_OVERRIDE (definitive asset ID on NAIP alone).
     Early-stop still also requires tier_confident_stop (equipment decided).
-    Note: classify_with_tiers also forces Nearmap for all rooftops via
-    rooftop_requires_nearmap_tiers regardless of age.
+    Note: classify_with_tiers skips Nearmap for rooftops only when NAIP
+    cell is already locked; stale NAIP still continues via this gate.
     """
     if naip_age_years is None:
         return False
@@ -2954,13 +3237,18 @@ def escalation_reason(res: dict) -> str | None:
     """Why a Gemini result should escalate to Claude; None if no escalation."""
     site = str(res.get("site_type") or "").strip().lower()
     conf = normalize_confidence(res.get("site_confidence"))
-    # Carrier-claimed site: Gemini "empty" on Nearmap still needs Claude
-    # unless the full pack already said no cell (False or null). Rooftops
-    # still escalate via rooftop_cell_unconfirmed.
+    # Carrier-claimed / high-trust: Gemini empty on Nearmap still needs Claude
+    # unless the pack locked other at >= 0.90. Medium-trust empties skip.
     if site in {"other", "unclear"} and _has_nearmap_context(res):
         if gemini_confidence_locks_claude(res):
             return None
         if _nearmap_empty_without_cell(res):
+            if (
+                source_expects_asset(res)
+                and conf is not None
+                and conf < GEMINI_SOLO_CELL_CONF
+            ):
+                return "nearmap_claimed_site_empty"
             return None
         if conf is not None and conf >= CLAUDE_ESCALATE_MIN_SITE_CONF:
             return "nearmap_claimed_site_empty"
@@ -3041,32 +3329,28 @@ def _classify_pass(
             provider, clients, views, prompt=prompt, gemini_model=GEMINI_MODEL
         )
         _step_done("Flash confirm", _brief_pass_result(res))
+    res["input_confidence"] = normalize_input_confidence(input_confidence)
     res = maybe_recheck_equipment(provider, clients, res, views, input_confidence)
+    res["input_confidence"] = normalize_input_confidence(input_confidence)
     return res
 
 
-def _maybe_osm_adjust_before_nearmap(
-    lat: float,
-    lon: float,
-    res: dict,
-) -> bool:
-    """OSM lookup only when we are about to buy Nearmap. Fail-open.
-
-    A nearby communication tower is not an FCC/TowerSource hit. Strong Gemini
-    towers can still skip obliques, but the skip is labeled OSM, not DB-hit.
-    """
+def _osm_features(lat: float, lon: float) -> dict:
+    """Nearby OSM building/tower flags. Fail-open to ok=False."""
+    empty = {
+        "ok": False,
+        "has_building": False,
+        "has_tower_or_mast": False,
+        "communication_tower": False,
+    }
     try:
         from enrichment.osm_prefilter import lookup_osm_features
     except Exception:
-        return False
+        return empty
     try:
-        osm = lookup_osm_features(lat, lon)
+        return lookup_osm_features(lat, lon)
     except Exception:
-        return False
-    osm_tower = bool(osm.get("communication_tower"))
-    if osm_tower:
-        _step_done("OSM", "communication tower nearby")
-    return osm_tower
+        return empty
 
 
 def locked_gemini_tower_skip_nearmap_reason(
@@ -3095,14 +3379,13 @@ def classify_with_tiers(lat: float, lon: float, img: Image.Image | None,
                         naip_age_years: float | None = None,
                         db_backed: bool = False,
                         osm_tower: bool = False) -> tuple[dict, dict, str | None, str, list]:
-    """NAIP screen, then Nearmap Vert+obliques.
+    """NAIP screen, then Nearmap Vert+obliques unless a cheaper lock applies.
 
-    FCC/TowerSource is the tower path (unique hit ≤25 m skips this). No DB
-    hit is the rooftop path: always buy obliques on the host building. NAIP
-    ``other``/``unclear`` is not evidence of no site — rooftop gear is usually
-    invisible at NAIP GSD. Skip paid imagery only when a DB-backed Gemini
-    tower is already locked, an OSM communication tower plus Gemini lock,
-    or there is no API key.
+    Skip paid imagery when: a DB-backed NAIP tower already decided cell at
+    medium+ conf; NAIP rooftop cell is locked at the Gemini solo bar; NAIP
+    is empty and OSM has no building/tower; an OSM communication tower plus
+    Gemini lock; or there is no API key. Remaining claimed sites and weaker
+    rooftops still buy Vert+obliques.
     """
     nearmap_views: dict = {}
     nearmap_date = None
@@ -3115,21 +3398,32 @@ def classify_with_tiers(lat: float, lon: float, img: Image.Image | None,
     _step_done("classify (NAIP)", _brief_pass_result(res))
     stamp_naip_screen(res)
 
-    fcc_skip = locked_gemini_tower_skip_nearmap_reason(
-        res, db_backed=db_backed, osm_tower=False
+    skip = skip_nearmap_after_naip_reason(
+        res, db_backed=db_backed, osm_tower=False, naip_age_years=naip_age_years
     )
-    if fcc_skip:
-        _step_done("Nearmap skipped", fcc_skip)
+    if skip:
+        _step_done("Nearmap skipped", skip)
         return res, nearmap_views, nearmap_date, "naip_only", views
 
+    osm_info = None
     if not db_backed:
-        if not osm_tower:
-            osm_tower = _maybe_osm_adjust_before_nearmap(lat, lon, res)
-        osm_skip = locked_gemini_tower_skip_nearmap_reason(
-            res, db_backed=False, osm_tower=osm_tower
+        osm_info = _osm_features(lat, lon)
+        if osm_info.get("communication_tower"):
+            osm_tower = True
+            _step_done("OSM", "communication tower nearby")
+        elif osm_info.get("ok") and not (
+            osm_info.get("has_building") or osm_info.get("has_tower_or_mast")
+        ):
+            _step_done("OSM", "no building/tower")
+        skip = skip_nearmap_after_naip_reason(
+            res,
+            db_backed=False,
+            osm_tower=osm_tower,
+            osm_info=osm_info,
+            naip_age_years=naip_age_years,
         )
-        if osm_skip:
-            _step_done("Nearmap skipped", osm_skip)
+        if skip:
+            _step_done("Nearmap skipped", skip)
             return res, nearmap_views, nearmap_date, "naip_only", views
 
     if rooftop_requires_nearmap_tiers(res):

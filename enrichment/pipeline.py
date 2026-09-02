@@ -89,6 +89,7 @@ def run_enrichment(
     verbose: bool = True,
     apply: bool = True,
     dequeue_holdouts: bool = True,
+    reuse_chips_dirs: list[Path] | None = None,
 ) -> dict[str, Any]:
     """Run proximity + NAIP/Nearmap/Claude enrichment, write CSVs, auto-apply.
 
@@ -106,7 +107,12 @@ def run_enrichment(
             "START",
             f"limit={limit!s} | "
             f"stages={','.join(stages or list(DEFAULT_STAGE_FILTER))} | "
-            f"run_dir={run_dir.name}",
+            f"run_dir={run_dir.name}"
+            + (
+                f" | reuse_chips={len(reuse_chips_dirs)}"
+                if reuse_chips_dirs
+                else ""
+            ),
         )
 
     own_sql = False
@@ -183,6 +189,7 @@ def run_enrichment(
                 chip_dir=chip_dir,
                 verbose=verbose,
                 cluster_cache=cluster_cache,
+                reuse_chips_dirs=reuse_chips_dirs,
             )
             row["outcome_class"] = outcome_class(row)
             site_elapsed = time.monotonic() - site_t0
@@ -322,6 +329,7 @@ def _process_site(
     chip_dir: Path,
     verbose: bool = True,
     cluster_cache: list[dict[str, Any]] | None = None,
+    reuse_chips_dirs: list[Path] | None = None,
 ) -> dict[str, Any]:
     sf_id = str(site.get("Id") or "")
     coords = parse_sf_lat_lng(site)
@@ -591,6 +599,12 @@ def _process_site(
         ),
         "pin_address_mismatch": bool(base["pin_address_mismatch"]),
         "db_backed": hit is not None,
+        "input_confidence": (
+            "high"
+            if str(site.get("Stage__c") or "").strip() in DEFAULT_STAGE_FILTER
+            else "medium"
+        ),
+        "reuse_chips_dirs": reuse_chips_dirs or None,
     }
     try:
         classified = classify_fn(**classify_kwargs)
@@ -657,6 +671,10 @@ def _process_site(
     base["asset_view"] = classified.get("asset_view") or ""
     if classified.get("error"):
         base["error"] = classified.get("error")
+        if classified.get("error") == "no_saved_chips":
+            base["bucket"] = BUCKET_OTHER
+            base["holdout_reason"] = "no_saved_chips"
+            return base
     if hit is None:
         src = classified.get("classify_coord_source")
         if src:

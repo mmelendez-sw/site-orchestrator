@@ -225,12 +225,54 @@ def _view_evidence_consistent(classified: dict[str, Any]) -> bool:
     return True
 
 
+def _stealth_mast_cues(classified: dict[str, Any]) -> bool:
+    """True when evidence names a disguised mast (monopalm/canister/etc.)."""
+    text = " ".join(
+        str(classified.get(key) or "")
+        for key in ("cell_equipment_evidence", "site_evidence")
+    ).lower()
+    cues = (
+        "monopalm",
+        "monopine",
+        "canister",
+        "faux palm",
+        "faux pine",
+        "palm frond",
+        "shroud",
+        "antenna bay",
+    )
+    return any(cue in text for cue in cues)
+
+
+def _tower_claimed_keep_ok(classified: dict[str, Any]) -> bool:
+    """Outreach-verified Gemini stealth mast that Claude false-vetoed.
+
+    Full Nearmap + disguise cues + site conf at the imagery-only bar.
+    Does not unlock rooftops or bare-monopole Claude disagreements.
+    """
+    if str(classified.get("site_type") or "").strip().lower() != "tower":
+        return False
+    resolution = str(classified.get("dual_model_resolution") or "").strip().lower()
+    if resolution != "claimed_site_keep_gemini":
+        return False
+    if not cell_equipment_confirmed(classified.get("cell_equipment")):
+        return False
+    if str(classified.get("nearmap_tier") or "").strip().lower() != "full":
+        return False
+    if not _confidence_ok(
+        classified.get("site_confidence"), MIN_IMAGERY_ONLY_SITE_CONFIDENCE
+    ):
+        return False
+    return _stealth_mast_cues(classified)
+
+
 def _dual_model_cell_ok(classified: dict[str, Any]) -> bool:
     """True when Gemini+Claude agreed cell gear is present (not Gemini-solo)."""
     resolution = str(classified.get("dual_model_resolution") or "").strip().lower()
     if resolution in {
         "gemini_strong_solo",
         "soft_keep_gemini",
+        "claimed_site_keep_gemini",
         "claude_veto",
         "box_required",
         "first_pass_gate",
@@ -499,21 +541,25 @@ def bucket_classification(
     ):
         return _holdout(BUCKET_OTHER, "tower_no_cell_equipment", classified)
 
-    # Auto-apply: Claude hard-agree, or Gemini already locked the tower at >= 0.9.
+    # Auto-apply: Claude hard-agree, Gemini tower lock at >= 0.9, or a
+    # claimed-site stealth mast Gemini found that Claude missed.
     tower_gemini_locked = _tower_gemini_high_conf_ok(classified)
+    tower_claimed_keep = _tower_claimed_keep_ok(classified)
     if (
         site_type_raw == "tower"
         and not tower_gemini_locked
+        and not tower_claimed_keep
         and not _dual_model_hard_agree(classified)
     ):
         return _holdout(BUCKET_OTHER, "tower_needs_dual_model_cell", classified)
 
     # Imagery-only is the exception path: require boxed crop/localize confirm
-    # unless Gemini already locked the tower at >= 0.9.
+    # unless Gemini already locked the tower at >= 0.9 or claimed-site keep.
     if (
         site_type_raw == "tower"
         and imagery_only
         and not tower_gemini_locked
+        and not tower_claimed_keep
         and not _dual_model_localized_agree(classified)
     ):
         return _holdout(

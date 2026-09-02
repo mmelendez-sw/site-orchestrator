@@ -15,13 +15,18 @@ from classifier.asset_classifier import (
     cheap_second_opinion_disagrees,
     CLAUDE_CROP_MODEL,
     CLAUDE_ESCALATION_MODEL,
+    db_backed_naip_tower_skip_nearmap_reason,
     escalation_reason,
+    gate_weak_stealth_tower_claim,
     locked_gemini_tower_skip_nearmap_reason,
     maybe_escalate_to_claude,
+    naip_empty_osm_skip_nearmap_reason,
     needs_flash_confirm,
     needs_naip_rescue,
+    rooftop_naip_cell_skip_nearmap_reason,
     scout_result_wins,
     should_attempt_claude_escalation,
+    skip_nearmap_after_naip_reason,
     nearmap_point_coverage,
     rooftop_requires_nearmap_tiers,
     select_zoom_candidates,
@@ -125,8 +130,8 @@ class TowerObliqueFetchTests(unittest.TestCase):
             tower_cell_requires_nearmap_obliques(self._locked, db_backed=True)
         )
 
-    def test_db_hit_below_lock_still_requires_obliques(self):
-        self.assertTrue(
+    def test_db_hit_medium_tower_skips_obliques(self):
+        self.assertFalse(
             tower_cell_requires_nearmap_obliques(
                 {
                     "site_type": "tower",
@@ -189,6 +194,145 @@ class LockedGeminiTowerSkipLabelTests(unittest.TestCase):
                 osm_tower=True,
             )
         )
+
+
+class SkipNearmapAfterNaipTests(unittest.TestCase):
+    _osm_empty = {
+        "ok": True,
+        "has_building": False,
+        "has_tower_or_mast": False,
+        "communication_tower": False,
+    }
+    _osm_building = {
+        "ok": True,
+        "has_building": True,
+        "has_tower_or_mast": False,
+        "communication_tower": False,
+    }
+
+    def test_db_backed_medium_tower_skips(self):
+        reason = db_backed_naip_tower_skip_nearmap_reason(
+            {
+                "site_type": "tower",
+                "site_confidence": 0.60,
+                "cell_equipment": True,
+            },
+            db_backed=True,
+        )
+        self.assertEqual(reason, "DB-hit NAIP tower medium+ cell decided")
+
+    def test_db_backed_tower_cell_false_skips(self):
+        self.assertIsNotNone(
+            db_backed_naip_tower_skip_nearmap_reason(
+                {
+                    "site_type": "tower",
+                    "site_confidence": 0.70,
+                    "cell_equipment": False,
+                },
+                db_backed=True,
+            )
+        )
+
+    def test_imagery_only_medium_tower_does_not_skip(self):
+        self.assertIsNone(
+            db_backed_naip_tower_skip_nearmap_reason(
+                {
+                    "site_type": "tower",
+                    "site_confidence": 0.85,
+                    "cell_equipment": True,
+                },
+                db_backed=False,
+            )
+        )
+
+    def test_db_backed_tower_cell_undecided_does_not_skip(self):
+        self.assertIsNone(
+            db_backed_naip_tower_skip_nearmap_reason(
+                {
+                    "site_type": "tower",
+                    "site_confidence": 0.85,
+                    "cell_equipment": None,
+                },
+                db_backed=True,
+            )
+        )
+
+    def test_rooftop_cell_lock_skips(self):
+        reason = rooftop_naip_cell_skip_nearmap_reason(
+            {
+                "site_type": "rooftop",
+                "site_confidence": 0.90,
+                "cell_equipment": True,
+                "cell_equipment_confidence": 0.90,
+            }
+        )
+        self.assertEqual(reason, "NAIP rooftop cell conf>=0.9")
+
+    def test_rooftop_cell_below_lock_still_needs_nearmap(self):
+        self.assertIsNone(
+            rooftop_naip_cell_skip_nearmap_reason(
+                {
+                    "site_type": "rooftop",
+                    "site_confidence": 0.90,
+                    "cell_equipment": True,
+                    "cell_equipment_confidence": 0.75,
+                }
+            )
+        )
+
+    def test_empty_naip_osm_empty_skips(self):
+        reason = naip_empty_osm_skip_nearmap_reason(
+            {"site_type": "other", "site_confidence": 0.50},
+            db_backed=False,
+            osm_info=self._osm_empty,
+        )
+        self.assertEqual(reason, "NAIP empty + OSM no building/tower")
+
+    def test_empty_naip_osm_building_still_buys(self):
+        self.assertIsNone(
+            naip_empty_osm_skip_nearmap_reason(
+                {"site_type": "other", "site_confidence": 0.50},
+                db_backed=False,
+                osm_info=self._osm_building,
+            )
+        )
+
+    def test_empty_naip_osm_failed_does_not_skip(self):
+        self.assertIsNone(
+            naip_empty_osm_skip_nearmap_reason(
+                {"site_type": "other", "site_confidence": 0.50},
+                db_backed=False,
+                osm_info={"ok": False},
+            )
+        )
+
+    def test_db_backed_empty_naip_still_buys(self):
+        self.assertIsNone(
+            naip_empty_osm_skip_nearmap_reason(
+                {"site_type": "other", "site_confidence": 0.50},
+                db_backed=True,
+                osm_info=self._osm_empty,
+            )
+        )
+
+    def test_combined_db_medium_tower(self):
+        reason = skip_nearmap_after_naip_reason(
+            {
+                "site_type": "tower",
+                "site_confidence": 0.60,
+                "cell_equipment": True,
+            },
+            db_backed=True,
+        )
+        self.assertEqual(reason, "DB-hit NAIP tower medium+ cell decided")
+
+    def test_combined_empty_osm(self):
+        reason = skip_nearmap_after_naip_reason(
+            {"site_type": "unclear", "site_confidence": 0.40},
+            db_backed=False,
+            osm_info=self._osm_empty,
+        )
+        self.assertEqual(reason, "NAIP empty + OSM no building/tower")
 
 
 class EscalationReasonTests(unittest.TestCase):
@@ -359,6 +503,28 @@ class EscalationReasonTests(unittest.TestCase):
         self.assertEqual(escalation_reason(res), "nearmap_claimed_site_empty")
         self.assertTrue(should_attempt_claude_escalation(res))
 
+    def test_high_trust_empty_nearmap_still_escalates_below_0_9(self):
+        res = {
+            "site_type": "other",
+            "site_confidence": 0.8,
+            "cell_equipment": False,
+            "nearmap_tier": "full",
+            "input_confidence": "high",
+        }
+        self.assertEqual(escalation_reason(res), "nearmap_claimed_site_empty")
+        self.assertTrue(should_attempt_claude_escalation(res))
+
+    def test_high_trust_empty_locks_at_0_9(self):
+        res = {
+            "site_type": "other",
+            "site_confidence": 0.9,
+            "cell_equipment": False,
+            "nearmap_tier": "full",
+            "input_confidence": "high",
+        }
+        self.assertIsNone(escalation_reason(res))
+        self.assertFalse(should_attempt_claude_escalation(res))
+
     def test_nearmap_other_at_0_9_skips_claude(self):
         self.assertIsNone(
             escalation_reason(
@@ -433,6 +599,26 @@ class GeminiTowerSkipClaudeTests(unittest.TestCase):
             )
         )
 
+    def test_confident_no_asset_high_trust_needs_0_9(self):
+        weak = {
+            "site_type": "other",
+            "site_confidence": 0.8,
+            "input_confidence": "high",
+        }
+        locked = {
+            "site_type": "other",
+            "site_confidence": 0.9,
+            "input_confidence": "high",
+        }
+        medium = {
+            "site_type": "other",
+            "site_confidence": 0.8,
+            "input_confidence": "medium",
+        }
+        self.assertFalse(confident_no_asset(weak))
+        self.assertTrue(confident_no_asset(locked))
+        self.assertTrue(confident_no_asset(medium))
+
     def test_do_not_skip_rooftop(self):
         self.assertFalse(
             should_skip_claude_for_gemini_tower(
@@ -483,6 +669,82 @@ class GeminiTowerSkipClaudeTests(unittest.TestCase):
         self.assertTrue(agree)
         self.assertEqual(model, "gemini_strong_solo")
         self.assertEqual(out["dual_model_resolution"], "gemini_strong_solo")
+
+    def test_claimed_site_keeps_gemini_stealth_on_localize_veto(self):
+        res = {
+            "site_type": "tower",
+            "tower_subtype": "flagpole",
+            "site_confidence": 0.8,
+            "cell_equipment": True,
+            "cell_equipment_confidence": 0.85,
+            "cell_equipment_evidence": "Canister shroud at the mast top.",
+            "site_evidence": (
+                "A slim flagpole-style tower with a canister shroud at "
+                "the top is visible in the vacant lot east of a billboard."
+            ),
+            "cell_gear_kind": "unclear",
+            "nearmap_tier": "full",
+            "nearmap_views": "Vert,North,East",
+            "input_confidence": "high",
+        }
+        with patch(
+            "classifier.asset_classifier.classify_site",
+            return_value={
+                "site_type": "other",
+                "cell_equipment": False,
+                "cell_equipment_evidence": "No tower structure exists",
+                "cell_gear_kind": "none",
+            },
+        ):
+            out, model, agree = confirm_rooftop_cell_with_claude(
+                res,
+                {"claude": object()},
+                [],
+                already_escalated=False,
+                allow_soft_keep=False,
+                allow_gemini_solo=False,
+                used_crop=False,
+            )
+        self.assertFalse(agree)
+        self.assertEqual(model, "claude")
+        self.assertTrue(out["cell_equipment"])
+        self.assertEqual(out["dual_model_resolution"], "claimed_site_keep_gemini")
+
+    def test_claimed_site_does_not_keep_bare_monopole_veto(self):
+        res = {
+            "site_type": "tower",
+            "tower_subtype": "monopole",
+            "site_confidence": 0.8,
+            "cell_equipment": True,
+            "cell_equipment_confidence": 0.85,
+            "cell_equipment_evidence": "North oblique shows sector panels on monopole",
+            "site_evidence": "A monopole in a compound.",
+            "cell_gear_kind": "sector_panel",
+            "nearmap_tier": "full",
+            "nearmap_views": "Vert,North,East",
+            "input_confidence": "high",
+        }
+        with patch(
+            "classifier.asset_classifier.classify_site",
+            return_value={
+                "site_type": "tower",
+                "cell_equipment": False,
+                "cell_equipment_evidence": "No sector panels visible",
+                "cell_gear_kind": "none",
+            },
+        ):
+            out, model, agree = confirm_rooftop_cell_with_claude(
+                res,
+                {"claude": object()},
+                [],
+                already_escalated=False,
+                allow_soft_keep=False,
+                allow_gemini_solo=False,
+                used_crop=False,
+            )
+        self.assertFalse(agree)
+        self.assertEqual(out["dual_model_resolution"], "claude_veto")
+        self.assertFalse(out["cell_equipment"])
 
     def test_rooftop_crop_no_falls_back_to_localize(self):
         from PIL import Image
@@ -818,6 +1080,71 @@ class CostGateTests(unittest.TestCase):
             has, date = nearmap_point_coverage(43.0, -89.0)
         self.assertFalse(has)
         self.assertIsNone(date)
+
+
+class StealthGateTests(unittest.TestCase):
+    def test_flagpole_canister_promotes_to_stealth(self):
+        out = gate_weak_stealth_tower_claim(
+            {
+                "site_type": "tower",
+                "tower_subtype": "flagpole",
+                "site_confidence": 0.8,
+                "cell_equipment": True,
+                "site_evidence": (
+                    "A slim flagpole-style tower with a canister shroud at "
+                    "the top is visible in the vacant lot east of a billboard."
+                ),
+                "cell_equipment_evidence": "Canister shroud at the mast top.",
+            }
+        )
+        self.assertEqual(out["tower_subtype"], "stealth")
+        self.assertTrue(out["cell_equipment"])
+
+    def test_speculative_steeple_still_demoted(self):
+        out = gate_weak_stealth_tower_claim(
+            {
+                "site_type": "tower",
+                "tower_subtype": "stealth",
+                "site_confidence": 0.7,
+                "cell_equipment": True,
+                "site_evidence": "Church steeple on the corner.",
+                "cell_equipment_evidence": "Likely conceals antennas in steeple",
+            }
+        )
+        self.assertEqual(out["tower_subtype"], "other_tower")
+        self.assertIsNone(out["cell_equipment"])
+
+    def test_bare_flagpole_not_promoted(self):
+        out = gate_weak_stealth_tower_claim(
+            {
+                "site_type": "tower",
+                "tower_subtype": "flagpole",
+                "site_confidence": 0.8,
+                "cell_equipment": True,
+                "site_evidence": "Slim flagpole in a parking lot.",
+                "cell_equipment_evidence": "No antennas visible on the mast.",
+            }
+        )
+        self.assertEqual(out["tower_subtype"], "flagpole")
+
+    def test_monopalm_kept_without_sector_word(self):
+        out = gate_weak_stealth_tower_claim(
+            {
+                "site_type": "tower",
+                "tower_subtype": "stealth",
+                "site_confidence": 0.8,
+                "cell_equipment": True,
+                "site_evidence": (
+                    "Monopalm at the vacant-lot edge, taller than neighboring palms."
+                ),
+                "cell_equipment_evidence": (
+                    "Equipment cabinets at the base and a cylindrical shroud "
+                    "in the crown."
+                ),
+            }
+        )
+        self.assertEqual(out["tower_subtype"], "stealth")
+        self.assertTrue(out["cell_equipment"])
 
 
 if __name__ == "__main__":
