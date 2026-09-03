@@ -63,10 +63,20 @@ DEFAULT_STAGE_FILTER = (
     "Outreach - Verified",
 )
 
-# Hard exclusion applied independently of the caller-provided stage filter.
+# Hard exclusion unless the caller explicitly lists the stage in STAGES.
 EXCLUDED_STAGE_FILTER = (
     "Working-Connected",
+    "Working - Connected",
     "Qualified (Converted)",
+)
+
+# Classifier source trust: an asset is expected at the pin.
+HIGH_INPUT_CONFIDENCE_STAGES = frozenset(
+    {
+        *DEFAULT_STAGE_FILTER,
+        "Working-Connected",
+        "Working - Connected",
+    }
 )
 
 DEFAULT_OWNER_FILTER = (

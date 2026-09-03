@@ -903,6 +903,30 @@ class SoqlTests(unittest.TestCase):
         )
         self.assertIn("Stage__c IN ('Outreach', 'Outreach - Verified')", soql)
         self.assertNotIn("Enhanced/Unreviewed", soql)
+        self.assertIn("Working-Connected", soql)
+        self.assertIn("Qualified (Converted)", soql)
+
+    def test_blank_site_type_query_excludes_working_connected_by_default(self):
+        soql = build_blank_site_type_query()
+        self.assertIn(
+            "Stage__c NOT IN ('Working-Connected', 'Working - Connected', "
+            "'Qualified (Converted)')",
+            soql,
+        )
+
+    def test_blank_site_type_query_can_opt_into_working_connected(self):
+        soql = build_blank_site_type_query(
+            stages=("Working-Connected", "Working - Connected"),
+            metro_classification=None,
+        )
+        self.assertIn(
+            "Stage__c IN ('Working-Connected', 'Working - Connected')",
+            soql,
+        )
+        self.assertIn("Stage__c NOT IN ('Qualified (Converted)')", soql)
+        self.assertNotIn("Working-Connected'", soql.split("NOT IN", 1)[-1])
+        self.assertNotIn("Metro_Classification__c =", soql)
+        self.assertIn("Owner__c IN ('Site Acquisition Team', 'Marketing Campaign')", soql)
 
     def test_blank_site_type_query_can_select_already_classified(self):
         soql = build_blank_site_type_query(
@@ -1762,10 +1786,18 @@ class HoldoutRerunTests(unittest.TestCase):
             write_csv(
                 newer / DETAIL_CSV,
                 [
-                    {"Id": "a0Znew", "Stage__c": "Outreach - Verified"},
-                    {"Id": "a0Zshared", "Stage__c": "Outreach - Verified"},
+                    {
+                        "Id": "a0Znew",
+                        "Stage__c": "Outreach - Verified",
+                        "sf_update_status": "dequeued",
+                    },
+                    {
+                        "Id": "a0Zshared",
+                        "Stage__c": "Outreach - Verified",
+                        "sf_update_status": "updated",
+                    },
                 ],
-                ("Id", "Stage__c"),
+                ("Id", "Stage__c", "sf_update_status"),
             )
             write_csv(
                 skipped / DETAIL_CSV,
@@ -1773,8 +1805,12 @@ class HoldoutRerunTests(unittest.TestCase):
                 ("Id", "Stage__c"),
             )
             ids = site_ids_from_run_specs(["2026-09-01"], runs_root=root)
+            pending = site_ids_from_run_specs(
+                ["2026-09-01"], runs_root=root, skip_applied=True
+            )
             chips = resolve_reuse_chips_dirs(["2026-09-01"], runs_root=root)
         self.assertEqual(ids, ["a0Znew", "a0Zshared", "a0Zold"])
+        self.assertEqual(pending, ["a0Znew", "a0Zold"])
         self.assertEqual(
             [path.parent.name for path in chips],
             ["2026-09-01_163825_sf_enrichment", "2026-09-01_100000_sf_enrichment"],

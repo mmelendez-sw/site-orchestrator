@@ -27,6 +27,7 @@ from enrichment.constants import (
     MATCH_SOURCE_NONE,
     PROXIMITY_MAX_M,
     DEFAULT_STAGE_FILTER,
+    HIGH_INPUT_CONFIDENCE_STAGES,
 )
 from enrichment.geo import (
     build_site_address,
@@ -601,7 +602,7 @@ def _process_site(
         "db_backed": hit is not None,
         "input_confidence": (
             "high"
-            if str(site.get("Stage__c") or "").strip() in DEFAULT_STAGE_FILTER
+            if str(site.get("Stage__c") or "").strip() in HIGH_INPUT_CONFIDENCE_STAGES
             else "medium"
         ),
         "reuse_chips_dirs": reuse_chips_dirs or None,

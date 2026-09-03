@@ -9,6 +9,7 @@ Set APPLY=0 to classify without Salesforce writes.
 Set DEQUEUE_HOLDOUTS=0 to apply successes only and leave failed holdouts as-is.
 Set RERUN_SITES_FROM to run folder names or YYYY-MM-DD prefixes to re-classify
 those runs' Outreach - Verified Ids (bypasses LLM_Holdout / blank Site_Type).
+RERUN_SKIP_APPLIED=1 (default) drops Ids that already wrote Site_Type.
 Set RERUN_HOLDOUTS_FROM to re-classify holdout Ids only.
 Set REUSE_CHIPS_FROM to classify saved JPEGs (no Nearmap fetch). If unset,
 chips are reused from RERUN_SITES_FROM or RERUN_HOLDOUTS_FROM.
@@ -76,9 +77,20 @@ def main() -> int:
     site_ids = _csv_env("IDS") or []
     rerun_sites_from = _csv_env("RERUN_SITES_FROM")
     if rerun_sites_from:
-        prior_ids = site_ids_from_run_specs(rerun_sites_from, runs_root=runs_dir())
+        skip_applied = _flag("RERUN_SKIP_APPLIED", "1")
+        prior_ids = site_ids_from_run_specs(
+            rerun_sites_from,
+            runs_root=runs_dir(),
+            skip_applied=skip_applied,
+        )
+        skipped = 0
+        if skip_applied:
+            skipped = len(
+                site_ids_from_run_specs(rerun_sites_from, runs_root=runs_dir())
+            ) - len(prior_ids)
         print(
-            f"  rerun sites from {', '.join(rerun_sites_from)}: {len(prior_ids)} id(s)",
+            f"  rerun sites from {', '.join(rerun_sites_from)}: {len(prior_ids)} id(s)"
+            + (f" ({skipped} already applied, skipped)" if skipped else ""),
             flush=True,
         )
         site_ids = list(dict.fromkeys([*site_ids, *prior_ids]))

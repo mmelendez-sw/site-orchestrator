@@ -223,11 +223,14 @@ def site_ids_from_run_specs(
     *,
     runs_root: Path,
     stages: Sequence[str] | None = None,
+    skip_applied: bool = False,
 ) -> list[str]:
     """Load unique Salesforce Ids from enrichment_detail.csv of prior runs.
 
     Defaults to Outreach - Verified. Newest matching run folders are read
     first; a site classified in multiple runs is kept once.
+    ``skip_applied`` drops Ids that already have ``sf_update_status=updated``
+    in any of those runs.
     """
     from enrichment.constants import DEFAULT_STAGE_FILTER, DETAIL_CSV
 
@@ -236,9 +239,24 @@ def site_ids_from_run_specs(
         for stage in (DEFAULT_STAGE_FILTER if stages is None else stages)
         if str(stage).strip()
     }
+    run_dirs = expand_run_specs(specs, runs_root=runs_root)
+    applied: set[str] = set()
+    if skip_applied:
+        for run_dir in run_dirs:
+            path = run_dir / DETAIL_CSV
+            if not path.is_file():
+                continue
+            with path.open(newline="", encoding="utf-8") as handle:
+                for row in csv.DictReader(handle):
+                    status = str(row.get("sf_update_status") or "").strip().lower()
+                    if status != "updated":
+                        continue
+                    sf_id = str(row.get("Id") or row.get("sf_id") or "").strip()
+                    if sf_id:
+                        applied.add(sf_id)
     seen: set[str] = set()
     ordered: list[str] = []
-    for run_dir in expand_run_specs(specs, runs_root=runs_root):
+    for run_dir in run_dirs:
         path = run_dir / DETAIL_CSV
         if not path.is_file():
             continue
@@ -249,7 +267,8 @@ def site_ids_from_run_specs(
                     if stage not in stage_set:
                         continue
                 sf_id = str(row.get("Id") or row.get("sf_id") or "").strip()
-                if sf_id and sf_id not in seen:
-                    seen.add(sf_id)
-                    ordered.append(sf_id)
+                if not sf_id or sf_id in seen or sf_id in applied:
+                    continue
+                seen.add(sf_id)
+                ordered.append(sf_id)
     return ordered

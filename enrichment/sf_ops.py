@@ -95,6 +95,8 @@ def build_blank_site_type_query(
     `states` filters Site_State__c IN (...); pass None/empty for all states.
     `llm_classified` defaults False (sites not yet LLM-classified). True selects
     the already-flagged NFL re-queue.
+    `Working-Connected` / `Qualified (Converted)` stay excluded unless listed
+    in `stages`.
     """
     field_list = ", ".join(fields)
     classified_sql = "true" if llm_classified else "false"
@@ -105,9 +107,14 @@ def build_blank_site_type_query(
         "Site_Latitude__c != null AND Site_Latitude__c != ''",
         "Site_Longitude__c != null AND Site_Longitude__c != ''",
         f"Stage__c IN ({_soql_in(stages)})",
-        f"Stage__c NOT IN ({_soql_in(EXCLUDED_STAGE_FILTER)})",
         f"Owner__c IN ({_soql_in(owners)})",
     ]
+    requested = {str(s).strip() for s in stages if str(s).strip()}
+    excluded = [
+        stage for stage in EXCLUDED_STAGE_FILTER if stage not in requested
+    ]
+    if excluded:
+        clauses.insert(-1, f"Stage__c NOT IN ({_soql_in(excluded)})")
     carrier = (carrier_like or "").strip()
     if carrier:
         escaped = carrier.replace("\\", "\\\\").replace("'", "\\'")
