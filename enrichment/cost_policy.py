@@ -8,13 +8,13 @@ from typing import Any, Sequence
 from enrichment.geo import haversine_meters
 from enrichment.constants import (
     AUTO_SKIP_ON_STRUCTURE_M,
-    GEMINI_TOWER_SKIP_CLAUDE_CONF,
+    NEARMAP_EMPTY_LOCK_CONF,
     PROXIMITY_AMBIGUITY_GAP_M,
     PROXIMITY_CONFIDENT_M,
 )
 from enrichment.mssql import ProximityHit
 
-PIN_CLUSTER_M = float(os.environ.get("PIN_CLUSTER_M", "50"))
+PIN_CLUSTER_M = float(os.environ.get("PIN_CLUSTER_M", "25"))
 
 
 def _env_flag(name: str, default: str = "1") -> bool:
@@ -39,7 +39,7 @@ def auto_skip_classify_reason(
 
     Unique ≤25 m still skips. A pin on the structure (≤5 m) also skips when
     extra FCC/TowerSource rows share the pad — that is collocation, not a
-    wrong-neighbor choice. 10–25 m clusters still need the 75 m gap.
+    wrong-neighbor choice. 10–25 m clusters still need the ambiguity gap.
     """
     if hit is None:
         return None
@@ -112,7 +112,7 @@ def nearmap_empty_is_locked(
     site_confidence: Any,
     nearmap_tier: Any,
     *,
-    lock_conf: float = GEMINI_TOWER_SKIP_CLAUDE_CONF,
+    lock_conf: float = NEARMAP_EMPTY_LOCK_CONF,
 ) -> bool:
     """True when full Nearmap+obliques already locked an empty claimed site."""
     if str(nearmap_tier or "").strip().lower() != "full":
@@ -150,11 +150,14 @@ def should_spend_second_nearmap(
     nearmap_tier: Any,
     rooftop_unlocked: bool,
     cell_equipment: Any = None,
+    pin_address_mismatch: bool = False,
 ) -> bool:
     """One extra Nearmap pack at the unused pin/Census point.
 
     Skip when the first full+oblique pack is already empty with no cell
-    (other/unclear and cell is not True), including the 0.90 lock.
+    (other/unclear and cell is not True), including the 0.90 lock — unless
+    the SF pin and Census disagree, in which case the first pack may be
+    the wrong building.
     Still spend on no-coverage probes, unlocked rooftops, and a first pack
     that still looks like a positive site_type.
     """
@@ -166,6 +169,8 @@ def should_spend_second_nearmap(
     if tier == "no_coverage":
         return True
     if rooftop_unlocked:
+        return True
+    if pin_address_mismatch:
         return True
     if str(site_type or "").strip().lower() not in {"other", "unclear"}:
         return False

@@ -16,9 +16,9 @@ AUTO_SKIP_ON_STRUCTURE_M = float(os.environ.get("AUTO_SKIP_ON_STRUCTURE_M", "5")
 
 # Extended-range (confident..max) hits must beat the runner-up by this gap, or
 # sit within ADDRESS_AFFINITY_M of the geocoded address, to avoid wrong neighbors.
-PROXIMITY_AMBIGUITY_GAP_M = float(os.environ.get("PROXIMITY_AMBIGUITY_GAP_M", "75"))
+PROXIMITY_AMBIGUITY_GAP_M = float(os.environ.get("PROXIMITY_AMBIGUITY_GAP_M", "60"))
 PROXIMITY_ADDRESS_AFFINITY_M = float(
-    os.environ.get("PROXIMITY_ADDRESS_AFFINITY_M", "80")
+    os.environ.get("PROXIMITY_ADDRESS_AFFINITY_M", "100")
 )
 
 # Imagery asset-box snap radius from the SF/classify pin. Effective max is
@@ -26,12 +26,12 @@ PROXIMITY_ADDRESS_AFFINITY_M = float(
 # imagery-only towers hold out (DB hits may still update). Independent of
 # PROXIMITY_MAX_M.
 MAX_ASSET_OFFSET_M = 75.0
-ASSET_OFFSET_LEEWAY_M = 10.0
+ASSET_OFFSET_LEEWAY_M = float(os.environ.get("ASSET_OFFSET_LEEWAY_M", "25"))
 
 # SF pin vs Census. ≥75 m is a far coerce (CSV flag). Rooftop host compare
-# starts earlier: a parking-lot pin 25 m from the building still needs the roof.
+# starts earlier: a parking-lot pin still needs the roof.
 PIN_ADDRESS_MISMATCH_M = float(os.environ.get("PIN_ADDRESS_MISMATCH_M", "75"))
-ROOFTOP_HOST_OFFSET_M = float(os.environ.get("ROOFTOP_HOST_OFFSET_M", "20"))
+ROOFTOP_HOST_OFFSET_M = float(os.environ.get("ROOFTOP_HOST_OFFSET_M", "15"))
 
 # Degrees buffer used for SQL bbox prefilter (~25–30 m at mid-latitudes).
 # Actual fetch buffer scales with PROXIMITY_MAX_M in mssql._buffer_deg_for_radius.
@@ -120,9 +120,13 @@ MIN_UPDATE_CONFIDENCE = 0.6
 MIN_ROOFTOP_CELL_CONFIDENCE = 0.75
 
 # Stricter bars when there is no FCC/TowerSource proximity hit.
-# 0.70: dual-model / Nearmap still required; 0.80 was dropping real towers.
+# 0.70 default; 0.65 when Gemini+Claude already agree on crop/localize.
+# 0.80 cell bar was dropping real towers.
 MIN_IMAGERY_ONLY_SITE_CONFIDENCE = float(
     os.environ.get("MIN_IMAGERY_ONLY_SITE_CONFIDENCE", "0.70")
+)
+MIN_IMAGERY_ONLY_SITE_CONFIDENCE_AGREE = float(
+    os.environ.get("MIN_IMAGERY_ONLY_SITE_CONFIDENCE_AGREE", "0.65")
 )
 MIN_IMAGERY_ONLY_CELL_CONFIDENCE = float(
     os.environ.get("MIN_IMAGERY_ONLY_CELL_CONFIDENCE", "0.80")
@@ -131,8 +135,11 @@ MIN_IMAGERY_ONLY_CELL_CONFIDENCE = float(
 # Skip dual-model for towers when Gemini site_confidence is at/above this.
 # Must match classifier.asset_classifier.GEMINI_SOLO_CELL_CONF default.
 GEMINI_TOWER_SKIP_CLAUDE_CONF = float(
-    os.environ.get("GEMINI_SOLO_CELL_CONF", "0.90")
+    os.environ.get("GEMINI_SOLO_CELL_CONF", "0.85")
 )
+
+# Full Nearmap other/unclear lock (second pack / KPI). Keep above Gemini solo.
+NEARMAP_EMPTY_LOCK_CONF = float(os.environ.get("NEARMAP_EMPTY_LOCK_CONF", "0.90"))
 
 # NAIP rooftop auto-apply: both site and cell confidence must clear this, plus
 # a named telecom gear kind, unhedged evidence, and an asset box.

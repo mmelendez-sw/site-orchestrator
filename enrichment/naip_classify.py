@@ -123,6 +123,18 @@ def _refresh_classifier_flags(ac: Any) -> None:
     )
     ac.NEARMAP_API_KEY = (os.environ.get("NEARMAP_API_KEY") or "").strip()
     try:
+        ac.CHIP_SIZE_M = float(os.environ.get("CHIP_SIZE_M", "300"))
+    except ValueError:
+        ac.CHIP_SIZE_M = 300.0
+    try:
+        ac.GEMINI_SOLO_CELL_CONF = float(os.environ.get("GEMINI_SOLO_CELL_CONF", "0.85"))
+    except ValueError:
+        ac.GEMINI_SOLO_CELL_CONF = 0.85
+    try:
+        ac.EMPTY_CHIP_LOCK_CONF = float(os.environ.get("NEARMAP_EMPTY_LOCK_CONF", "0.90"))
+    except ValueError:
+        ac.EMPTY_CHIP_LOCK_CONF = 0.90
+    try:
         ac.NAIP_MAX_AGE_YEARS = float(os.environ.get("NAIP_MAX_AGE_YEARS", "2"))
     except ValueError:
         ac.NAIP_MAX_AGE_YEARS = 2.0
@@ -188,8 +200,8 @@ def classify_site_imagery(
     OSM with no building/tower skips Nearmap.
 
     One Nearmap pack at the winner. A second pack at the unused pin/Census
-    point only if the first pack is empty or an unlocked rooftop (no cell
-    lock, no compact oblique HVAC box).
+    point if the first pack is empty, an unlocked rooftop, or the pin and
+    Census disagree (first pack may be the wrong building).
     """
     from enrichment import progress
     from classifier import asset_classifier as ac
@@ -484,6 +496,7 @@ def classify_site_imagery(
         nearmap_tier=nearmap_tier,
         rooftop_unlocked=rooftop_unlocked,
         cell_equipment=res.get("cell_equipment"),
+        pin_address_mismatch=pin_address_mismatch,
     ):
         second_nearmap = "spent"
         assert unused_point is not None
@@ -725,14 +738,13 @@ def classify_site_imagery(
                 wide_was_other = True
 
     # Zoom stage — skip when wide AOI also returned other.
-    # NAIP rescue zooms only other/unclear. Pin-offset still zooms rooftops
-    # (facade/parapet may sit just outside the pin chip).
+    # NAIP other/unclear always zooms when ZOOM_STAGE is on. Pin-offset still
+    # zooms rooftops (facade/parapet may sit just outside the pin chip).
     zoom_types = (
         ("other", "unclear", "rooftop") if pin_offset_scout else ("other", "unclear")
     )
     if (
-        (pin_offset_scout or naip_rescue)
-        and not ac.confident_no_asset(res)
+        not ac.confident_no_asset(res)
         and not wide_was_other
         and ac.ZOOM_STAGE
         and res.get("site_type") in zoom_types

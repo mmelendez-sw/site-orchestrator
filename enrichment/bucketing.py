@@ -22,6 +22,7 @@ from enrichment.constants import (
     GEMINI_TOWER_SKIP_CLAUDE_CONF,
     MIN_IMAGERY_ONLY_CELL_CONFIDENCE,
     MIN_IMAGERY_ONLY_SITE_CONFIDENCE,
+    MIN_IMAGERY_ONLY_SITE_CONFIDENCE_AGREE,
     MIN_ROOFTOP_CELL_CONFIDENCE,
     MIN_UPDATE_CONFIDENCE,
     VERIFIED_SITE_SOURCE_FCC,
@@ -293,7 +294,7 @@ def _dual_model_cell_ok(classified: dict[str, Any]) -> bool:
 
 
 def _tower_gemini_high_conf_ok(classified: dict[str, Any]) -> bool:
-    """Gemini already locked a tower at >= 0.9 — Claude dual-model not required.
+    """Gemini already locked a tower at GEMINI_TOWER_SKIP_CLAUDE_CONF — Claude not required.
 
     Accepts ``gemini_strong_solo`` or an empty dual_model_resolution (NAIP-only
     Gemini path never stamps Claude fields). Rooftop HVAC FPs still need Claude
@@ -316,7 +317,7 @@ def _dual_model_hard_agree(classified: dict[str, Any]) -> bool:
 
     Soft-keep and rooftop Gemini-solo must not unlock Salesforce writes — those
     are the HVAC / wrong-neighbor FP paths. Towers at Gemini site_confidence
-    >= 0.9 may write via ``_tower_gemini_high_conf_ok`` instead.
+    >= GEMINI_TOWER_SKIP_CLAUDE_CONF may write via ``_tower_gemini_high_conf_ok``.
     """
     if not cell_equipment_confirmed(classified.get("cell_equipment")):
         return False
@@ -516,9 +517,11 @@ def bucket_classification(
     if site_type_raw not in {"tower", "rooftop"}:
         return _holdout(BUCKET_OTHER, f"else:{site_type_raw}", classified)
 
-    site_min = (
-        MIN_IMAGERY_ONLY_SITE_CONFIDENCE if imagery_only else MIN_UPDATE_CONFIDENCE
-    )
+    site_min = MIN_UPDATE_CONFIDENCE
+    if imagery_only:
+        site_min = MIN_IMAGERY_ONLY_SITE_CONFIDENCE
+        if _dual_model_localized_agree(classified):
+            site_min = MIN_IMAGERY_ONLY_SITE_CONFIDENCE_AGREE
     if not _confidence_ok(classified.get("site_confidence"), site_min):
         reason = "low_confidence_imagery_only" if imagery_only else "low_confidence"
         if site_type_raw == "rooftop":
@@ -526,7 +529,7 @@ def bucket_classification(
         return _holdout(BUCKET_OTHER, reason, classified)
 
     # NAIP: rooftops write only when cellular gear is certain. Gemini towers
-    # at >= 0.9 may write.
+    # at GEMINI_TOWER_SKIP_CLAUDE_CONF may write.
     if img_bucket == "naip":
         if site_type_raw == "rooftop":
             if not _rooftop_cell_certain(classified):
@@ -541,7 +544,7 @@ def bucket_classification(
     ):
         return _holdout(BUCKET_OTHER, "tower_no_cell_equipment", classified)
 
-    # Auto-apply: Claude hard-agree, Gemini tower lock at >= 0.9, or a
+    # Auto-apply: Claude hard-agree, Gemini tower lock at >= GEMINI_SOLO, or a
     # claimed-site stealth mast Gemini found that Claude missed.
     tower_gemini_locked = _tower_gemini_high_conf_ok(classified)
     tower_claimed_keep = _tower_claimed_keep_ok(classified)
@@ -554,7 +557,7 @@ def bucket_classification(
         return _holdout(BUCKET_OTHER, "tower_needs_dual_model_cell", classified)
 
     # Imagery-only is the exception path: require boxed crop/localize confirm
-    # unless Gemini already locked the tower at >= 0.9 or claimed-site keep.
+    # unless Gemini already locked the tower at GEMINI_SOLO or claimed-site keep.
     if (
         site_type_raw == "tower"
         and imagery_only

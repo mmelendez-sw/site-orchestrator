@@ -713,7 +713,7 @@ class BucketTests(unittest.TestCase):
             classified={
                 "site_type": "tower",
                 "tower_subtype": "monopole",
-                "site_confidence": 0.85,
+                "site_confidence": 0.84,
                 "cell_equipment": True,
                 "cell_equipment_confidence": 0.9,
                 "cell_equipment_evidence": "North oblique shows sector panels on monopole",
@@ -762,7 +762,7 @@ class BucketTests(unittest.TestCase):
         self.assertEqual(decision["update_site_type"], "Stealth")
 
     def test_tower_gemini_high_conf_solo_is_ready(self):
-        """Gemini tower at >= 0.9 skips Claude and can write (DB or imagery)."""
+        """Gemini tower at >= GEMINI_SOLO skips Claude and can write (DB or imagery)."""
         from enrichment.tests.golden_cases import _tower
 
         classified = _tower(
@@ -794,7 +794,7 @@ class BucketTests(unittest.TestCase):
         decision = bucket_classification(
             match_source=MATCH_SOURCE_FCC,
             classified=_tower(
-                site_confidence=0.85,
+                site_confidence=0.84,
                 dual_model_resolution="gemini_strong_solo",
                 escalation_model="gemini_strong_solo",
             ),
@@ -871,18 +871,40 @@ class BucketTests(unittest.TestCase):
             sf_lng=-89.0,
         )
         self.assertEqual(decision["bucket"], BUCKET_ROOFTOP)
-        self.assertIn("asset_offset_117.5m_exceeds_85m", decision["holdout_reason"])
+        self.assertIn("asset_offset_117.5m_exceeds_100m", decision["holdout_reason"])
+
+    def test_imagery_only_asset_within_leeway_applies(self):
+        decision = bucket_classification(
+            match_source=MATCH_SOURCE_NONE,
+            classified=_rooftop_ok(asset_offset_m=95.0),
+            db_lat=None,
+            db_lng=None,
+            sf_lat=43.0,
+            sf_lng=-89.0,
+        )
+        self.assertEqual(decision["bucket"], BUCKET_POTENTIAL_UPDATE)
 
     def test_imagery_only_low_site_conf_held_out(self):
         decision = bucket_classification(
             match_source=MATCH_SOURCE_NONE,
-            classified=_rooftop_ok(site_confidence=0.69),
+            classified=_rooftop_ok(site_confidence=0.69, dual_model_resolution="agree"),
             db_lat=None,
             db_lng=None,
             sf_lat=43.0,
             sf_lng=-89.0,
         )
         self.assertEqual(decision["holdout_reason"], "low_confidence_imagery_only")
+
+    def test_imagery_only_localized_agree_allows_lower_site_conf(self):
+        decision = bucket_classification(
+            match_source=MATCH_SOURCE_NONE,
+            classified=_rooftop_ok(site_confidence=0.66),
+            db_lat=None,
+            db_lng=None,
+            sf_lat=43.0,
+            sf_lng=-89.0,
+        )
+        self.assertEqual(decision["bucket"], BUCKET_POTENTIAL_UPDATE)
 
 
 class SoqlTests(unittest.TestCase):
@@ -1398,6 +1420,14 @@ class CostPolicyTests(unittest.TestCase):
         kwargs["site_type"] = "rooftop"
         kwargs["rooftop_unlocked"] = True
         self.assertTrue(should_spend_second_nearmap(**kwargs))
+        kwargs["site_type"] = "other"
+        kwargs["rooftop_unlocked"] = False
+        kwargs["cell_equipment"] = False
+        kwargs["site_confidence"] = 0.9
+        kwargs["nearmap_tier"] = "full"
+        self.assertFalse(should_spend_second_nearmap(**kwargs))
+        kwargs["pin_address_mismatch"] = True
+        self.assertTrue(should_spend_second_nearmap(**kwargs))
 
     def test_stamp_apply_status_before_metrics(self):
         from enrichment.pipeline import stamp_apply_status
@@ -1658,10 +1688,10 @@ class CostPolicyTests(unittest.TestCase):
                 ],
             )
             result = drop_runs_from_ledger(["drop-me"], root=root)
-        self.assertEqual(result["runs"], 1)
-        self.assertEqual(result["site_rows"], 1)
-        self.assertEqual(result["kpis"]["unique_sites"], 1)
-        self.assertTrue((root / KPIS_JSON).is_file())
+            self.assertEqual(result["runs"], 1)
+            self.assertEqual(result["site_rows"], 1)
+            self.assertEqual(result["kpis"]["unique_sites"], 1)
+            self.assertTrue((root / KPIS_JSON).is_file())
 
     def test_osm_empty_chip_and_tower_tags(self):
         from enrichment.osm_prefilter import (
@@ -1740,7 +1770,7 @@ class SimpleClassifyStampTests(unittest.TestCase):
         self.assertNotEqual(weak.get("dual_model_resolution"), "gemini_strong_solo")
 
     def test_unstamped_naip_db_tower_at_high_conf_is_ready(self):
-        """Barebones Gemini path may omit dual_model_resolution; 0.9 still writes."""
+        """Barebones Gemini path may omit dual_model_resolution; solo bar still writes."""
         decision = bucket_classification(
             match_source=MATCH_SOURCE_FCC,
             classified={
@@ -1807,6 +1837,7 @@ class PinAddressGeocodeTests(unittest.TestCase):
     def test_should_compare_rooftop_hosts(self):
         from enrichment.geo import should_compare_rooftop_hosts
 
+        self.assertTrue(should_compare_rooftop_hosts(15))
         self.assertTrue(should_compare_rooftop_hosts(25))
         self.assertFalse(should_compare_rooftop_hosts(10))
         self.assertFalse(should_compare_rooftop_hosts(25, db_backed=True))

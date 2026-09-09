@@ -187,7 +187,7 @@ class LockedGeminiTowerSkipLabelTests(unittest.TestCase):
             locked_gemini_tower_skip_nearmap_reason(
                 {
                     "site_type": "tower",
-                    "site_confidence": 0.85,
+                    "site_confidence": 0.84,
                     "cell_equipment": True,
                 },
                 db_backed=True,
@@ -280,6 +280,18 @@ class SkipNearmapAfterNaipTests(unittest.TestCase):
             )
         )
 
+    def test_rooftop_cell_at_solo_bar_still_needs_nearmap(self):
+        self.assertIsNone(
+            rooftop_naip_cell_skip_nearmap_reason(
+                {
+                    "site_type": "rooftop",
+                    "site_confidence": 0.90,
+                    "cell_equipment": True,
+                    "cell_equipment_confidence": 0.85,
+                }
+            )
+        )
+
     def test_empty_naip_osm_empty_skips(self):
         reason = naip_empty_osm_skip_nearmap_reason(
             {"site_type": "other", "site_confidence": 0.50},
@@ -287,6 +299,16 @@ class SkipNearmapAfterNaipTests(unittest.TestCase):
             osm_info=self._osm_empty,
         )
         self.assertEqual(reason, "NAIP empty + OSM no building/tower")
+
+    def test_empty_naip_osm_stale_does_not_skip(self):
+        self.assertIsNone(
+            naip_empty_osm_skip_nearmap_reason(
+                {"site_type": "other", "site_confidence": 0.50},
+                db_backed=False,
+                osm_info=self._osm_empty,
+                naip_age_years=3.0,
+            )
+        )
 
     def test_empty_naip_osm_building_still_buys(self):
         self.assertIsNone(
@@ -577,23 +599,23 @@ class EscalationReasonTests(unittest.TestCase):
 
 
 class GeminiTowerSkipClaudeTests(unittest.TestCase):
-    def test_skip_when_tower_site_conf_at_least_0_9(self):
+    def test_skip_when_tower_site_conf_at_least_solo_bar(self):
         self.assertTrue(
             should_skip_claude_for_gemini_tower(
                 {
                     "site_type": "tower",
-                    "site_confidence": 0.9,
+                    "site_confidence": 0.85,
                     "cell_equipment": True,
                 }
             )
         )
 
-    def test_do_not_skip_below_0_9(self):
+    def test_do_not_skip_below_solo_bar(self):
         self.assertFalse(
             should_skip_claude_for_gemini_tower(
                 {
                     "site_type": "tower",
-                    "site_confidence": 0.89,
+                    "site_confidence": 0.84,
                     "cell_equipment": True,
                 }
             )
@@ -615,7 +637,13 @@ class GeminiTowerSkipClaudeTests(unittest.TestCase):
             "site_confidence": 0.8,
             "input_confidence": "medium",
         }
+        almost = {
+            "site_type": "other",
+            "site_confidence": 0.85,
+            "input_confidence": "high",
+        }
         self.assertFalse(confident_no_asset(weak))
+        self.assertFalse(confident_no_asset(almost))
         self.assertTrue(confident_no_asset(locked))
         self.assertTrue(confident_no_asset(medium))
 
@@ -718,7 +746,7 @@ class GeminiTowerSkipClaudeTests(unittest.TestCase):
             "cell_equipment": True,
             "cell_equipment_confidence": 0.85,
             "cell_equipment_evidence": "North oblique shows sector panels on monopole",
-            "site_evidence": "A monopole in a compound.",
+            "site_evidence": "A monopole in a fenced yard.",
             "cell_gear_kind": "sector_panel",
             "nearmap_tier": "full",
             "nearmap_views": "Vert,North,East",

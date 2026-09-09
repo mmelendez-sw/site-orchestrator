@@ -15,7 +15,7 @@ from typing import Any, Iterable
 from enrichment.constants import (
     BUCKET_POTENTIAL_UPDATE,
     BUCKET_ROOFTOP,
-    GEMINI_TOWER_SKIP_CLAUDE_CONF,
+    NEARMAP_EMPTY_LOCK_CONF,
 )
 from paths import metrics_dir
 
@@ -79,7 +79,7 @@ def outcome_class(row: dict[str, Any]) -> str:
     if _lower(row.get("nearmap_tier")) == "no_coverage":
         return "holdout_no_nearmap"
     conf = _conf(row.get("naip_site_confidence"))
-    if site in EMPTY_SCREEN and nearmap_ran(row) and conf is not None and conf >= GEMINI_TOWER_SKIP_CLAUDE_CONF:
+    if site in EMPTY_SCREEN and nearmap_ran(row) and conf is not None and conf >= NEARMAP_EMPTY_LOCK_CONF:
         return "holdout_empty_confirmed"
     if bucket == BUCKET_ROOFTOP or (site == "rooftop" and bucket != BUCKET_POTENTIAL_UPDATE):
         return "holdout_weak_rooftop"

@@ -60,10 +60,23 @@ Also install the ODBC Driver 18 for SQL Server. Azure SQL uses Entra token auth 
 1. **NAIP + Gemini** — always, unless a unique FCC/TowerSource hit ≤ 25 m skips imagery.
 2. **OSM Overpass** — cheap prefilter before Nearmap when the NAIP pass is inconclusive.
 3. **Nearmap** vert + obliques — rooftops and towers that still need high-res sides.
-4. **Claude** — dual-model cell confirm (skipped for high-conf Gemini towers ≥ 0.9, and below 0.7 site confidence).
+4. **Claude** — dual-model cell confirm (skipped for high-conf Gemini towers ≥ 0.85, and below 0.7 site confidence).
+
+Re-score holdouts on already-purchased Nearmap JPEGs (no new Nearmap fetch; Gemini and Claude still run). Dry-run a slice first:
+
+```powershell
+$env:RERUN_HOLDOUTS_FROM="2026-09-03"
+$env:REUSE_CHIPS_FROM="2026-09-03"
+$env:LIMIT="50"
+$env:APPLY="0"
+$env:VERBOSE="1"
+python -m enrichment
+```
+
+Sites with no saved chips return `error=no_saved_chips`. Then `APPLY=1` if the holdout mix looks right.
 
 ## What it writes
 
-- **Towers:** Gemini tower + cell at site confidence ≥ 0.9 auto-apply (imagery-only allowed). Claude can confirm weaker towers.
+- **Towers:** Gemini tower + cell at site confidence ≥ 0.85 auto-apply (imagery-only allowed). Claude can confirm weaker towers.
 - **Rooftops:** Nearmap obliques + dual-model agreement, or NAIP-only when site and cell confidence ≥ 0.95 with named gear, unhedged evidence, and an asset box. Otherwise holdout and dequeue (`LLM_Classified=false`, `LLM_Holdout=true`).
 - Unique FCC/TowerSource hit ≤ 25 m skips imagery and still updates coords + verified source.

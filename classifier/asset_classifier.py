@@ -137,7 +137,8 @@ GEMINI_THINKING_BUDGET_ENV = os.environ.get("GEMINI_THINKING_BUDGET", "").strip(
 GEMINI_SOFT_KEEP_CELL_CONF = float(os.environ.get("GEMINI_SOFT_KEEP_CELL_CONF", "0.85"))
 # Skip Claude (escalation + tower dual-model) when Gemini site_confidence is
 # at/above this. Rooftop HVAC FPs still go through Claude dual-confirm.
-GEMINI_SOLO_CELL_CONF = float(os.environ.get("GEMINI_SOLO_CELL_CONF", "0.90"))
+GEMINI_SOLO_CELL_CONF = float(os.environ.get("GEMINI_SOLO_CELL_CONF", "0.85"))
+EMPTY_CHIP_LOCK_CONF = float(os.environ.get("NEARMAP_EMPTY_LOCK_CONF", "0.90"))
 # Do not burn Claude on weak Gemini — below this site_confidence, skip
 # full-scene escalation and dual-model Claude. Weak calls stay holdout.
 # 0.60 matches the NAIP scout floor so imagery-only towers at 0.65 still get Claude.
@@ -165,7 +166,7 @@ STAC_URL = "https://planetarycomputer.microsoft.com/api/stac/v1"
 COLLECTION = "naip"
 # Primary NAIP chip side length (meters). Set to 500 to skip a prior 250 m pass
 # and go straight to wide-frame classify (then ZOOM_STAGE if still other/unclear).
-CHIP_SIZE_M = float(os.environ.get("CHIP_SIZE_M", "250"))
+CHIP_SIZE_M = float(os.environ.get("CHIP_SIZE_M", "300"))
 # Wide-AOI (zoom-out) retry size when primary NAIP pass finds no tower.
 # Only runs when NAIP_WIDE_CHIP_M > CHIP_SIZE_M.
 NAIP_WIDE_CHIP_M = float(os.environ.get("NAIP_WIDE_CHIP_M", "500"))
@@ -2284,8 +2285,8 @@ def needs_naip_rescue(res: dict) -> bool:
 def confident_no_asset(res: dict) -> bool:
     """True when Gemini already locked a high-confidence empty/other chip.
 
-    Outreach-verified (high source trust) only locks empty at the Gemini
-    solo bar (0.90). Weaker other calls still get zoom/Claude.
+    Outreach-verified (high source trust) only locks empty at
+    EMPTY_CHIP_LOCK_CONF (0.90). Weaker other calls still get zoom/Claude.
     """
     if str(res.get("site_type") or "").strip().lower() != "other":
         return False
@@ -2293,7 +2294,7 @@ def confident_no_asset(res: dict) -> bool:
     if conf is None:
         return False
     lock = (
-        GEMINI_SOLO_CELL_CONF
+        EMPTY_CHIP_LOCK_CONF
         if source_expects_asset(res)
         else TIER_CONF_HIGH
     )
@@ -2419,26 +2420,34 @@ def gemini_confidence_locks_claude(res: dict) -> bool:
     """True when Gemini site_confidence is high enough to skip full-scene Claude.
 
     ``unclear`` never locks. Rooftop cell-unconfirmed is checked first in
-    ``escalation_reason`` and still escalates.
+    ``escalation_reason`` and still escalates. Towers lock at
+    GEMINI_SOLO_CELL_CONF; empty/other and rooftops stay at EMPTY_CHIP_LOCK_CONF
+    so HVAC FPs still get Claude.
     """
-    if str(res.get("site_type") or "").strip().lower() == "unclear":
+    site = str(res.get("site_type") or "").strip().lower()
+    if site == "unclear":
         return False
     conf = normalize_confidence(res.get("site_confidence"))
-    return conf is not None and conf >= GEMINI_SOLO_CELL_CONF
+    if conf is None:
+        return False
+    if site in {"other", "rooftop"}:
+        return conf >= EMPTY_CHIP_LOCK_CONF
+    return conf >= GEMINI_SOLO_CELL_CONF
 
 
 def should_trust_gemini_cell_solo(res: dict, *, from_wide_rescue: bool = False) -> bool:
     """Skip Claude dual-confirm when Gemini already locked a strong rooftop cell.
 
-    Requires soft-keep-strength Nearmap localization plus conf >= GEMINI_SOLO_CELL_CONF.
+    Requires soft-keep-strength Nearmap localization plus conf >= EMPTY_CHIP_LOCK_CONF.
     Saves Claude cost and avoids Claude false vetoes on clear antenna sites.
+    Rooftop HVAC FPs still need Claude below that lock.
     """
     if res.get("cell_equipment") is not True:
         return False
     if not should_soft_keep_gemini_cell(res, from_wide_rescue=from_wide_rescue):
         return False
     conf = normalize_confidence(res.get("cell_equipment_confidence"))
-    if conf is None or conf < GEMINI_SOLO_CELL_CONF:
+    if conf is None or conf < EMPTY_CHIP_LOCK_CONF:
         return False
     return has_locked_oblique_asset_box(res)
 
@@ -3078,31 +3087,43 @@ def db_backed_naip_tower_skip_nearmap_reason(
 def rooftop_naip_cell_skip_nearmap_reason(
     res: dict, naip_age_years: float | None = None
 ) -> str | None:
-    """Skip Nearmap when NAIP already locked rooftop cell at the Gemini solo bar."""
+    """Skip Nearmap when NAIP already locked rooftop cell at the empty-chip lock."""
     if not _is_rooftop(res):
         return None
     if res.get("cell_equipment") is not True:
         return None
     cell_conf = normalize_confidence(res.get("cell_equipment_confidence"))
-    if cell_conf is None or cell_conf < GEMINI_SOLO_CELL_CONF:
+    if cell_conf is None or cell_conf < EMPTY_CHIP_LOCK_CONF:
         return None
     if site_confidence_band(res) == "low":
         return None
     if naip_age_blocks_early_stop(res, naip_age_years):
         return None
-    return f"NAIP rooftop cell conf>={GEMINI_SOLO_CELL_CONF:g}"
+    return f"NAIP rooftop cell conf>={EMPTY_CHIP_LOCK_CONF:g}"
 
 
 def naip_empty_osm_skip_nearmap_reason(
-    res: dict, *, db_backed: bool = False, osm_info: dict | None = None
+    res: dict,
+    *,
+    db_backed: bool = False,
+    osm_info: dict | None = None,
+    naip_age_years: float | None = None,
 ) -> str | None:
     """Skip Nearmap when NAIP is empty and OSM shows no building or tower.
 
     Fail-open: missing/failed OSM does not skip. DB-backed claimed towers
-    still buy Nearmap if NAIP saw nothing.
+    still buy Nearmap if NAIP saw nothing. Stale NAIP (older than
+    NAIP_MAX_AGE_YEARS) does not skip — OSM empty is not a substitute for
+    current imagery.
     """
     if db_backed:
         return None
+    if naip_age_years is not None:
+        try:
+            if float(naip_age_years) > float(NAIP_MAX_AGE_YEARS):
+                return None
+        except (TypeError, ValueError):
+            pass
     site = str(res.get("site_type") or "").strip().lower()
     if site not in {"other", "unclear"}:
         return None
@@ -3136,14 +3157,17 @@ def skip_nearmap_after_naip_reason(
     if roof:
         return roof
     return naip_empty_osm_skip_nearmap_reason(
-        res, db_backed=db_backed, osm_info=osm_info
+        res,
+        db_backed=db_backed,
+        osm_info=osm_info,
+        naip_age_years=naip_age_years,
     )
 
 
 def rooftop_requires_nearmap_tiers(res: dict) -> bool:
     """True when the remaining rooftop path should fetch Vert + obliques.
 
-    Locked NAIP rooftop cell (>= GEMINI_SOLO_CELL_CONF) skips earlier via
+    Locked NAIP rooftop cell (>= EMPTY_CHIP_LOCK_CONF) skips earlier via
     rooftop_naip_cell_skip_nearmap_reason. Callers that reach this point
     still need paid imagery for facade confirmation.
     """
@@ -3246,7 +3270,7 @@ def escalation_reason(res: dict) -> str | None:
             if (
                 source_expects_asset(res)
                 and conf is not None
-                and conf < GEMINI_SOLO_CELL_CONF
+                and conf < EMPTY_CHIP_LOCK_CONF
             ):
                 return "nearmap_claimed_site_empty"
             return None
@@ -3266,7 +3290,7 @@ def escalation_reason(res: dict) -> str | None:
     elif res.get("cell_equipment") is False:
         # Towers (and non-rooftop): definitive no-gear — skip Claude.
         return None
-    # Gemini already locked the call at >= 0.9 — don't overwrite with Claude.
+    # Gemini already locked the call — don't overwrite with Claude.
     if gemini_confidence_locks_claude(res):
         return None
     if site in {"other", "unclear"}:
@@ -4705,7 +4729,7 @@ def main():
                 if pin_offset_scout
                 else ("other", "unclear")
             )
-            if ((pin_offset_scout or naip_rescue or force_zoom) and ZOOM_STAGE
+            if ((ZOOM_STAGE)
                     and not confident_no_asset(res)
                     and not wide_was_other
                     and (

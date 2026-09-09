@@ -124,8 +124,8 @@ def should_compare_rooftop_hosts(
 ) -> bool:
     """No FCC/TowerSource hit: pin vs Census when they are not the same parcel.
 
-    Towers are DB-anchored. Rooftops sit on a building; a 25 m parking-lot pin
-    is enough to look at the street geocode before buying Nearmap.
+    Towers are DB-anchored. Rooftops sit on a building; a parking-lot pin
+    at ROOFTOP_HOST_OFFSET_M is enough to look at the street geocode.
     """
     if db_backed or offset_m is None:
         return False
