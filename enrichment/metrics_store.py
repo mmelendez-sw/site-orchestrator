@@ -224,3 +224,24 @@ def try_write_snapshot(snap: dict[str, Any]) -> None:
         logger.info("metrics SQL upsert run_id=%s sites=%s", snap.get("run_id"), n)
     except Exception:
         logger.exception("metrics SQL upsert skipped")
+
+
+def delete_run(run_id: str) -> None:
+    """Remove one run header and its site rows from Azure SQL."""
+    rid = str(run_id or "").strip()
+    if not rid:
+        raise ValueError("run_id is required")
+    from enrichment.mssql import connect_mssql
+
+    conn = connect_mssql()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM dbo.EnrichmentSiteOutcome WHERE RunId = ?", rid)
+        cursor.execute("DELETE FROM dbo.EnrichmentRun WHERE RunId = ?", rid)
+        conn.commit()
+        logger.info("metrics SQL deleted run_id=%s", rid)
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()

@@ -7,7 +7,7 @@ import logging
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 from enrichment.bucketing import (
     bucket_classification,
@@ -27,6 +27,7 @@ from enrichment.constants import (
     MATCH_SOURCE_NONE,
     PROXIMITY_MAX_M,
     DEFAULT_STAGE_FILTER,
+    DEFAULT_OWNER_FILTER,
     HIGH_INPUT_CONFIDENCE_STAGES,
 )
 from enrichment.geo import (
@@ -71,14 +72,42 @@ def default_run_dir(root: Path | None = None) -> Path:
     return base / f"{stamp}_sf_enrichment"
 
 
+def apply_queue_window(
+    sites: list[dict[str, Any]],
+    *,
+    offset: int = 0,
+    limit: int | None = None,
+    skip_ids: Iterable[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Drop already-attempted Ids, then slice ``sites[offset:offset+limit]``.
+
+    Without holdouts, non-hits stay at the front of the Salesforce queue.
+    ``skip_ids`` (prior run CSVs) is the way to walk past them. ``offset`` is
+    only stable for a frozen snapshot — hits that leave Salesforce shift
+    later rows up.
+    """
+    skip = {str(sid).strip() for sid in (skip_ids or []) if str(sid).strip()}
+    if skip:
+        sites = [
+            row for row in sites if str(row.get("Id") or "").strip() not in skip
+        ]
+    start = max(0, int(offset or 0))
+    if limit is None:
+        return sites[start:]
+    return sites[start : start + max(0, int(limit))]
+
+
 def run_enrichment(
     *,
     sf_client,
     sql_connection=None,
     run_dir: Path,
     limit: int | None = None,
+    offset: int = 0,
+    skip_ids: Iterable[str] | None = None,
     max_m: float = PROXIMITY_MAX_M,
     skip_classify: bool = False,
+    db_only: bool = False,
     classify_fn: Callable[..., dict[str, Any]] | None = None,
     sites: list[dict[str, Any]] | None = None,
     site_ids: list[str] | None = None,
@@ -86,6 +115,7 @@ def run_enrichment(
     metro_classification: str | None = "Major NFL Metro",
     states: list[str] | None = None,
     stages: list[str] | None = None,
+    owners: list[str] | None = None,
     llm_classified: bool = False,
     verbose: bool = True,
     apply: bool = True,
@@ -98,6 +128,11 @@ def run_enrichment(
     (LLM_Classified=true, LLM_Holdout=false). Remaining rows dequeue
     (LLM_Classified=false, LLM_Holdout=true) unless ``dequeue_holdouts``
     is false — then holdouts are left untouched.
+
+    ``db_only`` never fetches NAIP/Nearmap/Gemini/Claude. Every processed
+    row is marked LLM_Classified=true (no LLM_Holdout). Unique FCC or
+    TowerSource hits also write Site_Type and coords. Blanks stay classified
+    true until a later flip.
     """
     run_dir.mkdir(parents=True, exist_ok=True)
     chip_dir = run_dir / "chips"
@@ -106,7 +141,8 @@ def run_enrichment(
     if verbose:
         progress.stage(
             "START",
-            f"limit={limit!s} | "
+            f"offset={offset} | limit={limit!s} | "
+            f"db_only={str(db_only).lower()} | "
             f"stages={','.join(stages or list(DEFAULT_STAGE_FILTER))} | "
             f"run_dir={run_dir.name}"
             + (
@@ -125,7 +161,7 @@ def run_enrichment(
         if verbose:
             progress.result("connected")
 
-    classify = classify_fn or classify_site_imagery
+    classify = None if db_only else (classify_fn or classify_site_imagery)
 
     try:
         if sites is None:
@@ -140,10 +176,17 @@ def run_enrichment(
                 state_label = ",".join(states) if states else "all"
                 stage_filter = stages or list(DEFAULT_STAGE_FILTER)
                 stage_label = ",".join(stage_filter)
+                owner_filter = (
+                    owners if owners is not None else list(DEFAULT_OWNER_FILTER)
+                )
+                if db_only and owners is None:
+                    owner_filter = None
+                owner_label = ",".join(owner_filter) if owner_filter else "any"
                 if verbose:
                     progress.stage(
                         "2/4 QUERY SALESFORCE",
                         f"blank Site_Type | stages={stage_label} | "
+                        f"owners={owner_label} | "
                         f"carrier_like={carrier_like!r} | "
                         f"metro={metro_classification!r} | "
                         f"llm_classified={str(llm_classified).lower()} | "
@@ -152,6 +195,7 @@ def run_enrichment(
                 sites = query_blank_site_type_sites(
                     sf_client,
                     stages=stage_filter,
+                    owners=owner_filter,
                     carrier_like=carrier_like,
                     metro_classification=metro_classification,
                     states=states,
@@ -159,10 +203,21 @@ def run_enrichment(
                 )
             if verbose:
                 progress.result(f"{len(sites)} site(s)")
-        if limit is not None:
-            sites = sites[: max(0, limit)]
-            if verbose:
-                progress.step(f"processing first {len(sites)}")
+        queued = len(sites)
+        sites = apply_queue_window(
+            sites, offset=offset, limit=limit, skip_ids=skip_ids
+        )
+        if verbose and (offset or limit is not None or skip_ids):
+            skip_n = len({str(s).strip() for s in (skip_ids or []) if str(s).strip()})
+            extras = []
+            if skip_n:
+                extras.append(f"skip_from={skip_n} id(s)")
+            if offset:
+                extras.append(f"offset={offset}")
+            if limit is not None:
+                extras.append(f"limit={limit}")
+            suffix = f" ({', '.join(extras)})" if extras else ""
+            progress.step(f"processing {len(sites)} of {queued}{suffix}")
 
         detail_rows: list[dict[str, Any]] = []
         cursor = sql_connection.cursor()
@@ -186,6 +241,7 @@ def run_enrichment(
                 cursor=cursor,
                 max_m=max_m,
                 skip_classify=skip_classify,
+                db_only=db_only,
                 classify_fn=classify,
                 chip_dir=chip_dir,
                 verbose=verbose,
@@ -232,7 +288,7 @@ def run_enrichment(
         apply_info: dict[str, Any] | None = None
         if apply:
             apply_rows = list(candidates)
-            if dequeue_holdouts:
+            if dequeue_holdouts or db_only:
                 apply_rows.extend(
                     r
                     for r in detail_rows
@@ -247,6 +303,7 @@ def run_enrichment(
                     run_dir=run_dir,
                     apply=True,
                     verbose=verbose,
+                    write_holdout=not db_only,
                 )
                 stamp_apply_status(
                     detail_rows, apply_info.pop("results", None) or []
@@ -289,6 +346,8 @@ def run_enrichment(
                 run_dir=run_dir,
                 detail_rows=detail_rows,
                 apply_summary=apply_info if apply else None,
+                db_only=db_only,
+                write_sql=bool(apply),
             )
             run_block = {
                 key: metrics_snap[key]
@@ -326,7 +385,8 @@ def _process_site(
     cursor,
     max_m: float,
     skip_classify: bool,
-    classify_fn: Callable[..., dict[str, Any]],
+    db_only: bool = False,
+    classify_fn: Callable[..., dict[str, Any]] | None,
     chip_dir: Path,
     verbose: bool = True,
     cluster_cache: list[dict[str, Any]] | None = None,
@@ -501,7 +561,18 @@ def _process_site(
     base["classify_lat"] = classify_lat
     base["classify_lng"] = classify_lng
 
-    skip_reason = None if skip_classify else auto_skip_classify_reason(hit)
+    skip_reason = auto_skip_classify_reason(hit, force=db_only)
+    if db_only:
+        if skip_reason is not None and hit is not None:
+            if verbose:
+                progress.step(f"db-only unique hit ({skip_reason})")
+            return _stamp_unique_db_update(base, hit, classify_lat, classify_lng)
+        if verbose:
+            progress.step("db-only — no unique FCC/TowerSource hit (no imagery)")
+        base["bucket"] = BUCKET_OTHER
+        base["holdout_reason"] = "db_only_no_unique_hit"
+        return base
+
     auto_skip = skip_classify or skip_reason is not None
     if auto_skip:
         if verbose:
@@ -511,23 +582,9 @@ def _process_site(
                 else f"auto skip classify ({skip_reason})"
             )
         if hit is not None:
-            sf_type = site_type_from_db_asset_type(hit.asset_type)
-            base["bucket"] = BUCKET_POTENTIAL_UPDATE
-            base["holdout_reason"] = "skip_classify_db_hit"
-            base["naip_site_type"] = (
-                "rooftop" if sf_type == "Rooftop" else "tower"
-            )
-            base["update_lat"] = classify_lat
-            base["update_lng"] = classify_lng
-            base["update_coord_source"] = f"db:{base['match_source']}"
-            base["update_site_type"] = sf_type
-            base["update_verified_site"] = True
-            base["update_verified_site_source"] = verified_source_for_match(
-                base["match_source"]
-            )
-        else:
-            base["bucket"] = BUCKET_OTHER
-            base["holdout_reason"] = "skip_classify_no_db_hit"
+            return _stamp_unique_db_update(base, hit, classify_lat, classify_lng)
+        base["bucket"] = BUCKET_OTHER
+        base["holdout_reason"] = "skip_classify_no_db_hit"
         return base
 
     if cluster_cache is not None and hit is None:
@@ -713,6 +770,28 @@ def _process_site(
     return base
 
 
+def _stamp_unique_db_update(
+    base: dict[str, Any],
+    hit,
+    classify_lat: float,
+    classify_lng: float,
+) -> dict[str, Any]:
+    """Salesforce candidate from a unique FCC/TowerSource hit (no imagery)."""
+    sf_type = site_type_from_db_asset_type(hit.asset_type)
+    base["bucket"] = BUCKET_POTENTIAL_UPDATE
+    base["holdout_reason"] = "skip_classify_db_hit"
+    base["naip_site_type"] = "rooftop" if sf_type == "Rooftop" else "tower"
+    base["update_lat"] = classify_lat
+    base["update_lng"] = classify_lng
+    base["update_coord_source"] = f"db:{base['match_source']}"
+    base["update_site_type"] = sf_type
+    base["update_verified_site"] = True
+    base["update_verified_site_source"] = verified_source_for_match(
+        base["match_source"]
+    )
+    return base
+
+
 def stamp_apply_status(
     detail_rows: list[dict[str, Any]],
     apply_results: list[dict[str, Any]] | None,
@@ -739,9 +818,8 @@ def stamp_apply_status(
             continue
         if entry.get("success"):
             payload = entry.get("payload")
-            if is_enrichment_payload(
-                payload if isinstance(payload, dict) else None
-            ):
+            payload = payload if isinstance(payload, dict) else {}
+            if is_enrichment_payload(payload) or payload.get("LLM_Classified__c"):
                 row["sf_update_status"] = "updated"
             else:
                 row["sf_update_status"] = "dequeued"
@@ -758,6 +836,7 @@ def apply_candidate_csv(
     run_dir: Path | None = None,
     apply: bool = False,
     verbose: bool = True,
+    write_holdout: bool = True,
 ) -> dict[str, Any]:
     """Apply enrichment rows one at a time (idempotent on failure)."""
     import csv
@@ -778,6 +857,7 @@ def apply_candidate_csv(
         rows,
         dry_run=not apply,
         verbose=verbose,
+        write_holdout=write_holdout,
     )
     out_dir = run_dir or candidate_csv.parent
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -817,20 +897,31 @@ def apply_candidate_csv(
     dequeued = sum(
         1
         for r in results
-        if r.get("success") and not is_enrichment_payload(r.get("payload"))
+        if r.get("success")
+        and not is_enrichment_payload(r.get("payload"))
+        and (r.get("payload") or {}).get("LLM_Holdout__c") is True
+    )
+    classified_only = sum(
+        1
+        for r in results
+        if r.get("success")
+        and not is_enrichment_payload(r.get("payload"))
+        and (r.get("payload") or {}).get("LLM_Holdout__c") is not True
     )
     failed = sum(1 for r in results if not r.get("success"))
     summary = {
         "total": len(results),
         "success": tower_updated,
         "dequeued_holdouts": dequeued,
+        "classified_only": classified_only,
         "failed": failed,
         "apply": apply,
         "log": str(log_path),
     }
     if verbose:
         progress.result(
-            f"sf_writes={tower_updated} dequeued_holdouts={dequeued} failed={failed}"
+            f"sf_writes={tower_updated} classified_only={classified_only} "
+            f"dequeued_holdouts={dequeued} failed={failed}"
         )
     logger.info("Apply summary: %s", summary)
     summary["results"] = results

@@ -63,6 +63,16 @@ DEFAULT_STAGE_FILTER = (
     "Outreach - Verified",
 )
 
+# DB-only queue (no imagery). Override per run with STAGES or LEAD_STAGES.
+DB_ONLY_STAGE_FILTER = (
+    "New/Unreviewed",
+    "Enhanced/Unreviewed",
+    "Outreach",
+    "Outreach - Verified",
+    "Marketing",
+    "Unqualified"
+)
+
 # Hard exclusion unless the caller explicitly lists the stage in STAGES.
 EXCLUDED_STAGE_FILTER = (
     "Working-Connected",

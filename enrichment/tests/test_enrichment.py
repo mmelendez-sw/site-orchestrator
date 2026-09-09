@@ -896,6 +896,7 @@ class SoqlTests(unittest.TestCase):
         self.assertIn("LLM_Classified__c = false", soql)
         self.assertIn("(LLM_Holdout__c = false OR LLM_Holdout__c = null)", soql)
         self.assertIn("Metro_Classification__c", soql.split(" FROM ")[0])
+        self.assertTrue(soql.rstrip().endswith("ORDER BY Id"))
 
     def test_blank_site_type_query_can_override_stages(self):
         soql = build_blank_site_type_query(
@@ -905,6 +906,25 @@ class SoqlTests(unittest.TestCase):
         self.assertNotIn("Enhanced/Unreviewed", soql)
         self.assertIn("Working-Connected", soql)
         self.assertIn("Qualified (Converted)", soql)
+
+    def test_blank_site_type_query_can_omit_owner(self):
+        soql = build_blank_site_type_query(owners=None)
+        self.assertNotIn("Owner__c IN", soql)
+
+    def test_db_only_default_stages_any_owner(self):
+        from enrichment.constants import DB_ONLY_STAGE_FILTER
+
+        soql = build_blank_site_type_query(
+            stages=DB_ONLY_STAGE_FILTER,
+            owners=None,
+            metro_classification=None,
+        )
+        self.assertIn("New/Unreviewed", soql)
+        self.assertIn("Enhanced/Unreviewed", soql)
+        self.assertIn("Outreach - Verified", soql)
+        self.assertIn("Marketing", soql)
+        self.assertNotIn("Owner__c IN", soql)
+        self.assertNotIn("Metro_Classification__c =", soql)
 
     def test_blank_site_type_query_excludes_working_connected_by_default(self):
         soql = build_blank_site_type_query()
@@ -978,6 +998,28 @@ class SoqlTests(unittest.TestCase):
         soql = build_blank_site_type_query(states=["CA", "fl", "NV", "MA"])
         self.assertIn("Site_State__c IN ('CA', 'FL', 'NV', 'MA')", soql)
         self.assertNotIn("Carrier_Leasing_Source__c LIKE", soql)
+        self.assertTrue(soql.rstrip().endswith("ORDER BY Id"))
+
+
+class QueueWindowTests(unittest.TestCase):
+    def test_limit_takes_prefix_skip_and_offset_page_past_attempts(self):
+        from enrichment.pipeline import apply_queue_window
+
+        sites = [{"Id": f"a0Z{i:03d}"} for i in range(6)]
+        self.assertEqual(
+            [r["Id"] for r in apply_queue_window(sites, limit=3)],
+            ["a0Z000", "a0Z001", "a0Z002"],
+        )
+        self.assertEqual(
+            [r["Id"] for r in apply_queue_window(sites, offset=3, limit=2)],
+            ["a0Z003", "a0Z004"],
+        )
+        self.assertEqual(
+            [r["Id"] for r in apply_queue_window(
+                sites, skip_ids=["a0Z000", "a0Z002"], limit=3
+            )],
+            ["a0Z001", "a0Z003", "a0Z004"],
+        )
 
 
 class PayloadTests(unittest.TestCase):
@@ -1100,6 +1142,53 @@ class DuplicateFallbackTests(unittest.TestCase):
         self.assertTrue(entry["payload"]["LLM_Classified__c"])
         self.assertFalse(entry["payload"]["LLM_Holdout__c"])
         self.assertEqual(entry["payload"]["Site_Type__c"], "Rooftop")
+
+    def test_db_only_hit_sets_classified_without_holdout(self):
+        from enrichment.sf_ops import apply_one_update
+
+        site = _FakeSiteSObject()
+        entry = apply_one_update(
+            _FakeClient(site),
+            {
+                "Id": "a0ZTEST000000007",
+                "naip_site_type": "tower",
+                "holdout_reason": "skip_classify_db_hit",
+                "update_lat": 39.0,
+                "update_lng": -105.0,
+                "update_site_type": "Monopole",
+                "update_verified_site": True,
+                "update_verified_site_source": "FCC",
+            },
+            dry_run=False,
+            verbose=False,
+            write_holdout=False,
+        )
+        self.assertTrue(entry["success"])
+        self.assertTrue(entry["payload"]["LLM_Classified__c"])
+        self.assertNotIn("LLM_Holdout__c", entry["payload"])
+        self.assertEqual(entry["payload"]["Site_Type__c"], "Monopole")
+
+    def test_db_only_miss_sets_classified_without_site_type(self):
+        from enrichment.sf_ops import apply_one_update
+
+        site = _FakeSiteSObject()
+        entry = apply_one_update(
+            _FakeClient(site),
+            {
+                "Id": "a0ZTEST000000008",
+                "naip_site_type": "",
+                "holdout_reason": "db_only_no_unique_hit",
+            },
+            dry_run=False,
+            verbose=False,
+            write_holdout=False,
+        )
+        self.assertTrue(entry["success"])
+        self.assertEqual(
+            entry["payload"],
+            {"LLM_Classified__c": True},
+        )
+        self.assertNotIn("Site_Type__c", entry["payload"])
 
     def test_db_skip_blank_naip_writes_site_type(self):
         from enrichment.sf_ops import apply_one_update
@@ -1496,6 +1585,84 @@ class CostPolicyTests(unittest.TestCase):
         self.assertEqual(kpis["tower_write_rate"], 0.333)
         self.assertEqual(kpis["total_write_rate"], 0.667)
 
+    def test_rollup_skips_db_only_misses_keeps_unique_hits(self):
+        from enrichment.metrics import rollup_kpis, snapshot_run
+
+        kpis = rollup_kpis(
+            [
+                {"Id": "a", "outcome": "applied_rooftop"},
+                {
+                    "Id": "b",
+                    "outcome": "holdout_other",
+                    "include_in_kpis": False,
+                    "holdout_reason": "db_only_no_unique_hit",
+                    "db_only": True,
+                },
+                {
+                    "Id": "c",
+                    "outcome": "applied_db_skip",
+                    "include_in_kpis": True,
+                    "db_only": True,
+                },
+            ]
+        )
+        self.assertEqual(kpis["unique_sites"], 2)
+        self.assertEqual(kpis["rooftop_sf_writes"], 1)
+        self.assertNotIn("holdout_other", kpis["outcomes"])
+        snap = snapshot_run(
+            [
+                {
+                    "Id": "hit",
+                    "holdout_reason": "skip_classify_db_hit",
+                    "bucket": "potential_update",
+                    "update_site_type": "Monopole",
+                },
+                {
+                    "Id": "miss",
+                    "holdout_reason": "db_only_no_unique_hit",
+                    "bucket": "other_or_else",
+                },
+            ],
+            run_id="db-only-test",
+            db_only=True,
+        )
+        self.assertEqual(snap["sites"], 2)
+        self.assertEqual(snap["applied_db_skip"], 1)
+        by_id = {r["Id"]: r for r in snap["site_records"]}
+        self.assertTrue(by_id["hit"]["include_in_kpis"])
+        self.assertFalse(by_id["miss"]["include_in_kpis"])
+
+    def test_drop_runs_from_ledger_rewrites_kpis(self):
+        from enrichment.metrics import (
+            KPIS_JSON,
+            RUNS_JSONL,
+            SITES_JSONL,
+            drop_runs_from_ledger,
+            _rewrite_jsonl,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _rewrite_jsonl(
+                root / RUNS_JSONL,
+                [
+                    {"run_id": "keep", "sites": 1},
+                    {"run_id": "drop-me", "sites": 2},
+                ],
+            )
+            _rewrite_jsonl(
+                root / SITES_JSONL,
+                [
+                    {"Id": "a", "run_id": "keep", "outcome": "applied_rooftop"},
+                    {"Id": "b", "run_id": "drop-me", "outcome": "holdout_other"},
+                ],
+            )
+            result = drop_runs_from_ledger(["drop-me"], root=root)
+        self.assertEqual(result["runs"], 1)
+        self.assertEqual(result["site_rows"], 1)
+        self.assertEqual(result["kpis"]["unique_sites"], 1)
+        self.assertTrue((root / KPIS_JSON).is_file())
+
     def test_osm_empty_chip_and_tower_tags(self):
         from enrichment.osm_prefilter import (
             osm_suggests_empty_chip,
@@ -1808,9 +1975,13 @@ class HoldoutRerunTests(unittest.TestCase):
             pending = site_ids_from_run_specs(
                 ["2026-09-01"], runs_root=root, skip_applied=True
             )
+            all_stages = site_ids_from_run_specs(
+                ["2026-09-01"], runs_root=root, stages=[]
+            )
             chips = resolve_reuse_chips_dirs(["2026-09-01"], runs_root=root)
         self.assertEqual(ids, ["a0Znew", "a0Zshared", "a0Zold"])
         self.assertEqual(pending, ["a0Znew", "a0Zold"])
+        self.assertEqual(all_stages, ["a0Znew", "a0Zshared", "a0Zold", "a0Zworking"])
         self.assertEqual(
             [path.parent.name for path in chips],
             ["2026-09-01_163825_sf_enrichment", "2026-09-01_100000_sf_enrichment"],
@@ -1834,6 +2005,97 @@ class HoldoutRerunTests(unittest.TestCase):
         self.assertIn("North", pack["nearmap_views"])
         self.assertIsNotNone(pack["naip"])
         self.assertFalse(saved_chip_pack_usable(empty))
+
+
+class DbOnlyPipelineTests(unittest.TestCase):
+    def _site(self, **extra):
+        row = {
+            "Id": "a0ZDBONLY0000001",
+            "Site_Latitude__c": 43.0,
+            "Site_Longitude__c": -89.0,
+        }
+        row.update(extra)
+        return row
+
+    def _process(self, cursor, *, db_only=True, classify_fn=None):
+        from enrichment.constants import PROXIMITY_MAX_M
+        from enrichment.pipeline import _process_site
+
+        called = {"n": 0}
+
+        def boom(**_kwargs):
+            called["n"] += 1
+            raise AssertionError("classify must not run in db_only")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            return (
+                _process_site(
+                    self._site(),
+                    cursor=cursor,
+                    max_m=PROXIMITY_MAX_M,
+                    skip_classify=False,
+                    db_only=db_only,
+                    classify_fn=classify_fn or boom,
+                    chip_dir=Path(tmp),
+                    verbose=False,
+                ),
+                called,
+            )
+
+    def test_unique_close_hit_applies_without_classify(self):
+        from enrichment.constants import BUCKET_POTENTIAL_UPDATE
+
+        cursor = FakeCursor(
+            fcc_rows=[
+                {
+                    "ID": 1,
+                    "ASR_Number": "A",
+                    "Latitude_Decimal": 43.00005,
+                    "Longitude_Decimal": -89.0,
+                    "Registration_Type": "Monopole",
+                }
+            ]
+        )
+        row, called = self._process(cursor)
+        self.assertEqual(called["n"], 0)
+        self.assertEqual(row["bucket"], BUCKET_POTENTIAL_UPDATE)
+        self.assertEqual(row["holdout_reason"], "skip_classify_db_hit")
+        self.assertEqual(row["update_site_type"], "Monopole")
+        self.assertEqual(row["update_verified_site_source"], "FCC")
+        self.assertEqual(row["match_source"], "FCC")
+
+    def test_ambiguous_cluster_does_not_apply_or_classify(self):
+        from enrichment.constants import BUCKET_OTHER
+
+        cursor = FakeCursor(
+            fcc_rows=[
+                {
+                    "ID": 1,
+                    "ASR_Number": "A",
+                    "Latitude_Decimal": 43.00008,
+                    "Longitude_Decimal": -89.0,
+                },
+                {
+                    "ID": 2,
+                    "ASR_Number": "B",
+                    "Latitude_Decimal": 43.00012,
+                    "Longitude_Decimal": -89.0,
+                },
+            ]
+        )
+        row, called = self._process(cursor)
+        self.assertEqual(called["n"], 0)
+        self.assertEqual(row["bucket"], BUCKET_OTHER)
+        self.assertEqual(row["holdout_reason"], "db_only_no_unique_hit")
+        self.assertEqual(row["update_site_type"], "")
+
+    def test_no_hit_does_not_classify(self):
+        from enrichment.constants import BUCKET_OTHER
+
+        row, called = self._process(FakeCursor())
+        self.assertEqual(called["n"], 0)
+        self.assertEqual(row["bucket"], BUCKET_OTHER)
+        self.assertEqual(row["holdout_reason"], "db_only_no_unique_hit")
 
 
 if __name__ == "__main__":

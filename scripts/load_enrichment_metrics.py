@@ -24,7 +24,13 @@ from dotenv import load_dotenv
 load_dotenv(ROOT / ".env")
 
 from enrichment.constants import DETAIL_CSV  # noqa: E402
-from enrichment.metrics import RUNS_JSONL, SITES_JSONL, _read_jsonl, apply_slice_fields  # noqa: E402
+from enrichment.metrics import (  # noqa: E402
+    RUNS_JSONL,
+    SITES_JSONL,
+    _read_jsonl,
+    apply_slice_fields,
+    kpi_eligible,
+)
 from paths import metrics_dir, runs_dir  # noqa: E402
 from enrichment.metrics_store import (  # noqa: E402
     ensure_tables,
@@ -73,9 +79,12 @@ def _snaps_from_ledger(
             continue
         detail = _detail_by_id(rid)
         snap = dict(run)
-        snap["site_records"] = [
-            _hydrate_site(rec, detail) for rec in by_run.get(rid, [])
-        ]
+        records = []
+        for rec in by_run.get(rid, []):
+            if not kpi_eligible(rec):
+                continue
+            records.append(_hydrate_site(rec, detail))
+        snap["site_records"] = records
         snaps.append(snap)
     return snaps
 

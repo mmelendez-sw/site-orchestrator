@@ -33,6 +33,7 @@ def auto_skip_classify_reason(
     confident_m: float = PROXIMITY_CONFIDENT_M,
     on_structure_m: float = AUTO_SKIP_ON_STRUCTURE_M,
     ambiguity_gap_m: float = PROXIMITY_AMBIGUITY_GAP_M,
+    force: bool = False,
 ) -> str | None:
     """Operator label when imagery can be skipped, else None.
 
@@ -40,7 +41,9 @@ def auto_skip_classify_reason(
     extra FCC/TowerSource rows share the pad — that is collocation, not a
     wrong-neighbor choice. 10–25 m clusters still need the 75 m gap.
     """
-    if not _env_flag("AUTO_SKIP_CLASSIFY", default="1") or hit is None:
+    if hit is None:
+        return None
+    if not force and not _env_flag("AUTO_SKIP_CLASSIFY", default="1"):
         return None
     dist = float(hit.distance_m)
     if dist > float(confident_m):

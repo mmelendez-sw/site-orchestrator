@@ -11,6 +11,8 @@ Leadership KPIs for site-type enrichment live in **Symphony_dev**. They are writ
 5. Optional Salesforce **apply**.
 6. **`record_run`**: append local JSONL, rewrite `kpis.json`, upsert SQL (fail-open).
 
+`DB_ONLY=1` run headers still record this-run hits and misses. Cumulative KPIs (`kpis.json`, `vEnrichmentKpis`) only ingest unique FCC/TowerSource hits from those runs, not the misses. Dry-run (`APPLY=0`) updates the local ledger but does not upsert SQL.
+
 If SQL is down, CSVs and Salesforce writes still stand. Set `METRICS_SQL=0` to skip SQL and keep JSONL only.
 
 Local fallback (same grain as SQL):

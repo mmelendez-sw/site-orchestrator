@@ -204,8 +204,13 @@ def snapshot_run(
     *,
     run_id: str,
     apply_summary: dict[str, Any] | None = None,
+    db_only: bool = False,
 ) -> dict[str, Any]:
     sites = [site_record(r, run_id=run_id) for r in rows if str(r.get("Id") or "")]
+    if db_only:
+        for rec in sites:
+            rec["db_only"] = True
+            rec["include_in_kpis"] = rec.get("outcome") == "applied_db_skip"
     n = len(sites)
     empty_nm = sum(1 for s in sites if s["empty_to_nearmap"])
     empty_rt = sum(1 for s in sites if s["empty_to_rooftop"])
@@ -253,6 +258,45 @@ def _append_jsonl(path: Path, records: Iterable[dict[str, Any]]) -> None:
             handle.write(json.dumps(rec, ensure_ascii=True) + "\n")
 
 
+def _rewrite_jsonl(path: Path, records: Iterable[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as handle:
+        for rec in records:
+            handle.write(json.dumps(rec, ensure_ascii=True) + "\n")
+    tmp.replace(path)
+
+
+def drop_runs_from_ledger(
+    run_ids: Iterable[str],
+    *,
+    root: Path | None = None,
+) -> dict[str, Any]:
+    """Remove run headers and site rows from the local JSONL ledger, then rewrite kpis.json."""
+    drop = {str(rid).strip() for rid in run_ids if str(rid).strip()}
+    root = root or metrics_dir()
+    runs = [
+        rec
+        for rec in _read_jsonl(root / RUNS_JSONL)
+        if str(rec.get("run_id") or "") not in drop
+    ]
+    sites = [
+        rec
+        for rec in _read_jsonl(root / SITES_JSONL)
+        if str(rec.get("run_id") or "") not in drop
+    ]
+    _rewrite_jsonl(root / RUNS_JSONL, runs)
+    _rewrite_jsonl(root / SITES_JSONL, sites)
+    kpis = rollup_kpis(sites)
+    (root / KPIS_JSON).write_text(json.dumps(kpis, indent=2), encoding="utf-8")
+    return {
+        "dropped": sorted(drop),
+        "runs": len(runs),
+        "site_rows": len(sites),
+        "kpis": kpis,
+    }
+
+
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     if not path.is_file():
         return []
@@ -270,10 +314,21 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def kpi_eligible(rec: dict[str, Any]) -> bool:
+    """False for DB-only misses. Unique FCC/TowerSource hits still roll up."""
+    if rec.get("include_in_kpis") is False:
+        return False
+    if str(rec.get("holdout_reason") or "").strip() == "db_only_no_unique_hit":
+        return False
+    return True
+
+
 def rollup_kpis(site_rows: list[dict[str, Any]]) -> dict[str, Any]:
     """Last observation per Salesforce Id."""
     latest: dict[str, dict[str, Any]] = {}
     for rec in site_rows:
+        if not kpi_eligible(rec):
+            continue
         sid = str(rec.get("Id") or "")
         if sid:
             latest[sid] = rec
@@ -394,19 +449,38 @@ def record_run(
     run_dir: Path,
     detail_rows: list[dict[str, Any]],
     apply_summary: dict[str, Any] | None = None,
+    db_only: bool = False,
+    write_sql: bool | None = None,
 ) -> dict[str, Any]:
-    """Append this run to the cumulative ledger and refresh kpis.json."""
+    """Append this run to the ledger and refresh kpis.json.
+
+    The run header always keeps this-run successes and misses.
+    Cumulative KPIs / ``sites.jsonl`` only take KPI-eligible site rows
+    (DB-only unique hits; not DB-only misses). ``write_sql=False`` skips
+    Azure SQL (dry-run APPLY=0).
+    """
     run_id = run_dir.name
-    snap = snapshot_run(detail_rows, run_id=run_id, apply_summary=apply_summary)
+    snap = snapshot_run(
+        detail_rows,
+        run_id=run_id,
+        apply_summary=apply_summary,
+        db_only=db_only,
+    )
+    snap["db_only"] = db_only
+    ledger_sites = [rec for rec in snap["site_records"] if kpi_eligible(rec)]
     root = metrics_dir()
     root.mkdir(parents=True, exist_ok=True)
     run_rec = {k: v for k, v in snap.items() if k != "site_records"}
     _append_jsonl(root / RUNS_JSONL, [run_rec])
-    _append_jsonl(root / SITES_JSONL, snap["site_records"])
+    _append_jsonl(root / SITES_JSONL, ledger_sites)
     kpis = rollup_kpis(_read_jsonl(root / SITES_JSONL))
     (root / KPIS_JSON).write_text(json.dumps(kpis, indent=2), encoding="utf-8")
     snap["kpis"] = kpis
-    from enrichment.metrics_store import try_write_snapshot
+    should_sql = bool(apply_summary) if write_sql is None else write_sql
+    if should_sql:
+        from enrichment.metrics_store import try_write_snapshot
 
-    try_write_snapshot(snap)
+        sql_snap = dict(snap)
+        sql_snap["site_records"] = ledger_sites
+        try_write_snapshot(sql_snap)
     return snap

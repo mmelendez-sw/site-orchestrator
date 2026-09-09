@@ -2,10 +2,22 @@
 
 Salesforce blank Site_Type → FCC/TowerSource → NAIP/Nearmap + Gemini/Claude → auto-apply.
 Holdouts dequeue unless DEQUEUE_HOLDOUTS=0. Optional env: STATES, STAGES,
-LIMIT, IDS, CARRIER_LIKE, METRO_CLASSIFICATION, LLM_CLASSIFIED, APPLY,
-DEQUEUE_HOLDOUTS, RUN_DIR, VERBOSE, RERUN_SITES_FROM, RERUN_HOLDOUTS_FROM,
-REUSE_CHIPS_FROM.
+LIMIT, OFFSET, SKIP_FROM, IDS, CARRIER_LIKE, METRO_CLASSIFICATION,
+LLM_CLASSIFIED, APPLY, DEQUEUE_HOLDOUTS, RUN_DIR, VERBOSE,
+RERUN_SITES_FROM, RERUN_HOLDOUTS_FROM, REUSE_CHIPS_FROM, DB_ONLY.
 Set APPLY=0 to classify without Salesforce writes.
+Set DB_ONLY=1 to skip all imagery. Every processed site is marked
+LLM_Classified=true (no LLM_Holdout). Unique FCC/TowerSource hits ≤25 m
+(or on-structure ≤5 m) also write Site_Type and coords. Remaining blanks
+stay classified true until you flip them back (blank Site_Type +
+LLM_Classified=true). Default DB-only stages: New/Unreviewed,
+Enhanced/Unreviewed, Outreach, Outreach - Verified, Marketing (any owner).
+Override stages with STAGES or LEAD_STAGES (comma-separated).
+Set OWNERS=none (DB-only default) or a comma list. METRO_CLASSIFICATION=none
+includes every metro.
+LIMIT takes the first N remaining sites (stable ORDER BY Id). Processed
+rows leave the default queue via LLM_Classified=true; SKIP_FROM still
+skips prior-run Ids if you re-pull.
 Set DEQUEUE_HOLDOUTS=0 to apply successes only and leave failed holdouts as-is.
 Set RERUN_SITES_FROM to run folder names or YYYY-MM-DD prefixes to re-classify
 those runs' Outreach - Verified Ids (bypasses LLM_Holdout / blank Site_Type).
@@ -36,7 +48,15 @@ from enrichment.outputs import (  # noqa: E402
     site_ids_from_run_specs,
 )
 from enrichment.naip_classify import resolve_reuse_chips_dirs  # noqa: E402
-from enrichment.sf_ops import parse_carrier_like, parse_metro_classification  # noqa: E402
+from enrichment.sf_ops import (  # noqa: E402
+    parse_carrier_like,
+    parse_metro_classification,
+    parse_owners,
+)
+from enrichment.constants import (  # noqa: E402
+    DB_ONLY_STAGE_FILTER,
+    DEFAULT_OWNER_FILTER,
+)
 from paths import ensure_data_layout, runs_dir  # noqa: E402
 from salesforce.sf_client import SalesforceClient  # noqa: E402
 
@@ -70,10 +90,11 @@ def main() -> int:
         runs_dir()
     )
     limit_raw = (os.environ.get("LIMIT") or "").strip()
+    offset_raw = (os.environ.get("OFFSET") or os.environ.get("QUEUE_OFFSET") or "").strip()
     states = _csv_env("STATES")
     if states:
         states = [s.upper() for s in states]
-    stages = _csv_env("STAGES")
+    stages = _csv_env("STAGES") or _csv_env("LEAD_STAGES")
     site_ids = _csv_env("IDS") or []
     rerun_sites_from = _csv_env("RERUN_SITES_FROM")
     if rerun_sites_from:
@@ -114,27 +135,59 @@ def main() -> int:
             f"  reuse chips from {len(reuse_chips_dirs)} folder(s) (no Nearmap fetch)",
             flush=True,
         )
+    skip_from = _csv_env("SKIP_FROM")
+    skip_ids: list[str] = []
+    if skip_from:
+        skip_ids = site_ids_from_run_specs(
+            skip_from,
+            runs_root=runs_dir(),
+            stages=[],
+        )
+        print(
+            f"  skip already attempted from {', '.join(skip_from)}: "
+            f"{len(skip_ids)} id(s)",
+            flush=True,
+        )
 
     print("=== AUTHENTICATE SALESFORCE ===", flush=True)
     sf_client = SalesforceClient()
     print("  authenticated", flush=True)
 
+    db_only = _flag("DB_ONLY") or _flag("SKIP_CLASSIFY")
+    if db_only:
+        print(
+            "  DB_ONLY=1 — FCC/TowerSource unique hits only (no Nearmap/NAIP/LLM)",
+            flush=True,
+        )
+        if not stages:
+            stages = list(DB_ONLY_STAGE_FILTER)
+        print(f"  lead stages: {', '.join(stages)}", flush=True)
+    dequeue_default = "0" if db_only else "1"
+    owners = parse_owners(
+        os.environ.get("OWNERS"),
+        default=None if db_only else DEFAULT_OWNER_FILTER,
+    )
+
     summary = run_enrichment(
         sf_client=sf_client,
         run_dir=run_dir,
         limit=int(limit_raw) if limit_raw else None,
+        offset=int(offset_raw) if offset_raw else 0,
+        skip_ids=skip_ids or None,
         site_ids=site_ids or None,
         states=states,
         stages=stages,
+        owners=owners,
         carrier_like=parse_carrier_like(os.environ.get("CARRIER_LIKE")),
         metro_classification=parse_metro_classification(
             os.environ.get("METRO_CLASSIFICATION")
         ),
         llm_classified=_flag("LLM_CLASSIFIED", "0"),
         apply=_flag("APPLY", "1"),
-        dequeue_holdouts=_flag("DEQUEUE_HOLDOUTS", "1"),
+        dequeue_holdouts=_flag("DEQUEUE_HOLDOUTS", dequeue_default),
         verbose=_flag("VERBOSE"),
         reuse_chips_dirs=reuse_chips_dirs,
+        db_only=db_only,
     )
     failed = (summary.get("apply") or {}).get("failed", 0)
     return 0 if not failed else 2

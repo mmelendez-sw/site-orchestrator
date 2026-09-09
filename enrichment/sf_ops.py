@@ -57,6 +57,26 @@ def parse_metro_classification(
     return _parse_optional_filter(raw, default=default)
 
 
+def parse_owners(
+    raw: str | None,
+    *,
+    default: Sequence[str] | None = DEFAULT_OWNER_FILTER,
+) -> list[str] | None:
+    """Owner__c IN-list from env/CLI.
+
+    Unset/blank → ``default``. ``none`` / ``all`` / ``*`` omit the owner filter.
+    Comma-separated picklist values otherwise.
+    """
+    text = "" if raw is None else str(raw).strip()
+    if not text:
+        if default is None:
+            return None
+        return [str(v).strip() for v in default if str(v).strip()]
+    if text.lower() in {"none", "all", "*"}:
+        return None
+    return [part.strip() for part in text.split(",") if part.strip()] or None
+
+
 def _parse_optional_filter(raw: str | None, *, default: str | None) -> str | None:
     text = "" if raw is None else str(raw).strip()
     if not text:
@@ -79,7 +99,7 @@ def _soql_in(values: Sequence[str]) -> str:
 def build_blank_site_type_query(
     *,
     stages: Sequence[str] = DEFAULT_STAGE_FILTER,
-    owners: Sequence[str] = DEFAULT_OWNER_FILTER,
+    owners: Sequence[str] | None = DEFAULT_OWNER_FILTER,
     fields: Sequence[str] = SF_QUERY_FIELDS,
     carrier_like: str | None = None,
     metro_classification: str | None = "Major NFL Metro",
@@ -92,6 +112,7 @@ def build_blank_site_type_query(
     Pass None/"" to skip the carrier filter (the default).
     `metro_classification` filters Metro_Classification__c with an exact
     match (default Major NFL Metro). Pass None/"" to skip.
+    `owners` None/empty omits the Owner__c filter (any owner).
     `states` filters Site_State__c IN (...); pass None/empty for all states.
     `llm_classified` defaults False (sites not yet LLM-classified). True selects
     the already-flagged NFL re-queue.
@@ -107,14 +128,16 @@ def build_blank_site_type_query(
         "Site_Latitude__c != null AND Site_Latitude__c != ''",
         "Site_Longitude__c != null AND Site_Longitude__c != ''",
         f"Stage__c IN ({_soql_in(stages)})",
-        f"Owner__c IN ({_soql_in(owners)})",
     ]
+    owner_list = [str(v).strip() for v in (owners or []) if str(v).strip()]
+    if owner_list:
+        clauses.append(f"Owner__c IN ({_soql_in(owner_list)})")
     requested = {str(s).strip() for s in stages if str(s).strip()}
     excluded = [
         stage for stage in EXCLUDED_STAGE_FILTER if stage not in requested
     ]
     if excluded:
-        clauses.insert(-1, f"Stage__c NOT IN ({_soql_in(excluded)})")
+        clauses.append(f"Stage__c NOT IN ({_soql_in(excluded)})")
     carrier = (carrier_like or "").strip()
     if carrier:
         escaped = carrier.replace("\\", "\\\\").replace("'", "\\'")
@@ -127,7 +150,11 @@ def build_blank_site_type_query(
     ]
     if clean_states:
         clauses.append(f"Site_State__c IN ({_soql_in(clean_states)})")
-    return f"SELECT {field_list} FROM {OBJECT_NAME} WHERE " + " AND ".join(clauses)
+    return (
+        f"SELECT {field_list} FROM {OBJECT_NAME} WHERE "
+        + " AND ".join(clauses)
+        + " ORDER BY Id"
+    )
 
 
 def build_sites_by_ids_query(
@@ -164,7 +191,7 @@ def query_blank_site_type_sites(
     client: SalesforceClient,
     *,
     stages: Sequence[str] = DEFAULT_STAGE_FILTER,
-    owners: Sequence[str] = DEFAULT_OWNER_FILTER,
+    owners: Sequence[str] | None = DEFAULT_OWNER_FILTER,
     carrier_like: str | None = None,
     metro_classification: str | None = "Major NFL Metro",
     states: Sequence[str] | None = None,
@@ -261,16 +288,26 @@ def build_update_payload(
     return payload
 
 
-def apply_queue_flags(payload: dict[str, Any]) -> dict[str, Any]:
+def apply_queue_flags(
+    payload: dict[str, Any],
+    *,
+    write_holdout: bool = True,
+) -> dict[str, Any]:
     """Set LLM_Classified / LLM_Holdout from whether site enrichment fields are present.
 
     Successful enrichment: LLM_Classified=true, LLM_Holdout=false.
     Holdout / dequeue-only: LLM_Classified=false, LLM_Holdout=true.
+    ``write_holdout=False`` (DB-only batch): LLM_Classified=true for every
+    processed row (hits and misses). Hits also get site fields. Do not write
+    LLM_Holdout.
     """
     out = dict(payload)
     is_enrich = is_enrichment_payload(out)
-    out["LLM_Classified__c"] = is_enrich
-    out["LLM_Holdout__c"] = not is_enrich
+    if write_holdout:
+        out["LLM_Classified__c"] = is_enrich
+        out["LLM_Holdout__c"] = not is_enrich
+    else:
+        out["LLM_Classified__c"] = True
     return out
 
 
@@ -312,16 +349,20 @@ def apply_one_update(
     *,
     dry_run: bool = False,
     verbose: bool = True,
+    write_holdout: bool = True,
 ) -> dict[str, Any]:
     """Update a single enrichment candidate row; never raises.
 
     Eligible tower/rooftop writes: LLM_Classified__c=true, LLM_Holdout__c=false.
     Holdouts (no site fields): LLM_Classified__c=false, LLM_Holdout__c=true so
     they leave the blank-Site_Type enrichment queue and are flagged as holdouts.
+    ``write_holdout=False`` (DB-only): every row gets LLM_Classified=true and
+    no LLM_Holdout. Hits also get site type/coords. Duplicate holdout fallback
+    is skipped.
 
     On DUPLICATES_DETECTED for an enrichment payload, retries once with
     LLM_Classified__c=false + LLM_Holdout__c=true + Test_Batch_Flag__c so the
-    site still dequeues.
+    site still dequeues — unless ``write_holdout`` is false.
     """
     from enrichment import progress
 
@@ -336,15 +377,17 @@ def apply_one_update(
             verified_site_source=(row.get("update_verified_site_source") or None)
             or None,
         )
-        payload = apply_queue_flags(site_fields)
+        payload = apply_queue_flags(site_fields, write_holdout=write_holdout)
     else:
         # Preserve explicit queue flags on prebuilt payloads; fill any gaps.
         payload = dict(payload)
         is_enrich = is_enrichment_payload(payload)
         if "LLM_Classified__c" not in payload:
-            payload["LLM_Classified__c"] = is_enrich
-        if "LLM_Holdout__c" not in payload:
+            payload["LLM_Classified__c"] = True if not write_holdout else is_enrich
+        if write_holdout and "LLM_Holdout__c" not in payload:
             payload["LLM_Holdout__c"] = not is_enrich
+        if not write_holdout:
+            payload.pop("LLM_Holdout__c", None)
     entry = {
         "Id": sf_id,
         "success": False,
@@ -383,6 +426,7 @@ def apply_one_update(
     except Exception as exc:  # noqa: BLE001 — per-row resilience
         if (
             not dry_run
+            and write_holdout
             and sf_id
             and _is_duplicates_detected(exc)
             and is_enrichment_payload(payload)
@@ -443,6 +487,8 @@ def _format_apply_result(
             "dequeued (LLM_Classified=false, LLM_Holdout=true, Test_Batch_Flag)"
         )
     if not is_enrichment_payload(payload):
+        if payload.get("LLM_Classified__c") and payload.get("LLM_Holdout__c") is not True:
+            return f"{prefix} | LLM_Classified=true (no site type)"
         return (
             f"{prefix} | dequeued "
             "(LLM_Classified=false, LLM_Holdout=true, no site fields written)"
@@ -462,6 +508,7 @@ def apply_updates_idempotent(
     *,
     dry_run: bool = True,
     verbose: bool = True,
+    write_holdout: bool = True,
 ) -> list[dict[str, Any]]:
     """Apply updates one row at a time; failures are logged and skipped."""
     from enrichment import progress
@@ -478,7 +525,13 @@ def apply_updates_idempotent(
                 index, len(rows_list), sf_id=sf_id, address=address
             )
         row_t0 = time.monotonic()
-        entry = apply_one_update(client, row, dry_run=dry_run, verbose=False)
+        entry = apply_one_update(
+            client,
+            row,
+            dry_run=dry_run,
+            verbose=False,
+            write_holdout=write_holdout,
+        )
         row_elapsed = time.monotonic() - row_t0
         entry["index"] = index
         if verbose:
