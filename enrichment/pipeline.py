@@ -129,10 +129,11 @@ def run_enrichment(
     (LLM_Classified=false, LLM_Holdout=true) unless ``dequeue_holdouts``
     is false — then holdouts are left untouched.
 
-    ``db_only`` never fetches NAIP/Nearmap/Gemini/Claude. Every processed
-    row is marked LLM_Classified=true (no LLM_Holdout). Unique FCC or
+    ``db_only`` never fetches NAIP/Nearmap/Gemini/Claude. Successful rows
+    are marked LLM_Classified=true (no LLM_Holdout). Unique FCC or
     TowerSource hits also write Site_Type and coords. Blanks stay classified
-    true until a later flip.
+    true until a later flip. Failed Salesforce writes retry once with
+    LLM_Classified=false and LLM_Holdout=true.
     """
     run_dir.mkdir(parents=True, exist_ok=True)
     chip_dir = run_dir / "chips"
@@ -819,8 +820,12 @@ def stamp_apply_status(
         if entry.get("success"):
             payload = entry.get("payload")
             payload = payload if isinstance(payload, dict) else {}
-            if is_enrichment_payload(payload) or payload.get("LLM_Classified__c"):
+            if is_enrichment_payload(payload):
                 row["sf_update_status"] = "updated"
+            elif payload.get("LLM_Holdout__c") is True:
+                row["sf_update_status"] = "dequeued"
+            elif payload.get("LLM_Classified__c"):
+                row["sf_update_status"] = "classified_only"
             else:
                 row["sf_update_status"] = "dequeued"
             row["sf_update_error"] = ""

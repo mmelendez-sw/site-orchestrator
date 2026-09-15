@@ -246,13 +246,11 @@ def parse_sf_lat_lng(row: dict[str, Any]) -> tuple[float, float] | None:
         return None
 
 
-# Fallback when Site_Duplicate_Rule blocks enrichment field writes.
-# LLM_Classified=false removes the site from the blank-Site_Type enrichment queue.
-# LLM_Holdout=true marks that enrichment could not write site fields.
-DUPLICATE_FALLBACK_PAYLOAD = {
+# When the Salesforce write fails, dequeue with the same flags as imagery holdouts.
+# LLM_Classified=false + LLM_Holdout=true leaves the blank-Site_Type queue.
+APPLY_ERROR_HOLDOUT_PAYLOAD = {
     "LLM_Classified__c": False,
     "LLM_Holdout__c": True,
-    "Test_Batch_Flag__c": True,
 }
 
 
@@ -311,16 +309,15 @@ def apply_queue_flags(
     return out
 
 
-def _is_duplicates_detected(exc: BaseException) -> bool:
-    """True when Salesforce rejected the update for Site_Duplicate_Rule."""
-    return "DUPLICATES_DETECTED" in str(exc)
-
-
-def _is_duplicate_fallback_payload(payload: dict[str, Any] | None) -> bool:
+def _is_holdout_fallback_payload(payload: dict[str, Any] | None) -> bool:
+    """True when this payload is the error/holdout dequeue (no site fields)."""
     if not payload:
         return False
-    return set(payload) == set(DUPLICATE_FALLBACK_PAYLOAD) and all(
-        payload.get(key) == value for key, value in DUPLICATE_FALLBACK_PAYLOAD.items()
+    return (
+        payload.get("LLM_Classified__c") is False
+        and payload.get("LLM_Holdout__c") is True
+        and "Site_Type__c" not in payload
+        and "Site_Latitude__c" not in payload
     )
 
 
@@ -356,13 +353,11 @@ def apply_one_update(
     Eligible tower/rooftop writes: LLM_Classified__c=true, LLM_Holdout__c=false.
     Holdouts (no site fields): LLM_Classified__c=false, LLM_Holdout__c=true so
     they leave the blank-Site_Type enrichment queue and are flagged as holdouts.
-    ``write_holdout=False`` (DB-only): every row gets LLM_Classified=true and
-    no LLM_Holdout. Hits also get site type/coords. Duplicate holdout fallback
-    is skipped.
+    ``write_holdout=False`` (DB-only): successful rows get LLM_Classified=true
+    and no LLM_Holdout. Hits also get site type/coords.
 
-    On DUPLICATES_DETECTED for an enrichment payload, retries once with
-    LLM_Classified__c=false + LLM_Holdout__c=true + Test_Batch_Flag__c so the
-    site still dequeues — unless ``write_holdout`` is false.
+    If the Salesforce write fails (duplicates, API errors), retries once with
+    LLM_Classified=false + LLM_Holdout=true so the site still dequeues.
     """
     from enrichment import progress
 
@@ -426,38 +421,36 @@ def apply_one_update(
     except Exception as exc:  # noqa: BLE001 — per-row resilience
         if (
             not dry_run
-            and write_holdout
             and sf_id
-            and _is_duplicates_detected(exc)
-            and is_enrichment_payload(payload)
-            and not _is_duplicate_fallback_payload(payload)
+            and not _is_holdout_fallback_payload(payload)
         ):
-            fallback = dict(DUPLICATE_FALLBACK_PAYLOAD)
+            fallback = dict(APPLY_ERROR_HOLDOUT_PAYLOAD)
             try:
                 update_site(client, sf_id, fallback, verbose=False)
                 entry["success"] = True
-                entry["status"] = "updated_llm_after_duplicate"
+                entry["status"] = "updated_holdout_after_error"
                 entry["payload"] = fallback
-                entry["error"] = f"fallback after DUPLICATES_DETECTED: {exc}"
+                entry["error"] = f"fallback after apply error: {exc}"
                 logger.warning(
-                    "enrichment blocked by duplicate for %s — dequeued LLM/Holdout/Test_Batch only",
+                    "SF write failed for %s — dequeued LLM_Holdout=true: %s",
                     sf_id,
+                    exc,
                 )
                 if verbose:
                     progress.warn(
-                        "SF duplicate blocked enrichment — "
-                        "dequeued (LLM_Classified=false, LLM_Holdout=true, Test_Batch_Flag)"
+                        "SF write failed — dequeued "
+                        "(LLM_Classified=false, LLM_Holdout=true)"
                     )
                 return entry
             except Exception as fallback_exc:  # noqa: BLE001
                 entry["error"] = (
-                    f"DUPLICATES_DETECTED fallback also failed: {fallback_exc} "
+                    f"holdout fallback also failed: {fallback_exc} "
                     f"(original: {exc})"
                 )
                 entry["status"] = "failed"
                 entry["payload"] = fallback
                 logger.warning(
-                    "duplicate fallback failed for %s: %s", sf_id, fallback_exc
+                    "holdout fallback failed for %s: %s", sf_id, fallback_exc
                 )
                 if verbose:
                     progress.warn(
@@ -481,10 +474,10 @@ def _format_apply_result(
 ) -> str:
     """Human-readable apply line: enrichment details, or holdout dequeue."""
     prefix = "SF dry-run OK (not written)" if dry_run else "SF updated"
-    if status == "updated_llm_after_duplicate":
+    if status == "updated_holdout_after_error":
         return (
-            f"{prefix} | duplicate fallback | "
-            "dequeued (LLM_Classified=false, LLM_Holdout=true, Test_Batch_Flag)"
+            f"{prefix} | apply error fallback | "
+            "dequeued (LLM_Classified=false, LLM_Holdout=true)"
         )
     if not is_enrichment_payload(payload):
         if payload.get("LLM_Classified__c") and payload.get("LLM_Holdout__c") is not True:

@@ -7,7 +7,7 @@ import os
 from datetime import datetime, timezone
 from typing import Any, Iterable
 
-from enrichment.metrics import rec_true
+from enrichment.metrics import rec_true, kpi_eligible
 from enrichment.metrics_ddl import ddl_statements
 
 logger = logging.getLogger(__name__)
@@ -182,19 +182,53 @@ def ensure_tables(cursor) -> None:
         cursor.execute(stmt)
 
 
+_EXISTING_WRITE_IDS = """
+SELECT DISTINCT SalesforceId
+FROM dbo.EnrichmentSiteOutcome
+WHERE Outcome IN (N'applied_rooftop', N'applied_tower', N'applied_db_skip', N'applied_other')
+  AND ISNULL(HoldoutReason, N'') <> N'db_only_no_unique_hit'
+  AND ISNULL(SfUpdateStatus, N'') NOT IN (
+        N'dry_run', N'failed', N'dequeued', N'classified_only', N'skipped'
+      )
+  AND (
+        SfUpdateStatus = N'updated'
+        OR (
+            (SfUpdateStatus IS NULL OR LTRIM(RTRIM(SfUpdateStatus)) IN (N'', N'pending'))
+            AND Outcome IN (N'applied_rooftop', N'applied_tower')
+        )
+      )
+"""
+
+
+def _salesforce_id(rec: dict[str, Any]) -> str:
+    return str(rec.get("Id") or rec.get("SalesforceId") or "").strip()
+
+
 def upsert_snapshot(cursor, snap: dict[str, Any]) -> int:
-    """Replace one run header + its site rows. Returns site count written."""
+    """Replace one run header + net-new successful write rows. Returns site count written."""
     run_id = str(snap.get("run_id") or "")
     if not run_id:
         raise ValueError("snapshot missing run_id")
     sites: Iterable[dict[str, Any]] = snap.get("site_records") or []
-    site_list = [s for s in sites if str(s.get("Id") or s.get("SalesforceId") or "")]
+    site_list = [
+        s
+        for s in sites
+        if _salesforce_id(s) and kpi_eligible(s)
+    ]
     cursor.execute("DELETE FROM dbo.EnrichmentSiteOutcome WHERE RunId = ?", run_id)
     cursor.execute(_UPSERT_RUN, run_row(snap))
+    cursor.execute(_EXISTING_WRITE_IDS)
+    existing = {str(row[0]) for row in cursor.fetchall() if row and row[0]}
+    written = 0
     for rec in site_list:
+        sid = _salesforce_id(rec)
+        if sid in existing:
+            continue
         row = site_row({**rec, "run_id": rec.get("run_id") or run_id})
         cursor.execute(_INSERT_SITE, row)
-    return len(site_list)
+        existing.add(sid)
+        written += 1
+    return written
 
 
 def write_snapshot(snap: dict[str, Any]) -> int:
@@ -224,6 +258,40 @@ def try_write_snapshot(snap: dict[str, Any]) -> None:
         logger.info("metrics SQL upsert run_id=%s sites=%s", snap.get("run_id"), n)
     except Exception:
         logger.exception("metrics SQL upsert skipped")
+
+
+def delete_all_site_outcomes(cursor) -> None:
+    """Empty the site fact table. Run headers stay; caller reloads writes."""
+    cursor.execute("DELETE FROM dbo.EnrichmentSiteOutcome")
+
+
+def delete_ineligible_site_rows(cursor) -> int:
+    """Remove holdouts, misses, and unconfirmed applies from the fact table."""
+    cursor.execute(
+        """
+        DELETE FROM dbo.EnrichmentSiteOutcome
+        WHERE NOT (
+            Outcome IN (
+                N'applied_rooftop', N'applied_tower',
+                N'applied_db_skip', N'applied_other'
+            )
+            AND ISNULL(HoldoutReason, N'') <> N'db_only_no_unique_hit'
+            AND ISNULL(SfUpdateStatus, N'') NOT IN (
+                N'dry_run', N'failed', N'dequeued',
+                N'classified_only', N'skipped'
+            )
+            AND (
+                SfUpdateStatus = N'updated'
+                OR (
+                    (SfUpdateStatus IS NULL
+                     OR LTRIM(RTRIM(SfUpdateStatus)) IN (N'', N'pending'))
+                    AND Outcome IN (N'applied_rooftop', N'applied_tower')
+                )
+            )
+        )
+        """
+    )
+    return int(cursor.rowcount or 0)
 
 
 def delete_run(run_id: str) -> None:

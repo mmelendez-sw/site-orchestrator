@@ -30,9 +30,12 @@ from enrichment.metrics import (  # noqa: E402
     _read_jsonl,
     apply_slice_fields,
     kpi_eligible,
+    refresh_kpis_from_ledger,
 )
 from paths import metrics_dir, runs_dir  # noqa: E402
 from enrichment.metrics_store import (  # noqa: E402
+    delete_all_site_outcomes,
+    delete_ineligible_site_rows,
     ensure_tables,
     upsert_snapshot,
 )
@@ -96,39 +99,85 @@ def main() -> int:
         action="store_true",
         help="Print counts; do not connect or write",
     )
+    parser.add_argument(
+        "--rebuild-sites",
+        action="store_true",
+        help="Delete all EnrichmentSiteOutcome rows, then reload net-new writes",
+    )
     args = parser.parse_args()
+    kpis = refresh_kpis_from_ledger()
+    print(
+        f"local unique_sites={kpis.get('unique_sites')} "
+        f"rooftop={kpis.get('rooftop_sf_writes')} "
+        f"tower={kpis.get('tower_sf_writes')} "
+        f"outcomes={kpis.get('outcomes')}"
+    )
     runs, sites = _load_ledger()
     snaps = _snaps_from_ledger(runs, sites)
-    print(f"ledger runs={len(runs)} site_rows={len(sites)} snaps={len(snaps)}")
+    eligible = sum(len(snap.get("site_records") or []) for snap in snaps)
+    print(
+        f"ledger runs={len(runs)} site_rows={len(sites)} "
+        f"eligible_write_rows={eligible} snaps={len(snaps)}"
+    )
     for snap in snaps:
-        print(
-            f"  {snap.get('run_id')}: sites={len(snap.get('site_records') or [])} "
-            f"applied_rooftop={snap.get('applied_rooftop')}"
-        )
+        n = len(snap.get("site_records") or [])
+        if n:
+            print(
+                f"  {snap.get('run_id')}: writes={n} "
+                f"applied_rooftop={snap.get('applied_rooftop')}"
+            )
     if args.dry_run:
         print("dry-run — no SQL writes")
         return 0
 
+    leftover = 0
+    row = fact = holdouts_left = None
     conn = connect_mssql()
     try:
         cursor = conn.cursor()
         ensure_tables(cursor)
+        if args.rebuild_sites:
+            delete_all_site_outcomes(cursor)
+            print("cleared dbo.EnrichmentSiteOutcome")
         total_sites = 0
         for snap in snaps:
             n = upsert_snapshot(cursor, snap)
             total_sites += n
-            print(f"  upserted {snap.get('run_id')} ({n} site rows)")
+            if n:
+                print(f"  upserted {snap.get('run_id')} ({n} site rows)")
+        leftover = delete_ineligible_site_rows(cursor)
         conn.commit()
+        cursor.execute("SELECT UniqueSites, RooftopSfWrites, TowerSfWrites, AppliedDbSkip FROM dbo.vEnrichmentKpis")
+        row = cursor.fetchone()
+        cursor.execute("SELECT COUNT(*) FROM dbo.EnrichmentSiteOutcome")
+        fact = cursor.fetchone()
+        cursor.execute(
+            """
+            SELECT COUNT(*) FROM dbo.EnrichmentSiteOutcome
+            WHERE Outcome NOT IN (
+                N'applied_rooftop', N'applied_tower',
+                N'applied_db_skip', N'applied_other'
+            )
+            """
+        )
+        holdouts_left = cursor.fetchone()
     except Exception:
         conn.rollback()
         raise
     finally:
         conn.close()
-    print(f"done — {len(snaps)} run(s), {total_sites} site row(s)")
+    print(f"done — {len(snaps)} run(s), {total_sites} site row(s) inserted")
+    print(f"removed leftover ineligible rows: {leftover}")
+    if row:
+        print(
+            f"sql UniqueSites={row[0]} RooftopSfWrites={row[1]} "
+            f"TowerSfWrites={row[2]} AppliedDbSkip={row[3]}"
+        )
+    if fact:
+        print(f"sql EnrichmentSiteOutcome rows={fact[0]}")
+    if holdouts_left:
+        print(f"sql non-apply outcome rows={holdouts_left[0]}")
     print("query: SELECT * FROM dbo.vEnrichmentKpis")
-    print("query: SELECT * FROM dbo.vEnrichmentKpisByState")
-    print("query: SELECT * FROM dbo.vEnrichmentKpisByMatchSource")
-    print("query: SELECT * FROM dbo.vEnrichmentSiteLatest")
     return 0
 
 

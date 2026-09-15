@@ -123,6 +123,9 @@ GO
 IF OBJECT_ID(N'dbo.vEnrichmentKpis', N'V') IS NOT NULL
     DROP VIEW dbo.vEnrichmentKpis;
 GO
+IF OBJECT_ID(N'dbo.vEnrichmentSiteLatestWrite', N'V') IS NOT NULL
+    DROP VIEW dbo.vEnrichmentSiteLatestWrite;
+GO
 IF OBJECT_ID(N'dbo.vEnrichmentSiteLatest', N'V') IS NOT NULL
     DROP VIEW dbo.vEnrichmentSiteLatest;
 GO
@@ -141,6 +144,41 @@ INNER JOIN (
         ) AS rn
     FROM dbo.EnrichmentSiteOutcome AS o2
     INNER JOIN dbo.EnrichmentRun AS r ON r.RunId = o2.RunId
+) AS latest
+    ON latest.SalesforceId = o.SalesforceId
+   AND latest.RunId = o.RunId
+    AND latest.rn = 1
+GO
+
+CREATE VIEW dbo.vEnrichmentSiteLatestWrite
+AS
+SELECT o.*
+FROM dbo.EnrichmentSiteOutcome AS o
+INNER JOIN (
+    SELECT
+        o2.SalesforceId,
+        o2.RunId,
+        ROW_NUMBER() OVER (
+            PARTITION BY o2.SalesforceId
+            ORDER BY r.RecordedAt DESC, o2.RunId DESC
+        ) AS rn
+    FROM dbo.EnrichmentSiteOutcome AS o2
+    INNER JOIN dbo.EnrichmentRun AS r ON r.RunId = o2.RunId
+    WHERE o2.Outcome IN (
+            N'applied_rooftop', N'applied_tower', N'applied_db_skip', N'applied_other'
+        )
+      AND ISNULL(o2.HoldoutReason, N'') <> N'db_only_no_unique_hit'
+      AND ISNULL(o2.SfUpdateStatus, N'') NOT IN (
+            N'dry_run', N'failed', N'dequeued', N'classified_only', N'skipped'
+          )
+      AND (
+            o2.SfUpdateStatus = N'updated'
+            OR (
+                (o2.SfUpdateStatus IS NULL
+                 OR LTRIM(RTRIM(o2.SfUpdateStatus)) IN (N'', N'pending'))
+                AND o2.Outcome IN (N'applied_rooftop', N'applied_tower')
+            )
+          )
 ) AS latest
     ON latest.SalesforceId = o.SalesforceId
    AND latest.RunId = o.RunId
@@ -187,7 +225,7 @@ SELECT
         / NULLIF(COUNT(*), 0)
         AS decimal(6,3)
     ) AS TotalWriteRate
-FROM dbo.vEnrichmentSiteLatest
+FROM dbo.vEnrichmentSiteLatestWrite
 GO
 
 CREATE VIEW dbo.vEnrichmentKpisByState
@@ -231,7 +269,7 @@ SELECT
         / NULLIF(COUNT(*), 0)
         AS decimal(6,3)
     ) AS TotalWriteRate
-FROM dbo.vEnrichmentSiteLatest
+FROM dbo.vEnrichmentSiteLatestWrite
 GROUP BY SiteState
 GO
 
@@ -276,6 +314,6 @@ SELECT
         / NULLIF(COUNT(*), 0)
         AS decimal(6,3)
     ) AS TotalWriteRate
-FROM dbo.vEnrichmentSiteLatest
+FROM dbo.vEnrichmentSiteLatestWrite
 GROUP BY MatchSource
 GO

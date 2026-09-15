@@ -11,7 +11,7 @@ Leadership KPIs for site-type enrichment live in **Symphony_dev**. They are writ
 5. Optional Salesforce **apply**.
 6. **`record_run`**: append local JSONL, rewrite `kpis.json`, upsert SQL (fail-open).
 
-`DB_ONLY=1` run headers still record this-run hits and misses. Cumulative KPIs (`kpis.json`, `vEnrichmentKpis`) only ingest unique FCC/TowerSource hits from those runs, not the misses. Dry-run (`APPLY=0`) updates the local ledger but does not upsert SQL.
+`DB_ONLY=1` run headers still record this-run hits and misses. Cumulative KPIs (`kpis.json`, `vEnrichmentKpis`) count **distinct Salesforce Ids with a successful site-type/coords write** only: imagery applies and unique FCC/TowerSource hits that Salesforce actually accepted (`sf_update_status=updated`). Holdouts, classified-only flags, dry-runs, failed applies, and Ids already counted do not increment UniqueSites and are not inserted into `EnrichmentSiteOutcome` again. Dry-run (`APPLY=0`) updates the local run header but does not upsert SQL.
 
 If SQL is down, CSVs and Salesforce writes still stand. Set `METRICS_SQL=0` to skip SQL and keep JSONL only.
 
@@ -21,18 +21,19 @@ Local fallback (same grain as SQL):
 - `../site-orchestrator-data/metrics/sites.jsonl`
 - `../site-orchestrator-data/metrics/kpis.json` (last Salesforce Id wins)
 
-## Objects (2 tables, 4 views)
+## Objects (2 tables, 5 views)
 
 | Object | Kind | Grain |
 |---|---|---|
-| `dbo.EnrichmentRun` | table | one row per `run_id` |
-| `dbo.EnrichmentSiteOutcome` | table | `(RunId, SalesforceId)` |
-| `dbo.vEnrichmentSiteLatest` | view | last observation per Salesforce Id |
-| `dbo.vEnrichmentKpis` | view | last-Id-wins totals |
-| `dbo.vEnrichmentKpisByState` | view | last-Id-wins by `SiteState` |
-| `dbo.vEnrichmentKpisByMatchSource` | view | last-Id-wins by FCC / TowerSource / none |
+| `dbo.EnrichmentRun` | table | one row per `run_id` (this-run ops header) |
+| `dbo.EnrichmentSiteOutcome` | table | `(RunId, SalesforceId)` — net-new successful writes |
+| `dbo.vEnrichmentSiteLatest` | view | last observation per Salesforce Id (includes holdouts) |
+| `dbo.vEnrichmentSiteLatestWrite` | view | last successful enrichment write per Salesforce Id |
+| `dbo.vEnrichmentKpis` | view | UniqueSites = distinct successful writes |
+| `dbo.vEnrichmentKpisByState` | view | same grain by `SiteState` |
+| `dbo.vEnrichmentKpisByMatchSource` | view | same grain by FCC / TowerSource / none |
 
-Do not store last-wins KPIs on `EnrichmentRun`. That header is **this run only**. Retries must not double-count; use the views.
+Do not store last-wins KPIs on `EnrichmentRun`. That header is **this run only**. UniqueSites must not double-count retries; use `vEnrichmentSiteLatestWrite`.
 
 ## What belongs where
 
@@ -75,6 +76,7 @@ Do **not** store chips, prompts, raw model JSON, or dollar estimates (packs/toke
 SELECT * FROM dbo.vEnrichmentKpis;
 SELECT * FROM dbo.vEnrichmentKpisByState;
 SELECT * FROM dbo.vEnrichmentKpisByMatchSource;
+SELECT * FROM dbo.vEnrichmentSiteLatestWrite;
 SELECT * FROM dbo.vEnrichmentSiteLatest;
 SELECT * FROM dbo.EnrichmentRun ORDER BY RecordedAt DESC;
 ```

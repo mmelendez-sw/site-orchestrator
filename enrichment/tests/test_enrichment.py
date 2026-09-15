@@ -1090,7 +1090,7 @@ class _FakeClient:
 
 
 class DuplicateFallbackTests(unittest.TestCase):
-    def test_enrichment_duplicate_retries_llm_and_test_batch(self):
+    def test_enrichment_duplicate_retries_holdout(self):
         from enrichment.sf_ops import apply_one_update
 
         site = _FakeSiteSObject(fail_payloads_containing=["Site_Type__c"])
@@ -1109,15 +1109,71 @@ class DuplicateFallbackTests(unittest.TestCase):
         }
         entry = apply_one_update(client, row, dry_run=False, verbose=False)
         self.assertTrue(entry["success"])
-        self.assertEqual(entry["status"], "updated_llm_after_duplicate")
+        self.assertEqual(entry["status"], "updated_holdout_after_error")
         self.assertEqual(
             entry["payload"],
             {
                 "LLM_Classified__c": False,
                 "LLM_Holdout__c": True,
-                "Test_Batch_Flag__c": True,
             },
         )
+        self.assertEqual(len(site.calls), 2)
+
+    def test_db_only_duplicate_still_holdouts(self):
+        from enrichment.sf_ops import apply_one_update
+
+        site = _FakeSiteSObject(fail_payloads_containing=["Site_Type__c"])
+        client = _FakeClient(site)
+        row = {
+            "Id": "a0ZTEST000000011",
+            "naip_site_type": "tower",
+            "holdout_reason": "skip_classify_db_hit",
+            "payload": {
+                "Site_Latitude__c": 1.0,
+                "Site_Longitude__c": 2.0,
+                "Site_Type__c": "Monopole",
+                "Verified_Site__c": True,
+                "Verified_Site_Source__c": "FCC",
+                "LLM_Classified__c": True,
+            },
+        }
+        entry = apply_one_update(
+            client, row, dry_run=False, verbose=False, write_holdout=False
+        )
+        self.assertTrue(entry["success"])
+        self.assertEqual(entry["status"], "updated_holdout_after_error")
+        self.assertEqual(
+            entry["payload"],
+            {"LLM_Classified__c": False, "LLM_Holdout__c": True},
+        )
+        self.assertEqual(len(site.calls), 2)
+
+    def test_generic_sf_error_holdouts(self):
+        from enrichment.sf_ops import apply_one_update
+
+        class BoomSite(_FakeSiteSObject):
+            def update(self, record_id, payload):
+                self.calls.append((record_id, dict(payload)))
+                if payload.get("LLM_Holdout__c") is True:
+                    return 204
+                raise RuntimeError("UNABLE_TO_LOCK_ROW")
+
+        site = BoomSite()
+        entry = apply_one_update(
+            _FakeClient(site),
+            {
+                "Id": "a0ZTEST000000012",
+                "naip_site_type": "tower",
+                "payload": {
+                    "Site_Type__c": "Monopole",
+                    "LLM_Classified__c": True,
+                },
+            },
+            dry_run=False,
+            verbose=False,
+        )
+        self.assertTrue(entry["success"])
+        self.assertEqual(entry["status"], "updated_holdout_after_error")
         self.assertEqual(len(site.calls), 2)
 
     def test_holdout_dequeues_with_llm_classified_false(self):
@@ -1234,7 +1290,7 @@ class DuplicateFallbackTests(unittest.TestCase):
         self.assertTrue(entry["success"])
         self.assertEqual(entry["payload"]["Site_Type__c"], "Monopole")
 
-    def test_db_skip_blank_naip_without_site_type_still_fails(self):
+    def test_db_skip_blank_naip_without_site_type_holdouts(self):
         from enrichment.sf_ops import apply_one_update
 
         entry = apply_one_update(
@@ -1252,8 +1308,12 @@ class DuplicateFallbackTests(unittest.TestCase):
             dry_run=False,
             verbose=False,
         )
-        self.assertFalse(entry["success"])
-        self.assertIn("got blank", entry["error"])
+        self.assertTrue(entry["success"])
+        self.assertEqual(entry["status"], "updated_holdout_after_error")
+        self.assertEqual(
+            entry["payload"],
+            {"LLM_Classified__c": False, "LLM_Holdout__c": True},
+        )
 
 
 class GoldenRegressionTests(unittest.TestCase):
@@ -1443,11 +1503,13 @@ class CostPolicyTests(unittest.TestCase):
             )
         )
         holdout = apply_queue_flags({})
+        classified_only = {"LLM_Classified__c": True}
         rows = [
             {"Id": "a", "sf_update_status": "pending", "sf_update_error": ""},
             {"Id": "b", "sf_update_status": "pending", "sf_update_error": ""},
             {"Id": "c", "sf_update_status": "pending", "sf_update_error": ""},
             {"Id": "d", "sf_update_status": "skipped", "sf_update_error": ""},
+            {"Id": "e", "sf_update_status": "pending", "sf_update_error": ""},
         ]
         stamp_apply_status(
             rows,
@@ -1460,6 +1522,7 @@ class CostPolicyTests(unittest.TestCase):
                     "payload": enrich,
                     "error": "DUPLICATES_DETECTED",
                 },
+                {"Id": "e", "success": True, "payload": classified_only},
             ],
         )
         self.assertEqual(rows[0]["sf_update_status"], "updated")
@@ -1467,6 +1530,7 @@ class CostPolicyTests(unittest.TestCase):
         self.assertEqual(rows[2]["sf_update_status"], "failed")
         self.assertEqual(rows[2]["sf_update_error"], "DUPLICATES_DETECTED")
         self.assertEqual(rows[3]["sf_update_status"], "skipped")
+        self.assertEqual(rows[4]["sf_update_status"], "classified_only")
 
     def test_metrics_empty_to_rooftop_funnel(self):
         from enrichment.metrics import outcome_class, snapshot_run
@@ -1587,7 +1651,9 @@ class CostPolicyTests(unittest.TestCase):
         joined = "\n".join(batches)
         self.assertTrue(any("CREATE TABLE dbo.EnrichmentRun" in b for b in batches))
         self.assertTrue(any("CREATE VIEW dbo.vEnrichmentKpisByState" in b for b in batches))
+        self.assertTrue(any("CREATE VIEW dbo.vEnrichmentSiteLatestWrite" in b for b in batches))
         self.assertIn("SiteState", joined)
+        self.assertIn("vEnrichmentSiteLatestWrite", joined)
 
     def test_metrics_rollup_last_id_wins(self):
         from enrichment.metrics import rollup_kpis
@@ -1606,14 +1672,14 @@ class CostPolicyTests(unittest.TestCase):
                 {"Id": "c", "outcome": "applied_tower"},
             ]
         )
-        self.assertEqual(kpis["unique_sites"], 3)
+        self.assertEqual(kpis["unique_sites"], 2)
         self.assertEqual(kpis["rooftop_sf_writes"], 1)
         self.assertEqual(kpis["tower_sf_writes"], 1)
-        self.assertEqual(kpis["holdout_empty_confirmed"], 1)
+        self.assertEqual(kpis["holdout_empty_confirmed"], 0)
         self.assertEqual(kpis["naip_empty_to_rooftop_apply"], 1)
-        self.assertEqual(kpis["rooftop_write_rate"], 0.333)
-        self.assertEqual(kpis["tower_write_rate"], 0.333)
-        self.assertEqual(kpis["total_write_rate"], 0.667)
+        self.assertEqual(kpis["rooftop_write_rate"], 0.5)
+        self.assertEqual(kpis["tower_write_rate"], 0.5)
+        self.assertEqual(kpis["total_write_rate"], 1.0)
 
     def test_rollup_skips_db_only_misses_keeps_unique_hits(self):
         from enrichment.metrics import rollup_kpis, snapshot_run
@@ -1633,11 +1699,25 @@ class CostPolicyTests(unittest.TestCase):
                     "outcome": "applied_db_skip",
                     "include_in_kpis": True,
                     "db_only": True,
+                    "sf_update_status": "updated",
+                },
+                {
+                    "Id": "d",
+                    "outcome": "applied_db_skip",
+                    "db_only": True,
+                    "sf_update_status": "dequeued",
+                },
+                {
+                    "Id": "e",
+                    "outcome": "applied_db_skip",
+                    "db_only": True,
+                    "sf_update_status": "pending",
                 },
             ]
         )
         self.assertEqual(kpis["unique_sites"], 2)
         self.assertEqual(kpis["rooftop_sf_writes"], 1)
+        self.assertEqual(kpis["outcomes"].get("applied_db_skip"), 1)
         self.assertNotIn("holdout_other", kpis["outcomes"])
         snap = snapshot_run(
             [
@@ -1646,11 +1726,13 @@ class CostPolicyTests(unittest.TestCase):
                     "holdout_reason": "skip_classify_db_hit",
                     "bucket": "potential_update",
                     "update_site_type": "Monopole",
+                    "sf_update_status": "updated",
                 },
                 {
                     "Id": "miss",
                     "holdout_reason": "db_only_no_unique_hit",
                     "bucket": "other_or_else",
+                    "sf_update_status": "classified_only",
                 },
             ],
             run_id="db-only-test",
@@ -1661,6 +1743,24 @@ class CostPolicyTests(unittest.TestCase):
         by_id = {r["Id"]: r for r in snap["site_records"]}
         self.assertTrue(by_id["hit"]["include_in_kpis"])
         self.assertFalse(by_id["miss"]["include_in_kpis"])
+
+    def test_rollup_skips_already_written_salesforce_id(self):
+        from enrichment.metrics import kpi_eligible, rollup_kpis
+
+        first = {
+            "Id": "a",
+            "outcome": "applied_db_skip",
+            "sf_update_status": "updated",
+        }
+        retry = {
+            "Id": "a",
+            "outcome": "applied_db_skip",
+            "sf_update_status": "updated",
+            "run_id": "later",
+        }
+        self.assertTrue(kpi_eligible(first))
+        kpis = rollup_kpis([first, retry])
+        self.assertEqual(kpis["unique_sites"], 1)
 
     def test_drop_runs_from_ledger_rewrites_kpis(self):
         from enrichment.metrics import (

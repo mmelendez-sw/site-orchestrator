@@ -12,7 +12,7 @@ Set `APPLY=0` to classify and write CSVs without Salesforce updates. Optional en
 
 `CARRIER_LIKE` is the `Carrier_Leasing_Source__c` LIKE needle (unset = no carrier filter). Set `CARRIER_LIKE=NFL` to restrict to NFL sources. `METRO_CLASSIFICATION` is an exact `Metro_Classification__c` match (default `Major NFL Metro`). Set `METRO_CLASSIFICATION=none` to omit it. Enrichment does not write those fields. The queue defaults to `LLM_Classified__c = false`; set `LLM_CLASSIFIED=1` only to re-pull already-flagged rows.
 
-**DB-only (no Nearmap):** `DB_ONLY=1` walks blank-`Site_Type` sites in **New/Unreviewed, Enhanced/Unreviewed, Outreach, Outreach - Verified, Marketing**, any owner. Every processed site is marked `LLM_Classified=true` (no `LLM_Holdout`). Unique FCC/TowerSource hits also write site type and coords. Misses stay blank type and classified true until you flip them (`LLM_CLASSIFIED=1`, then set classified false). `SKIP_FROM` still skips Ids already in prior run CSVs. Change stages with `STAGES` or `LEAD_STAGES`.
+**DB-only (no Nearmap):** `DB_ONLY=1` walks blank-`Site_Type` sites in **New/Unreviewed, Enhanced/Unreviewed, Outreach, Outreach - Verified, Marketing**, any owner. Successful writes are `LLM_Classified=true` (no `LLM_Holdout`). Unique FCC/TowerSource hits also write site type and coords. Misses stay blank type and classified true until you flip them (`LLM_CLASSIFIED=1`, then set classified false). If a Salesforce update fails (duplicates, API errors), the apply retries once with `LLM_Classified=false` and `LLM_Holdout=true` so the site leaves the queue. `SKIP_FROM` still skips Ids already in prior run CSVs. Change stages with `STAGES` or `LEAD_STAGES`.
 
 ```powershell
 $env:DB_ONLY="1"
@@ -27,7 +27,7 @@ python -m enrichment
 
 Then set `APPLY=1` for live Salesforce writes. `Working-Connected` / `Qualified (Converted)` stay excluded unless listed in `STAGES`.
 
-Leadership KPIs land in Azure SQL (`dbo.EnrichmentRun` / `dbo.EnrichmentSiteOutcome`) at the end of `APPLY=1` runs. DB-only unique hits roll into cumulative KPIs; DB-only misses stay on the this-run header only. Details: [docs/enrichment-metrics.md](docs/enrichment-metrics.md).
+Leadership KPIs land in Azure SQL (`dbo.EnrichmentRun` / `dbo.EnrichmentSiteOutcome`) at the end of `APPLY=1` runs. UniqueSites is distinct Salesforce Ids with a successful site-type/coords write. DB-only unique hits count only when that write succeeds; misses, holdouts, and retries of an Id already counted stay off UniqueSites. Details: [docs/enrichment-metrics.md](docs/enrichment-metrics.md).
 
 ## Layout
 

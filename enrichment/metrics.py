@@ -210,7 +210,7 @@ def snapshot_run(
     if db_only:
         for rec in sites:
             rec["db_only"] = True
-            rec["include_in_kpis"] = rec.get("outcome") == "applied_db_skip"
+            rec["include_in_kpis"] = is_successful_sf_write(rec)
     n = len(sites)
     empty_nm = sum(1 for s in sites if s["empty_to_nearmap"])
     empty_rt = sum(1 for s in sites if s["empty_to_rooftop"])
@@ -297,6 +297,15 @@ def drop_runs_from_ledger(
     }
 
 
+def refresh_kpis_from_ledger(*, root: Path | None = None) -> dict[str, Any]:
+    """Rewrite kpis.json from sites.jsonl using UniqueSites write rules."""
+    root = root or metrics_dir()
+    sites = _read_jsonl(root / SITES_JSONL)
+    kpis = rollup_kpis(sites)
+    (root / KPIS_JSON).write_text(json.dumps(kpis, indent=2), encoding="utf-8")
+    return kpis
+
+
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     if not path.is_file():
         return []
@@ -314,17 +323,49 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
-def kpi_eligible(rec: dict[str, Any]) -> bool:
-    """False for DB-only misses. Unique FCC/TowerSource hits still roll up."""
-    if rec.get("include_in_kpis") is False:
+APPLIED_OUTCOMES = frozenset(
+    {"applied_rooftop", "applied_tower", "applied_db_skip", "applied_other"}
+)
+NON_WRITE_STATUS = frozenset(
+    {"dry_run", "failed", "dequeued", "classified_only", "skipped"}
+)
+
+
+def _sf_status(rec: dict[str, Any]) -> str:
+    return str(rec.get("sf_update_status") or "").strip().lower()
+
+
+def is_successful_sf_write(rec: dict[str, Any]) -> bool:
+    """True when Salesforce received site type/coords, not a holdout or classified-only flag."""
+    outcome = str(rec.get("outcome") or "").strip().lower()
+    if outcome not in APPLIED_OUTCOMES:
         return False
     if str(rec.get("holdout_reason") or "").strip() == "db_only_no_unique_hit":
         return False
-    return True
+    status = _sf_status(rec)
+    if status in NON_WRITE_STATUS:
+        return False
+    if status == "updated":
+        return True
+    if outcome == "applied_db_skip":
+        return False
+    # Legacy imagery rooftop/tower applies snapshotted as pending/blank.
+    return status in {"", "pending"}
+
+
+def kpi_eligible(rec: dict[str, Any]) -> bool:
+    """Cumulative UniqueSites: first successful Salesforce enrichment write only."""
+    if rec.get("include_in_kpis") is False:
+        return False
+    return is_successful_sf_write(rec)
 
 
 def rollup_kpis(site_rows: list[dict[str, Any]]) -> dict[str, Any]:
-    """Last observation per Salesforce Id."""
+    """Last successful Salesforce enrichment write per Id.
+
+    UniqueSites is distinct Ids that received site type/coords, not holdouts,
+    classified-only flags, dry-runs, or failed applies.
+    """
     latest: dict[str, dict[str, Any]] = {}
     for rec in site_rows:
         if not kpi_eligible(rec):
@@ -455,9 +496,10 @@ def record_run(
     """Append this run to the ledger and refresh kpis.json.
 
     The run header always keeps this-run successes and misses.
-    Cumulative KPIs / ``sites.jsonl`` only take KPI-eligible site rows
-    (DB-only unique hits; not DB-only misses). ``write_sql=False`` skips
-    Azure SQL (dry-run APPLY=0).
+    Cumulative KPIs / ``sites.jsonl`` / Azure SQL site rows only take a
+    Salesforce Id on its first successful enrichment write (site type/coords).
+    Holdouts, classified-only flags, dry-runs, and failed applies stay on
+    this-run only. ``write_sql=False`` skips Azure SQL (dry-run APPLY=0).
     """
     run_id = run_dir.name
     snap = snapshot_run(
@@ -467,13 +509,23 @@ def record_run(
         db_only=db_only,
     )
     snap["db_only"] = db_only
-    ledger_sites = [rec for rec in snap["site_records"] if kpi_eligible(rec)]
     root = metrics_dir()
     root.mkdir(parents=True, exist_ok=True)
+    prior_sites = _read_jsonl(root / SITES_JSONL)
+    already = {
+        str(rec.get("Id") or "")
+        for rec in prior_sites
+        if kpi_eligible(rec) and rec.get("Id")
+    }
+    ledger_sites = [
+        rec
+        for rec in snap["site_records"]
+        if kpi_eligible(rec) and str(rec.get("Id") or "") not in already
+    ]
     run_rec = {k: v for k, v in snap.items() if k != "site_records"}
     _append_jsonl(root / RUNS_JSONL, [run_rec])
     _append_jsonl(root / SITES_JSONL, ledger_sites)
-    kpis = rollup_kpis(_read_jsonl(root / SITES_JSONL))
+    kpis = rollup_kpis(prior_sites + ledger_sites)
     (root / KPIS_JSON).write_text(json.dumps(kpis, indent=2), encoding="utf-8")
     snap["kpis"] = kpis
     should_sql = bool(apply_summary) if write_sql is None else write_sql

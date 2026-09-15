@@ -7,7 +7,7 @@ LLM_CLASSIFIED, APPLY, DEQUEUE_HOLDOUTS, RUN_DIR, VERBOSE,
 RERUN_SITES_FROM, RERUN_HOLDOUTS_FROM, REUSE_CHIPS_FROM, DB_ONLY.
 Set APPLY=0 to classify without Salesforce writes.
 Set DB_ONLY=1 to skip all imagery. Every processed site is marked
-LLM_Classified=true (no LLM_Holdout). Unique FCC/TowerSource hits ≤25 m
+LLM_Classified=true (no LLM_Holdout on success). Unique FCC/TowerSource hits ≤25 m
 (or on-structure ≤5 m) also write Site_Type and coords. Remaining blanks
 stay classified true until you flip them back (blank Site_Type +
 LLM_Classified=true). Default DB-only stages: New/Unreviewed,
@@ -17,7 +17,8 @@ Set OWNERS=none (DB-only default) or a comma list. METRO_CLASSIFICATION=none
 includes every metro.
 LIMIT takes the first N remaining sites (stable ORDER BY Id). Processed
 rows leave the default queue via LLM_Classified=true; SKIP_FROM still
-skips prior-run Ids if you re-pull.
+skips prior-run Ids if you re-pull. Salesforce apply errors retry once
+with LLM_Classified=false and LLM_Holdout=true.
 Set DEQUEUE_HOLDOUTS=0 to apply successes only and leave failed holdouts as-is.
 Set RERUN_SITES_FROM to run folder names or YYYY-MM-DD prefixes to re-classify
 those runs' Outreach - Verified Ids (bypasses LLM_Holdout / blank Site_Type).
