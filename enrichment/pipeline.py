@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import json
 import logging
 import time
@@ -12,10 +13,11 @@ from typing import Any, Callable, Iterable
 from enrichment.bucketing import (
     bucket_classification,
     imagery_bucket,
+    naip_rooftop_confirm_decision,
     verified_source_for_match,
 )
 from enrichment.metrics import RUN_METRIC_KEYS, outcome_class, record_run
-from enrichment.naip_classify import classify_site_imagery
+from enrichment.naip_classify import classify_naip_only, classify_site_imagery
 from enrichment.constants import (
     APPLY_LOG_CSV,
     BUCKET_OTHER,
@@ -72,6 +74,49 @@ def default_run_dir(root: Path | None = None) -> Path:
     return base / f"{stamp}_sf_enrichment"
 
 
+_ALREADY_WRITTEN = frozenset({"updated", "classified_only", "dequeued"})
+
+
+def apply_paused_run(
+    *,
+    sf_client,
+    run_dir: Path,
+    apply: bool = True,
+    confirm_rooftop: bool = False,
+    db_only: bool = False,
+    dequeue_holdouts: bool = False,
+    verbose: bool = True,
+    max_sites: int | None = None,
+) -> dict[str, Any]:
+    """Apply Salesforce updates from a classify run that never reached stage 4/4.
+
+    Reads ``enrichment_detail.csv`` (rewritten after each site). Does not
+    re-query Salesforce or re-classify. Confirm path writes Site_Type +
+    LLM_Classified only for ``potential_update`` rows still pending.
+    """
+    path = run_dir / DETAIL_CSV
+    if not path.is_file():
+        raise FileNotFoundError(f"No {DETAIL_CSV} in {run_dir}")
+    with path.open(newline="", encoding="utf-8-sig") as handle:
+        detail_rows = list(csv.DictReader(handle))
+    if max_sites is not None:
+        detail_rows = detail_rows[: max(0, int(max_sites))]
+    if verbose:
+        progress.warn(
+            f"apply existing {run_dir.name}: {len(detail_rows)} classified row(s)"
+        )
+    return _write_and_apply_run(
+        sf_client=sf_client,
+        run_dir=run_dir,
+        detail_rows=detail_rows,
+        apply=apply,
+        dequeue_holdouts=dequeue_holdouts,
+        db_only=db_only,
+        confirm_rooftop=confirm_rooftop,
+        verbose=verbose,
+    )
+
+
 def apply_queue_window(
     sites: list[dict[str, Any]],
     *,
@@ -121,6 +166,7 @@ def run_enrichment(
     apply: bool = True,
     dequeue_holdouts: bool = True,
     reuse_chips_dirs: list[Path] | None = None,
+    confirm_rooftop: bool = False,
 ) -> dict[str, Any]:
     """Run proximity + NAIP/Nearmap/Claude enrichment, write CSVs, auto-apply.
 
@@ -134,6 +180,11 @@ def run_enrichment(
     TowerSource hits also write Site_Type and coords. Blanks stay classified
     true until a later flip. Failed Salesforce writes retry once with
     LLM_Classified=false and LLM_Holdout=true.
+
+    ``confirm_rooftop`` queries existing Site_Type=Rooftop rows, classifies
+    NAIP/Gemini for building-roof presence (not cellular gear), and writes
+    Site_Type + LLM_Classified=true when NAIP labels rooftop. Inconclusive
+    rows are left unchanged (no holdout).
     """
     run_dir.mkdir(parents=True, exist_ok=True)
     chip_dir = run_dir / "chips"
@@ -144,6 +195,7 @@ def run_enrichment(
             "START",
             f"offset={offset} | limit={limit!s} | "
             f"db_only={str(db_only).lower()} | "
+            f"confirm_rooftop={str(confirm_rooftop).lower()} | "
             f"stages={','.join(stages or list(DEFAULT_STAGE_FILTER))} | "
             f"run_dir={run_dir.name}"
             + (
@@ -154,15 +206,24 @@ def run_enrichment(
         )
 
     own_sql = False
-    if sql_connection is None:
-        if verbose:
-            progress.stage("1/4 CONNECT SQL")
-        sql_connection = connect_mssql()
-        own_sql = True
-        if verbose:
-            progress.result("connected")
+    if confirm_rooftop:
+        sql_connection = None
+        if classify_fn is None:
 
-    classify = None if db_only else (classify_fn or classify_site_imagery)
+            def classify(**kwargs):
+                return classify_naip_only(presence_only=True, **kwargs)
+
+        else:
+            classify = classify_fn
+    else:
+        if sql_connection is None:
+            if verbose:
+                progress.stage("1/4 CONNECT SQL")
+            sql_connection = connect_mssql()
+            own_sql = True
+            if verbose:
+                progress.result("connected")
+        classify = None if db_only else (classify_fn or classify_site_imagery)
 
     try:
         if sites is None:
@@ -180,13 +241,16 @@ def run_enrichment(
                 owner_filter = (
                     owners if owners is not None else list(DEFAULT_OWNER_FILTER)
                 )
-                if db_only and owners is None:
+                if (db_only or confirm_rooftop) and owners is None:
                     owner_filter = None
                 owner_label = ",".join(owner_filter) if owner_filter else "any"
+                queue_label = (
+                    "Site_Type=Rooftop" if confirm_rooftop else "blank Site_Type"
+                )
                 if verbose:
                     progress.stage(
                         "2/4 QUERY SALESFORCE",
-                        f"blank Site_Type | stages={stage_label} | "
+                        f"{queue_label} | stages={stage_label} | "
                         f"owners={owner_label} | "
                         f"carrier_like={carrier_like!r} | "
                         f"metro={metro_classification!r} | "
@@ -201,6 +265,7 @@ def run_enrichment(
                     metro_classification=metro_classification,
                     states=states,
                     llm_classified=llm_classified,
+                    site_type="Rooftop" if confirm_rooftop else None,
                 )
             if verbose:
                 progress.result(f"{len(sites)} site(s)")
@@ -221,163 +286,218 @@ def run_enrichment(
             progress.step(f"processing {len(sites)} of {queued}{suffix}")
 
         detail_rows: list[dict[str, Any]] = []
-        cursor = sql_connection.cursor()
+        cursor = sql_connection.cursor() if sql_connection is not None else None
         cluster_cache: list[dict[str, Any]] = []
 
-        for index, site in enumerate(sites, start=1):
-            sf_id = str(site.get("Id") or "")
-            address = progress.format_site_address(site)
-            if verbose:
-                progress.stage(
-                    f"3/4 SITE {index}/{len(sites)}",
-                    f"{sf_id} | {address}".strip(" |"),
-                )
-            else:
-                progress.row_count(
-                    index, len(sites), sf_id=sf_id, address=address
-                )
-            site_t0 = time.monotonic()
-            row = _process_site(
-                site,
-                cursor=cursor,
-                max_m=max_m,
-                skip_classify=skip_classify,
-                db_only=db_only,
-                classify_fn=classify,
-                chip_dir=chip_dir,
-                verbose=verbose,
-                cluster_cache=cluster_cache,
-                reuse_chips_dirs=reuse_chips_dirs,
-            )
-            row["outcome_class"] = outcome_class(row)
-            site_elapsed = time.monotonic() - site_t0
-            row.setdefault("sf_update_status", "")
-            row.setdefault("sf_update_error", "")
-            if row.get("bucket") == BUCKET_POTENTIAL_UPDATE:
-                row["sf_update_status"] = "pending"
-            else:
-                row["sf_update_status"] = "skipped"
-
-            detail_rows.append(row)
-            if verbose:
-                progress.result(
-                    f"{row.get('bucket')} | type={row.get('naip_site_type') or '—'} | "
-                    f"img={row.get('imagery_used') or '—'} | "
-                    f"tier={row.get('nearmap_tier') or '—'} | "
-                    f"ai={row.get('escalation_model') or row.get('primary_model') or '—'} | "
-                    f"src={row.get('update_verified_site_source') or '—'} | "
-                    f"sf={row.get('sf_update_status') or '—'}",
-                    elapsed_s=site_elapsed,
-                )
-            write_csv(run_dir / DETAIL_CSV, detail_rows, DETAIL_COLUMNS)
-
-        candidates = [r for r in detail_rows if r.get("bucket") == BUCKET_POTENTIAL_UPDATE]
-        holdouts = [
-            r
-            for r in detail_rows
-            if r.get("bucket") in {BUCKET_ROOFTOP, BUCKET_OTHER}
-        ]
-        if verbose:
-            progress.stage("4/4 WRITE CSVs", str(run_dir.name))
-        write_csv(run_dir / CANDIDATE_CSV, candidates, CANDIDATE_COLUMNS)
-        write_csv(run_dir / HOLDOUT_CSV, holdouts, HOLDOUT_COLUMNS)
-        if verbose:
-            progress.result(
-                f"updates={len(candidates)} holdouts={len(holdouts)} total={len(detail_rows)}"
-            )
-
-        apply_info: dict[str, Any] | None = None
-        if apply:
-            apply_rows = list(candidates)
-            if dequeue_holdouts or db_only:
-                apply_rows.extend(
-                    r
-                    for r in detail_rows
-                    if r.get("bucket") != BUCKET_POTENTIAL_UPDATE
-                )
-            if apply_rows:
-                batch_csv = run_dir / "_apply_batch.csv"
-                write_csv(batch_csv, apply_rows, DETAIL_COLUMNS)
-                apply_info = apply_candidate_csv(
-                    sf_client=sf_client,
-                    candidate_csv=batch_csv,
-                    run_dir=run_dir,
-                    apply=True,
-                    verbose=verbose,
-                    write_holdout=not db_only,
-                )
-                stamp_apply_status(
-                    detail_rows, apply_info.pop("results", None) or []
-                )
-                write_csv(run_dir / DETAIL_CSV, detail_rows, DETAIL_COLUMNS)
-                write_csv(
-                    run_dir / CANDIDATE_CSV,
-                    [
-                        r
-                        for r in detail_rows
-                        if r.get("bucket") == BUCKET_POTENTIAL_UPDATE
-                    ],
-                    CANDIDATE_COLUMNS,
-                )
-            else:
-                apply_info = {
-                    "total": 0,
-                    "success": 0,
-                    "dequeued_holdouts": 0,
-                    "failed": 0,
-                    "apply": True,
-                }
-        run_block: dict[str, Any] = {
-            "sites": len(detail_rows),
-            "applied_rooftop": sum(
-                1 for r in detail_rows if r.get("outcome_class") == "applied_rooftop"
-            ),
-            "applied_tower": sum(
-                1 for r in detail_rows if r.get("outcome_class") == "applied_tower"
-            ),
-            "sf_writes": (apply_info or {}).get("success", 0) if apply else 0,
-            "sf_holdouts_dequeued": (apply_info or {}).get("dequeued_holdouts", 0)
-            if apply
-            else 0,
-            "sf_write_failed": (apply_info or {}).get("failed", 0) if apply else 0,
-        }
-        kpis_block: dict[str, Any] | None = None
         try:
-            metrics_snap = record_run(
-                run_dir=run_dir,
-                detail_rows=detail_rows,
-                apply_summary=apply_info if apply else None,
-                db_only=db_only,
-                write_sql=bool(apply),
-            )
-            run_block = {
-                key: metrics_snap[key]
-                for key in ("run_id", *RUN_METRIC_KEYS)
-                if key in metrics_snap
-            }
-            kpis_block = metrics_snap.get("kpis")
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("metrics ledger skipped: %s", exc)
+            for index, site in enumerate(sites, start=1):
+                sf_id = str(site.get("Id") or "")
+                address = progress.format_site_address(site)
+                if verbose:
+                    progress.stage(
+                        f"3/4 SITE {index}/{len(sites)}",
+                        f"{sf_id} | {address}".strip(" |"),
+                    )
+                else:
+                    progress.row_count(
+                        index, len(sites), sf_id=sf_id, address=address
+                    )
+                site_t0 = time.monotonic()
+                row = _process_site(
+                    site,
+                    cursor=cursor,
+                    max_m=max_m,
+                    skip_classify=skip_classify,
+                    db_only=db_only,
+                    classify_fn=classify,
+                    chip_dir=chip_dir,
+                    verbose=verbose,
+                    cluster_cache=cluster_cache,
+                    reuse_chips_dirs=reuse_chips_dirs,
+                    confirm_rooftop=confirm_rooftop,
+                )
+                row["outcome_class"] = outcome_class(row)
+                site_elapsed = time.monotonic() - site_t0
+                row.setdefault("sf_update_status", "")
+                row.setdefault("sf_update_error", "")
+                if row.get("bucket") == BUCKET_POTENTIAL_UPDATE:
+                    row["sf_update_status"] = "pending"
+                else:
+                    row["sf_update_status"] = "skipped"
+
+                detail_rows.append(row)
+                if verbose:
+                    progress.result(
+                        f"{row.get('bucket')} | type={row.get('naip_site_type') or '—'} | "
+                        f"img={row.get('imagery_used') or '—'} | "
+                        f"tier={row.get('nearmap_tier') or '—'} | "
+                        f"ai={row.get('escalation_model') or row.get('primary_model') or '—'} | "
+                        f"src={row.get('update_verified_site_source') or '—'} | "
+                        f"sf={row.get('sf_update_status') or '—'}",
+                        elapsed_s=site_elapsed,
+                    )
+                write_csv(run_dir / DETAIL_CSV, detail_rows, DETAIL_COLUMNS)
+        except KeyboardInterrupt:
             if verbose:
-                progress.warn(f"metrics ledger skipped: {exc}")
-        summary = {
-            "run_dir": str(run_dir),
-            "run": run_block,
-            "kpis": kpis_block,
-            "apply": apply_info or {"failed": 0, "success": 0, "dequeued_holdouts": 0},
-        }
-        (run_dir / "summary.json").write_text(
-            json.dumps(summary, indent=2), encoding="utf-8"
+                progress.warn(
+                    f"stopped after {len(detail_rows)} classified site(s) — "
+                    "applying Salesforce updates for completed rows"
+                )
+
+        return _write_and_apply_run(
+            sf_client=sf_client,
+            run_dir=run_dir,
+            detail_rows=detail_rows,
+            apply=apply,
+            dequeue_holdouts=dequeue_holdouts,
+            db_only=db_only,
+            confirm_rooftop=confirm_rooftop,
+            verbose=verbose,
         )
-        if verbose:
-            progress.dump_summary(summary)
-        return summary
     finally:
         if own_sql:
             try:
                 sql_connection.close()
             except Exception:  # pragma: no cover
                 pass
+
+
+def _needs_sf_apply(row: dict[str, Any]) -> bool:
+    status = str(row.get("sf_update_status") or "").strip().lower()
+    return status not in _ALREADY_WRITTEN
+
+
+def _write_and_apply_run(
+    *,
+    sf_client,
+    run_dir: Path,
+    detail_rows: list[dict[str, Any]],
+    apply: bool,
+    dequeue_holdouts: bool,
+    db_only: bool,
+    confirm_rooftop: bool,
+    verbose: bool,
+) -> dict[str, Any]:
+    """Write run CSVs and optionally apply Salesforce updates."""
+    candidates = [
+        r for r in detail_rows if r.get("bucket") == BUCKET_POTENTIAL_UPDATE
+    ]
+    holdouts = [
+        r
+        for r in detail_rows
+        if r.get("bucket") in {BUCKET_ROOFTOP, BUCKET_OTHER}
+    ]
+    if verbose:
+        progress.stage("4/4 WRITE CSVs", str(run_dir.name))
+    write_csv(run_dir / CANDIDATE_CSV, candidates, CANDIDATE_COLUMNS)
+    write_csv(run_dir / HOLDOUT_CSV, holdouts, HOLDOUT_COLUMNS)
+    if verbose:
+        progress.result(
+            f"updates={len(candidates)} holdouts={len(holdouts)} total={len(detail_rows)}"
+        )
+
+    apply_info: dict[str, Any] | None = None
+    if apply:
+        apply_rows = [r for r in candidates if _needs_sf_apply(r)]
+        if not confirm_rooftop and (dequeue_holdouts or db_only):
+            apply_rows.extend(
+                r
+                for r in detail_rows
+                if r.get("bucket") != BUCKET_POTENTIAL_UPDATE and _needs_sf_apply(r)
+            )
+        if apply_rows:
+            batch_csv = run_dir / "_apply_batch.csv"
+            write_csv(batch_csv, apply_rows, DETAIL_COLUMNS)
+            apply_info = apply_candidate_csv(
+                sf_client=sf_client,
+                candidate_csv=batch_csv,
+                run_dir=run_dir,
+                apply=True,
+                verbose=verbose,
+                write_holdout=not db_only and not confirm_rooftop,
+                error_holdout=not confirm_rooftop,
+            )
+            stamp_apply_status(
+                detail_rows, apply_info.pop("results", None) or []
+            )
+            write_csv(run_dir / DETAIL_CSV, detail_rows, DETAIL_COLUMNS)
+            write_csv(
+                run_dir / CANDIDATE_CSV,
+                [
+                    r
+                    for r in detail_rows
+                    if r.get("bucket") == BUCKET_POTENTIAL_UPDATE
+                ],
+                CANDIDATE_COLUMNS,
+            )
+        else:
+            apply_info = {
+                "total": 0,
+                "success": 0,
+                "dequeued_holdouts": 0,
+                "failed": 0,
+                "apply": True,
+            }
+    else:
+        for row in detail_rows:
+            if row.get("sf_update_status") == "pending":
+                row["sf_update_status"] = "dry_run"
+        write_csv(run_dir / DETAIL_CSV, detail_rows, DETAIL_COLUMNS)
+        write_csv(
+            run_dir / CANDIDATE_CSV,
+            [
+                r
+                for r in detail_rows
+                if r.get("bucket") == BUCKET_POTENTIAL_UPDATE
+            ],
+            CANDIDATE_COLUMNS,
+        )
+    run_block: dict[str, Any] = {
+        "sites": len(detail_rows),
+        "applied_rooftop": sum(
+            1 for r in detail_rows if r.get("outcome_class") == "applied_rooftop"
+        ),
+        "applied_tower": sum(
+            1 for r in detail_rows if r.get("outcome_class") == "applied_tower"
+        ),
+        "sf_writes": (apply_info or {}).get("success", 0) if apply else 0,
+        "sf_holdouts_dequeued": (apply_info or {}).get("dequeued_holdouts", 0)
+        if apply
+        else 0,
+        "sf_write_failed": (apply_info or {}).get("failed", 0) if apply else 0,
+    }
+    kpis_block: dict[str, Any] | None = None
+    try:
+        metrics_snap = record_run(
+            run_dir=run_dir,
+            detail_rows=detail_rows,
+            apply_summary=apply_info if apply else None,
+            db_only=db_only,
+            confirm_rooftop=confirm_rooftop,
+            write_sql=bool(apply),
+        )
+        run_block = {
+            key: metrics_snap[key]
+            for key in ("run_id", *RUN_METRIC_KEYS)
+            if key in metrics_snap
+        }
+        kpis_block = metrics_snap.get("kpis")
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("metrics ledger skipped: %s", exc)
+        if verbose:
+            progress.warn(f"metrics ledger skipped: {exc}")
+    summary = {
+        "run_dir": str(run_dir),
+        "run": run_block,
+        "kpis": kpis_block,
+        "apply": apply_info or {"failed": 0, "success": 0, "dequeued_holdouts": 0},
+    }
+    (run_dir / "summary.json").write_text(
+        json.dumps(summary, indent=2), encoding="utf-8"
+    )
+    if verbose:
+        progress.dump_summary(summary)
+    return summary
 
 
 def _process_site(
@@ -392,6 +512,7 @@ def _process_site(
     verbose: bool = True,
     cluster_cache: list[dict[str, Any]] | None = None,
     reuse_chips_dirs: list[Path] | None = None,
+    confirm_rooftop: bool = False,
 ) -> dict[str, Any]:
     sf_id = str(site.get("Id") or "")
     coords = parse_sf_lat_lng(site)
@@ -480,115 +601,128 @@ def _process_site(
     if verbose:
         progress.step(f"SF pin: {sf_lat:.6f}, {sf_lng:.6f}")
 
-    if verbose:
-        progress.stage("PROXIMITY", f"≤{max_m:g} m")
-    addr_lat = None
-    addr_lng = None
-    address_query = build_site_address(site)
-    if address_query:
-        base["address_query"] = address_query
-        geo = geocode_census(address_query)
-        if geo:
-            addr_lat, addr_lng = geo["lat"], geo["lng"]
-            base["address_lat"] = addr_lat
-            base["address_lng"] = addr_lng
-            base["address_geocode_source"] = geo.get("source") or "census"
-            base["address_matched"] = geo.get("matched") or ""
-            offset_m = haversine_meters(sf_lat, sf_lng, addr_lat, addr_lng)
-            base["pin_address_offset_m"] = round(offset_m, 1)
-            mismatch = pin_address_is_mismatch(offset_m)
-            base["pin_address_mismatch"] = mismatch
-            if verbose:
-                extra = ""
-                if mismatch:
-                    extra = " — far mismatch, pick pin vs Census before Nearmap"
-                elif should_compare_rooftop_hosts(offset_m, db_backed=False):
-                    extra = " — rooftop host compare if no FCC/TS hit"
-                progress.result(
-                    f"Census address {offset_m:.0f} m from pin{extra}"
-                )
-    try:
-        hit = find_proximity_hit(
-            cursor,
-            sf_lat,
-            sf_lng,
-            max_m=max_m,
-            address_lat=addr_lat,
-            address_lng=addr_lng,
-        )
-    except Exception as exc:  # noqa: BLE001
-        if verbose:
-            progress.warn(f"SQL proximity failed: {exc}")
-        base["error"] = f"sql_proximity_failed: {exc}"
-        base["holdout_reason"] = "sql_error"
-        return base
-
-    if hit is not None:
-        base["match_source"] = describe_match(hit)
-        base["match_distance_m"] = round(hit.distance_m, 2)
-        base["match_selection_reason"] = hit.selection_reason or ""
-        base["match_candidate_count"] = (
-            hit.candidate_count if hit.candidate_count is not None else ""
-        )
-        base["match_runner_up_gap_m"] = (
-            hit.runner_up_gap_m if hit.runner_up_gap_m is not None else ""
-        )
-        base["match_record_id"] = hit.record_id or ""
-        base["match_asr_number"] = hit.asr_number or ""
-        base["match_asset_type"] = hit.asset_type or ""
-        classify_lat, classify_lng = hit.latitude, hit.longitude
-        db_lat, db_lng = hit.latitude, hit.longitude
-        base["classify_coord_source"] = f"db:{base['match_source']}"
-        if verbose:
-            reason = hit.selection_reason or "nearest"
-            progress.result(
-                f"{base['match_source']} @ {hit.distance_m:.1f} m ({reason})"
-            )
-    else:
-        db_lat = db_lng = None
-        classify_lat, classify_lng = sf_lat, sf_lng
-        base["classify_coord_source"] = "sf_pin"
-        if verbose:
-            if should_compare_rooftop_hosts(
-                base.get("pin_address_offset_m") or None, db_backed=False
-            ):
-                progress.result(
-                    "no tower DB hit → rooftop path "
-                    "(pick host building before Nearmap)"
-                )
-            else:
-                progress.result("no DB hit → classify on SF pin")
-
+    hit = None
+    db_lat = db_lng = None
+    addr_lat = addr_lng = None
+    classify_lat, classify_lng = sf_lat, sf_lng
     base["classify_lat"] = classify_lat
     base["classify_lng"] = classify_lng
+    base["classify_coord_source"] = "sf_pin"
 
-    skip_reason = auto_skip_classify_reason(hit, force=db_only)
-    if db_only:
-        if skip_reason is not None and hit is not None:
-            if verbose:
-                progress.step(f"db-only unique hit ({skip_reason})")
-            return _stamp_unique_db_update(base, hit, classify_lat, classify_lng)
+    if confirm_rooftop:
         if verbose:
-            progress.step("db-only — no unique FCC/TowerSource hit (no imagery)")
-        base["bucket"] = BUCKET_OTHER
-        base["holdout_reason"] = "db_only_no_unique_hit"
-        return base
-
-    auto_skip = skip_classify or skip_reason is not None
-    if auto_skip:
+            progress.step("NAIP rooftop confirm (no FCC/TowerSource, no Nearmap)")
+    if not confirm_rooftop:
         if verbose:
-            progress.step(
-                "skip classify"
-                if skip_classify
-                else f"auto skip classify ({skip_reason})"
+            progress.stage("PROXIMITY", f"≤{max_m:g} m")
+        addr_lat = None
+        addr_lng = None
+        address_query = build_site_address(site)
+        if address_query:
+            base["address_query"] = address_query
+            geo = geocode_census(address_query)
+            if geo:
+                addr_lat, addr_lng = geo["lat"], geo["lng"]
+                base["address_lat"] = addr_lat
+                base["address_lng"] = addr_lng
+                base["address_geocode_source"] = geo.get("source") or "census"
+                base["address_matched"] = geo.get("matched") or ""
+                offset_m = haversine_meters(sf_lat, sf_lng, addr_lat, addr_lng)
+                base["pin_address_offset_m"] = round(offset_m, 1)
+                mismatch = pin_address_is_mismatch(offset_m)
+                base["pin_address_mismatch"] = mismatch
+                if verbose:
+                    extra = ""
+                    if mismatch:
+                        extra = " — far mismatch, pick pin vs Census before Nearmap"
+                    elif should_compare_rooftop_hosts(offset_m, db_backed=False):
+                        extra = " — rooftop host compare if no FCC/TS hit"
+                    progress.result(
+                        f"Census address {offset_m:.0f} m from pin{extra}"
+                    )
+        try:
+            hit = find_proximity_hit(
+                cursor,
+                sf_lat,
+                sf_lng,
+                max_m=max_m,
+                address_lat=addr_lat,
+                address_lng=addr_lng,
             )
-        if hit is not None:
-            return _stamp_unique_db_update(base, hit, classify_lat, classify_lng)
-        base["bucket"] = BUCKET_OTHER
-        base["holdout_reason"] = "skip_classify_no_db_hit"
-        return base
+        except Exception as exc:  # noqa: BLE001
+            if verbose:
+                progress.warn(f"SQL proximity failed: {exc}")
+            base["error"] = f"sql_proximity_failed: {exc}"
+            base["holdout_reason"] = "sql_error"
+            return base
 
-    if cluster_cache is not None and hit is None:
+        if hit is not None:
+            base["match_source"] = describe_match(hit)
+            base["match_distance_m"] = round(hit.distance_m, 2)
+            base["match_selection_reason"] = hit.selection_reason or ""
+            base["match_candidate_count"] = (
+                hit.candidate_count if hit.candidate_count is not None else ""
+            )
+            base["match_runner_up_gap_m"] = (
+                hit.runner_up_gap_m if hit.runner_up_gap_m is not None else ""
+            )
+            base["match_record_id"] = hit.record_id or ""
+            base["match_asr_number"] = hit.asr_number or ""
+            base["match_asset_type"] = hit.asset_type or ""
+            classify_lat, classify_lng = hit.latitude, hit.longitude
+            db_lat, db_lng = hit.latitude, hit.longitude
+            base["classify_coord_source"] = f"db:{base['match_source']}"
+            if verbose:
+                reason = hit.selection_reason or "nearest"
+                progress.result(
+                    f"{base['match_source']} @ {hit.distance_m:.1f} m ({reason})"
+                )
+        else:
+            db_lat = db_lng = None
+            classify_lat, classify_lng = sf_lat, sf_lng
+            base["classify_coord_source"] = "sf_pin"
+            if verbose:
+                if should_compare_rooftop_hosts(
+                    base.get("pin_address_offset_m") or None, db_backed=False
+                ):
+                    progress.result(
+                        "no tower DB hit → rooftop path "
+                        "(pick host building before Nearmap)"
+                    )
+                else:
+                    progress.result("no DB hit → classify on SF pin")
+
+        base["classify_lat"] = classify_lat
+        base["classify_lng"] = classify_lng
+
+    if not confirm_rooftop:
+        skip_reason = auto_skip_classify_reason(hit, force=db_only)
+        if db_only:
+            if skip_reason is not None and hit is not None:
+                if verbose:
+                    progress.step(f"db-only unique hit ({skip_reason})")
+                return _stamp_unique_db_update(base, hit, classify_lat, classify_lng)
+            if verbose:
+                progress.step("db-only — no unique FCC/TowerSource hit (no imagery)")
+            base["bucket"] = BUCKET_OTHER
+            base["holdout_reason"] = "db_only_no_unique_hit"
+            return base
+
+        auto_skip = skip_classify or skip_reason is not None
+        if auto_skip:
+            if verbose:
+                progress.step(
+                    "skip classify"
+                    if skip_classify
+                    else f"auto skip classify ({skip_reason})"
+                )
+            if hit is not None:
+                return _stamp_unique_db_update(base, hit, classify_lat, classify_lng)
+            base["bucket"] = BUCKET_OTHER
+            base["holdout_reason"] = "skip_classify_no_db_hit"
+            return base
+
+    if cluster_cache is not None and hit is None and not confirm_rooftop:
         reuse = find_cluster_match(
             cluster_cache, float(classify_lat), float(classify_lng)
         )
@@ -747,14 +881,20 @@ def _process_site(
         except (TypeError, ValueError):
             pass
 
-    decision = bucket_classification(
-        match_source=base["match_source"],
-        classified=classified,
-        db_lat=db_lat,
-        db_lng=db_lng,
-        sf_lat=sf_lat,
-        sf_lng=sf_lng,
-    )
+    if confirm_rooftop:
+        decision = naip_rooftop_confirm_decision(
+            classified,
+            existing_site_type=str(site.get("Site_Type__c") or ""),
+        )
+    else:
+        decision = bucket_classification(
+            match_source=base["match_source"],
+            classified=classified,
+            db_lat=db_lat,
+            db_lng=db_lng,
+            sf_lat=sf_lat,
+            sf_lng=sf_lng,
+        )
     base.update(decision)
     if (
         cluster_cache is not None
@@ -842,6 +982,7 @@ def apply_candidate_csv(
     apply: bool = False,
     verbose: bool = True,
     write_holdout: bool = True,
+    error_holdout: bool = True,
 ) -> dict[str, Any]:
     """Apply enrichment rows one at a time (idempotent on failure)."""
     import csv
@@ -863,6 +1004,7 @@ def apply_candidate_csv(
         dry_run=not apply,
         verbose=verbose,
         write_holdout=write_holdout,
+        error_holdout=error_holdout,
     )
     out_dir = run_dir or candidate_csv.parent
     out_dir.mkdir(parents=True, exist_ok=True)

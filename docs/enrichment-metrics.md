@@ -11,7 +11,7 @@ Leadership KPIs for site-type enrichment live in **Symphony_dev**. They are writ
 5. Optional Salesforce **apply**.
 6. **`record_run`**: append local JSONL, rewrite `kpis.json`, upsert SQL (fail-open).
 
-`DB_ONLY=1` run headers still record this-run hits and misses. Cumulative KPIs (`kpis.json`, `vEnrichmentKpis`) count **distinct Salesforce Ids with a successful site-type/coords write** only: imagery applies and unique FCC/TowerSource hits that Salesforce actually accepted (`sf_update_status=updated`). Holdouts, classified-only flags, dry-runs, failed applies, and Ids already counted do not increment UniqueSites and are not inserted into `EnrichmentSiteOutcome` again. Dry-run (`APPLY=0`) updates the local run header but does not upsert SQL.
+`DB_ONLY=1` run headers still record this-run hits and misses. Cumulative UniqueSites (`kpis.json`, `vEnrichmentKpis`) is **distinct Salesforce Ids with `sf_update_status=updated`** only (site type/coords actually accepted), including `CONFIRM_ROOFTOP=1` writes that Salesforce accepted. Holdouts, classified-only flags, dry-runs (`APPLY=0` / `pending`), failed applies, and Ids already counted do not increment UniqueSites. `APPLY=0` may write a local run header (`apply_enabled=0`) but does not append UniqueSites, rewrite `kpis.json`, or upsert SQL.
 
 If SQL is down, CSVs and Salesforce writes still stand. Set `METRICS_SQL=0` to skip SQL and keep JSONL only.
 

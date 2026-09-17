@@ -168,17 +168,7 @@ INNER JOIN (
             N'applied_rooftop', N'applied_tower', N'applied_db_skip', N'applied_other'
         )
       AND ISNULL(o2.HoldoutReason, N'') <> N'db_only_no_unique_hit'
-      AND ISNULL(o2.SfUpdateStatus, N'') NOT IN (
-            N'dry_run', N'failed', N'dequeued', N'classified_only', N'skipped'
-          )
-      AND (
-            o2.SfUpdateStatus = N'updated'
-            OR (
-                (o2.SfUpdateStatus IS NULL
-                 OR LTRIM(RTRIM(o2.SfUpdateStatus)) IN (N'', N'pending'))
-                AND o2.Outcome IN (N'applied_rooftop', N'applied_tower')
-            )
-          )
+      AND o2.SfUpdateStatus = N'updated'
 ) AS latest
     ON latest.SalesforceId = o.SalesforceId
    AND latest.RunId = o.RunId

@@ -73,6 +73,17 @@ DB_ONLY_STAGE_FILTER = (
     "Unqualified"
 )
 
+# NAIP rooftop confirm: already Site_Type=Rooftop. Override with STAGES.
+CONFIRM_ROOFTOP_STAGE_FILTER = (
+    "New/Unreviewed",
+    "Enhanced/Unreviewed",
+    "Outreach",
+    "Outreach - Verified",
+    "Marketing",
+    "Working-Connected",
+    "Working - Connected",
+)
+
 # Hard exclusion unless the caller explicitly lists the stage in STAGES.
 EXCLUDED_STAGE_FILTER = (
     "Working-Connected",

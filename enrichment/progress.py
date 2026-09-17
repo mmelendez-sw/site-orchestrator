@@ -12,6 +12,19 @@ _stage_t0: float | None = None
 _stage_title: str = ""
 
 
+def _safe_print(*args: Any, **kwargs: Any) -> None:
+    """Print without crashing on cp1252 consoles (checkmark, arrows, dashes)."""
+    try:
+        print(*args, **kwargs)
+    except UnicodeEncodeError:
+        encoding = getattr(kwargs.get("file") or sys.stdout, "encoding", None) or "ascii"
+        safe_args = [
+            str(arg).encode(encoding, errors="replace").decode(encoding, errors="replace")
+            for arg in args
+        ]
+        print(*safe_args, **kwargs)
+
+
 def format_duration(seconds: float) -> str:
     """Human-readable duration for terminal output."""
     if seconds < 0:
@@ -55,13 +68,13 @@ def stage(title: str, detail: str | None = None) -> None:
     _stage_title = title
 
     line = f"\n=== STAGE: {title} ===  [run {format_duration(now - _run_t0)}]"
-    print(line, flush=True)
+    _safe_print(line, flush=True)
     if detail:
-        print(f"    {detail}", flush=True)
+        _safe_print(f"    {detail}", flush=True)
 
 
 def step(message: str) -> None:
-    print(f"  → {message}", flush=True)
+    _safe_print(f"  -> {message}", flush=True)
 
 
 def row_count(
@@ -72,9 +85,9 @@ def row_count(
     address: str = "",
 ) -> None:
     """Compact per-row progress: count, Salesforce Id, address, run elapsed."""
-    sid = (sf_id or "").strip() or "—"
-    addr = (address or "").strip() or "—"
-    print(
+    sid = (sf_id or "").strip() or "-"
+    addr = (address or "").strip() or "-"
+    _safe_print(
         f"[{index}/{total}] {sid} | {addr} | run {format_duration(run_elapsed())}",
         flush=True,
     )
@@ -93,12 +106,12 @@ def format_site_address(row: dict[str, Any]) -> str:
 def result(message: str, *, elapsed_s: float | None = None) -> None:
     """Print a success line; elapsed_s overrides stage elapsed when provided."""
     seconds = stage_elapsed() if elapsed_s is None else elapsed_s
-    print(f"  ✓ {message}  ({format_duration(seconds)})", flush=True)
+    _safe_print(f"  + {message}  ({format_duration(seconds)})", flush=True)
 
 
 def warn(message: str, *, elapsed_s: float | None = None) -> None:
     seconds = stage_elapsed() if elapsed_s is None else elapsed_s
-    print(
+    _safe_print(
         f"  ! {message}  ({format_duration(seconds)})",
         flush=True,
         file=sys.stderr,
@@ -113,10 +126,10 @@ def dump_summary(summary: dict[str, Any]) -> None:
     run_id = (run or {}).get("run_id") or Path(str(summary.get("run_dir") or "")).name
     stage("COMPLETE — THIS RUN", str(run_id or summary.get("run_dir") or ""))
     for line in metric_lines(run if isinstance(run, dict) else {}, RUN_METRIC_KEYS):
-        print(line, flush=True)
+        _safe_print(line, flush=True)
     kpis = summary.get("kpis") if isinstance(summary.get("kpis"), dict) else None
     if kpis:
         stage("CUMULATIVE KPIs", "last Salesforce Id wins")
         for line in metric_lines(kpis, KPI_METRIC_KEYS):
-            print(line, flush=True)
-    print(f"    elapsed: {format_duration(run_elapsed())}", flush=True)
+            _safe_print(line, flush=True)
+    _safe_print(f"    elapsed: {format_duration(run_elapsed())}", flush=True)

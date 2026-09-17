@@ -8,7 +8,7 @@ There is no upload-template or CSV-import step. Run CSVs under `../site-orchestr
 python -m enrichment
 ```
 
-Set `APPLY=0` to classify and write CSVs without Salesforce updates. Optional env: `STATES`, `STAGES`, `LIMIT`, `OFFSET`, `SKIP_FROM`, `IDS`, `CARRIER_LIKE`, `METRO_CLASSIFICATION`, `LLM_CLASSIFIED`, `RUN_DIR`, `VERBOSE`, `METRICS_SQL`, `DEQUEUE_HOLDOUTS`, `DB_ONLY`. The queue defaults to `Stage__c = 'Outreach - Verified'` with no `LIMIT`. Set `STAGES` to a comma-separated picklist list to widen it.
+Set `APPLY=0` to classify and write CSVs without Salesforce updates. Optional env: `STATES`, `STAGES`, `LIMIT`, `OFFSET`, `SKIP_FROM`, `IDS`, `CARRIER_LIKE`, `METRO_CLASSIFICATION`, `LLM_CLASSIFIED`, `RUN_DIR`, `VERBOSE`, `METRICS_SQL`, `DEQUEUE_HOLDOUTS`, `DB_ONLY`, `CONFIRM_ROOFTOP`. The queue defaults to `Stage__c = 'Outreach - Verified'` with no `LIMIT`. Set `STAGES` to a comma-separated picklist list to widen it.
 
 `CARRIER_LIKE` is the `Carrier_Leasing_Source__c` LIKE needle (unset = no carrier filter). Set `CARRIER_LIKE=NFL` to restrict to NFL sources. `METRO_CLASSIFICATION` is an exact `Metro_Classification__c` match (default `Major NFL Metro`). Set `METRO_CLASSIFICATION=none` to omit it. Enrichment does not write those fields. The queue defaults to `LLM_Classified__c = false`; set `LLM_CLASSIFIED=1` only to re-pull already-flagged rows.
 
@@ -27,7 +27,30 @@ python -m enrichment
 
 Then set `APPLY=1` for live Salesforce writes. `Working-Connected` / `Qualified (Converted)` stay excluded unless listed in `STAGES`.
 
-Leadership KPIs land in Azure SQL (`dbo.EnrichmentRun` / `dbo.EnrichmentSiteOutcome`) at the end of `APPLY=1` runs. UniqueSites is distinct Salesforce Ids with a successful site-type/coords write. DB-only unique hits count only when that write succeeds; misses, holdouts, and retries of an Id already counted stay off UniqueSites. Details: [docs/enrichment-metrics.md](docs/enrichment-metrics.md).
+Leadership KPIs land in Azure SQL (`dbo.EnrichmentRun` / `dbo.EnrichmentSiteOutcome`) at the end of `APPLY=1` runs. UniqueSites is distinct Salesforce Ids with `sf_update_status=updated` (a real site-type/coords write), including rooftop-confirm applies. `APPLY=0` dry-runs do not increment UniqueSites or rewrite `kpis.json`. DB-only unique hits count only when that write succeeds; misses, holdouts, and retries of an Id already counted stay off UniqueSites. Details: [docs/enrichment-metrics.md](docs/enrichment-metrics.md).
+
+**NAIP rooftop confirm:** `CONFIRM_ROOFTOP=1` pulls existing `Site_Type=Rooftop` (not blank type), classifies NAIP + Gemini for **building-roof presence** (not cellular gear), and writes `Site_Type` + `LLM_Classified=true` when NAIP labels rooftop. HVAC-only or empty roofs still confirm. Inconclusive rows are left unchanged. No Nearmap, no Claude, no cell-gear bar. Successful applies count as rooftop SF writes / UniqueSites. Default stages include Working-Connected; set `CARRIER_LIKE` as needed. Uncomment `LIMIT` in `.env` only to cap a slice. Dry-run with `APPLY=0` first.
+
+```powershell
+$env:CONFIRM_ROOFTOP="1"
+$env:CARRIER_LIKE="ConnectX"
+$env:METRO_CLASSIFICATION="none"
+$env:OWNERS="none"
+$env:APPLY="0"
+$env:VERBOSE="1"
+python -m enrichment
+```
+
+Salesforce apply is stage 4/4. If you Ctrl+C during classify, push the paused CSV (no Gemini rerun):
+
+```powershell
+$env:CONFIRM_ROOFTOP="1"
+$env:APPLY="1"
+$env:APPLY_EXISTING="1"
+$env:RUN_DIR="C:\Users\Mmelendez\Codebases\site-orchestrator-data\runs\2026-09-17_130656_sf_enrichment"
+$env:VERBOSE="1"
+python -m enrichment
+```
 
 ## Layout
 

@@ -105,8 +105,12 @@ def build_blank_site_type_query(
     metro_classification: str | None = "Major NFL Metro",
     states: Sequence[str] | None = None,
     llm_classified: bool = False,
+    site_type: str | None = None,
 ) -> str:
-    """SOQL for blank Site_Type__c sites in the enrichment queue.
+    """SOQL for enrichment queue sites.
+
+    Default: blank ``Site_Type__c``. Pass ``site_type='Rooftop'`` to audit
+    rows that already have that picklist value.
 
     `carrier_like` filters Carrier_Leasing_Source__c with LIKE '%value%'.
     Pass None/"" to skip the carrier filter (the default).
@@ -121,8 +125,13 @@ def build_blank_site_type_query(
     """
     field_list = ", ".join(fields)
     classified_sql = "true" if llm_classified else "false"
+    wanted_type = (site_type or "").strip()
+    if wanted_type:
+        type_clause = f"Site_Type__c = {_soql_quote(wanted_type)}"
+    else:
+        type_clause = "(Site_Type__c = null OR Site_Type__c = '')"
     clauses = [
-        "(Site_Type__c = null OR Site_Type__c = '')",
+        type_clause,
         f"LLM_Classified__c = {classified_sql}",
         "(LLM_Holdout__c = false OR LLM_Holdout__c = null)",
         "Site_Latitude__c != null AND Site_Latitude__c != ''",
@@ -196,6 +205,7 @@ def query_blank_site_type_sites(
     metro_classification: str | None = "Major NFL Metro",
     states: Sequence[str] | None = None,
     llm_classified: bool = False,
+    site_type: str | None = None,
 ) -> list[dict[str, Any]]:
     soql = build_blank_site_type_query(
         stages=stages,
@@ -204,6 +214,7 @@ def query_blank_site_type_sites(
         metro_classification=metro_classification,
         states=states,
         llm_classified=llm_classified,
+        site_type=site_type,
     )
     logger.info("Salesforce SOQL: %s", soql)
     return query_all(client, soql)
@@ -347,6 +358,7 @@ def apply_one_update(
     dry_run: bool = False,
     verbose: bool = True,
     write_holdout: bool = True,
+    error_holdout: bool = True,
 ) -> dict[str, Any]:
     """Update a single enrichment candidate row; never raises.
 
@@ -357,7 +369,8 @@ def apply_one_update(
     and no LLM_Holdout. Hits also get site type/coords.
 
     If the Salesforce write fails (duplicates, API errors), retries once with
-    LLM_Classified=false + LLM_Holdout=true so the site still dequeues.
+    LLM_Classified=false + LLM_Holdout=true so the site still dequeues, unless
+    ``error_holdout=False`` (rooftop NAIP confirm: leave the row unchanged).
     """
     from enrichment import progress
 
@@ -420,7 +433,8 @@ def apply_one_update(
             progress.result(_format_apply_result(payload, dry_run=False))
     except Exception as exc:  # noqa: BLE001 — per-row resilience
         if (
-            not dry_run
+            error_holdout
+            and not dry_run
             and sf_id
             and not _is_holdout_fallback_payload(payload)
         ):
@@ -502,6 +516,7 @@ def apply_updates_idempotent(
     dry_run: bool = True,
     verbose: bool = True,
     write_holdout: bool = True,
+    error_holdout: bool = True,
 ) -> list[dict[str, Any]]:
     """Apply updates one row at a time; failures are logged and skipped."""
     from enrichment import progress
@@ -524,6 +539,7 @@ def apply_updates_idempotent(
             dry_run=dry_run,
             verbose=False,
             write_holdout=write_holdout,
+            error_holdout=error_holdout,
         )
         row_elapsed = time.monotonic() - row_t0
         entry["index"] = index

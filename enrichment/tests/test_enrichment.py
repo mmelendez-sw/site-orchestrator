@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
+import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
 
-from enrichment.bucketing import bucket_classification
+from enrichment.bucketing import bucket_classification, naip_rooftop_confirm_decision
+from enrichment.naip_classify import (
+    ROOFTOP_PRESENCE_PROMPT,
+    classification_prompt_for_run,
+)
 from enrichment.constants import (
     BUCKET_OTHER,
     BUCKET_POTENTIAL_UPDATE,
@@ -920,6 +926,22 @@ class SoqlTests(unittest.TestCase):
         self.assertIn("Metro_Classification__c", soql.split(" FROM ")[0])
         self.assertTrue(soql.rstrip().endswith("ORDER BY Id"))
 
+    def test_rooftop_confirm_query_selects_existing_rooftop(self):
+        soql = build_blank_site_type_query(
+            site_type="Rooftop",
+            stages=("New/Unreviewed", "Working-Connected"),
+            owners=None,
+            metro_classification=None,
+            carrier_like="ConnectX",
+        )
+        self.assertIn("Site_Type__c = 'Rooftop'", soql)
+        self.assertNotIn("Site_Type__c = null", soql)
+        self.assertIn("Carrier_Leasing_Source__c LIKE '%ConnectX%'", soql)
+        self.assertIn("Working-Connected", soql)
+        self.assertNotIn("Owner__c IN", soql)
+        self.assertNotIn("Metro_Classification__c =", soql)
+        self.assertIn("LLM_Classified__c = false", soql)
+
     def test_blank_site_type_query_can_override_stages(self):
         soql = build_blank_site_type_query(
             stages=("Outreach", "Outreach - Verified"),
@@ -932,6 +954,18 @@ class SoqlTests(unittest.TestCase):
     def test_blank_site_type_query_can_omit_owner(self):
         soql = build_blank_site_type_query(owners=None)
         self.assertNotIn("Owner__c IN", soql)
+
+    def test_dotenv_limit_ignores_leftover_shell_limit(self):
+        from enrichment.__main__ import apply_dotenv_limit
+
+        leftover = {"LIMIT": "40", "APPLY": "1"}
+        apply_dotenv_limit({}, leftover)
+        self.assertNotIn("LIMIT", leftover)
+        apply_dotenv_limit({"LIMIT": ""}, leftover)
+        self.assertNotIn("LIMIT", leftover)
+        capped = {"LIMIT": "40"}
+        apply_dotenv_limit({"LIMIT": "200"}, capped)
+        self.assertEqual(capped["LIMIT"], "200")
 
     def test_db_only_default_stages_any_owner(self):
         from enrichment.constants import DB_ONLY_STAGE_FILTER
@@ -1175,6 +1209,34 @@ class DuplicateFallbackTests(unittest.TestCase):
         self.assertTrue(entry["success"])
         self.assertEqual(entry["status"], "updated_holdout_after_error")
         self.assertEqual(len(site.calls), 2)
+
+    def test_apply_error_skips_holdout_when_disabled(self):
+        from enrichment.sf_ops import apply_one_update
+
+        class BoomSite(_FakeSiteSObject):
+            def update(self, record_id, payload):
+                self.calls.append((record_id, dict(payload)))
+                raise RuntimeError("UNABLE_TO_LOCK_ROW")
+
+        site = BoomSite()
+        entry = apply_one_update(
+            _FakeClient(site),
+            {
+                "Id": "a0ZTEST000000013",
+                "naip_site_type": "rooftop",
+                "payload": {
+                    "Site_Type__c": "Rooftop",
+                    "LLM_Classified__c": True,
+                },
+            },
+            dry_run=False,
+            verbose=False,
+            write_holdout=False,
+            error_holdout=False,
+        )
+        self.assertFalse(entry["success"])
+        self.assertEqual(entry["status"], "failed")
+        self.assertEqual(len(site.calls), 1)
 
     def test_holdout_dequeues_with_llm_classified_false(self):
         from enrichment.sf_ops import apply_one_update
@@ -1664,12 +1726,17 @@ class CostPolicyTests(unittest.TestCase):
                 {
                     "Id": "a",
                     "outcome": "applied_rooftop",
+                    "sf_update_status": "updated",
                     "empty_to_nearmap": True,
                     "empty_to_rooftop_apply": True,
                     "nearmap_ran": True,
                 },
                 {"Id": "b", "outcome": "holdout_empty_confirmed", "nearmap_ran": True},
-                {"Id": "c", "outcome": "applied_tower"},
+                {
+                    "Id": "c",
+                    "outcome": "applied_tower",
+                    "sf_update_status": "updated",
+                },
             ]
         )
         self.assertEqual(kpis["unique_sites"], 2)
@@ -1686,7 +1753,7 @@ class CostPolicyTests(unittest.TestCase):
 
         kpis = rollup_kpis(
             [
-                {"Id": "a", "outcome": "applied_rooftop"},
+                {"Id": "a", "outcome": "applied_rooftop", "sf_update_status": "updated"},
                 {
                     "Id": "b",
                     "outcome": "holdout_other",
@@ -1762,6 +1829,79 @@ class CostPolicyTests(unittest.TestCase):
         kpis = rollup_kpis([first, retry])
         self.assertEqual(kpis["unique_sites"], 1)
 
+    def test_dry_run_and_pending_do_not_count_unique_sites(self):
+        from enrichment.metrics import is_successful_sf_write, rollup_kpis
+
+        pending = {
+            "Id": "a",
+            "outcome": "applied_rooftop",
+            "sf_update_status": "pending",
+        }
+        dry = {
+            "Id": "b",
+            "outcome": "applied_rooftop",
+            "sf_update_status": "dry_run",
+        }
+        live = {
+            "Id": "c",
+            "outcome": "applied_tower",
+            "sf_update_status": "updated",
+        }
+        self.assertFalse(is_successful_sf_write(pending))
+        self.assertFalse(is_successful_sf_write(dry))
+        self.assertTrue(is_successful_sf_write(live))
+        self.assertEqual(rollup_kpis([pending, dry, live])["unique_sites"], 1)
+
+    def test_record_run_apply_zero_skips_unique_sites(self):
+        from enrichment.metrics import KPIS_JSON, SITES_JSONL, record_run, _rewrite_jsonl
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            prior = [
+                {
+                    "Id": "keep",
+                    "run_id": "prior",
+                    "outcome": "applied_tower",
+                    "sf_update_status": "updated",
+                }
+            ]
+            _rewrite_jsonl(root / SITES_JSONL, prior)
+            (root / KPIS_JSON).write_text(
+                '{"unique_sites": 1}', encoding="utf-8"
+            )
+            run_dir = root / "dry-run"
+            run_dir.mkdir()
+            import enrichment.metrics as metrics_mod
+
+            old_dir = metrics_mod.metrics_dir
+            metrics_mod.metrics_dir = lambda: root
+            try:
+                snap = record_run(
+                    run_dir=run_dir,
+                    detail_rows=[
+                        {
+                            "Id": "new",
+                            "bucket": "potential_update",
+                            "update_site_type": "Rooftop",
+                            "naip_site_type": "rooftop",
+                            "sf_update_status": "dry_run",
+                        }
+                    ],
+                    apply_summary=None,
+                    write_sql=False,
+                )
+            finally:
+                metrics_mod.metrics_dir = old_dir
+            self.assertIsNone(snap["kpis"])
+            sites = (root / SITES_JSONL).read_text(encoding="utf-8")
+            self.assertNotIn('"Id": "new"', sites)
+            self.assertEqual(
+                json.loads((root / KPIS_JSON).read_text(encoding="utf-8"))[
+                    "unique_sites"
+                ],
+                1,
+            )
+
     def test_drop_runs_from_ledger_rewrites_kpis(self):
         from enrichment.metrics import (
             KPIS_JSON,
@@ -1783,7 +1923,7 @@ class CostPolicyTests(unittest.TestCase):
             _rewrite_jsonl(
                 root / SITES_JSONL,
                 [
-                    {"Id": "a", "run_id": "keep", "outcome": "applied_rooftop"},
+                    {"Id": "a", "run_id": "keep", "outcome": "applied_rooftop", "sf_update_status": "updated"},
                     {"Id": "b", "run_id": "drop-me", "outcome": "holdout_other"},
                 ],
             )
@@ -2227,6 +2367,266 @@ class DbOnlyPipelineTests(unittest.TestCase):
         self.assertEqual(called["n"], 0)
         self.assertEqual(row["bucket"], BUCKET_OTHER)
         self.assertEqual(row["holdout_reason"], "db_only_no_unique_hit")
+
+
+class ConfirmRooftopTests(unittest.TestCase):
+    def test_presence_prompt_asks_for_building_not_cellular(self):
+        prompt = classification_prompt_for_run(presence_only=True)
+        self.assertIn("building-presence", prompt)
+        self.assertIn("Do not require antennas", prompt)
+        self.assertNotIn("Ordinary building mechanicals alone are NOT", prompt)
+        stock = classification_prompt_for_run(presence_only=False)
+        self.assertIn("ROOFTOP SITE: a building whose roof hosts cellular", stock)
+        self.assertIs(prompt, ROOFTOP_PRESENCE_PROMPT)
+
+    def test_naip_rooftop_persists_type_without_cell_or_coords(self):
+        for cell in (False, None, True):
+            with self.subTest(cell_equipment=cell):
+                decision = naip_rooftop_confirm_decision(
+                    {
+                        "site_type": "rooftop",
+                        "site_confidence": 0.7,
+                        "cell_equipment": cell,
+                    },
+                    existing_site_type="Rooftop",
+                )
+                self.assertEqual(decision["bucket"], BUCKET_POTENTIAL_UPDATE)
+                self.assertEqual(decision["update_site_type"], "Rooftop")
+                self.assertEqual(decision["update_lat"], "")
+                self.assertEqual(decision["update_verified_site"], "")
+                self.assertEqual(decision["holdout_reason"], "naip_rooftop_confirm")
+                self.assertFalse(decision["cell_equipment_confirmed"])
+
+    def test_process_site_confirms_hvac_only_rooftop(self):
+        from enrichment.constants import PROXIMITY_MAX_M
+        from enrichment.pipeline import _process_site
+
+        def classify(**_kwargs):
+            return {
+                "site_type": "rooftop",
+                "site_confidence": 0.75,
+                "cell_equipment": False,
+                "cell_equipment_confidence": 0.2,
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            row = _process_site(
+                {
+                    "Id": "a0ZROOF000000003",
+                    "Site_Latitude__c": 43.0,
+                    "Site_Longitude__c": -89.0,
+                    "Site_Type__c": "Rooftop",
+                },
+                cursor=None,
+                max_m=PROXIMITY_MAX_M,
+                skip_classify=False,
+                classify_fn=classify,
+                chip_dir=Path(tmp),
+                verbose=False,
+                confirm_rooftop=True,
+            )
+        self.assertEqual(row["bucket"], BUCKET_POTENTIAL_UPDATE)
+        self.assertEqual(row["update_site_type"], "Rooftop")
+        self.assertEqual(row["naip_cell_equipment"], False)
+
+    def test_naip_other_or_low_conf_does_nothing(self):
+        other = naip_rooftop_confirm_decision(
+            {"site_type": "other", "site_confidence": 0.9}
+        )
+        weak = naip_rooftop_confirm_decision(
+            {"site_type": "rooftop", "site_confidence": 0.2}
+        )
+        tower = naip_rooftop_confirm_decision(
+            {"site_type": "tower", "site_confidence": 0.95}
+        )
+        for decision in (other, weak, tower):
+            self.assertEqual(decision["bucket"], BUCKET_OTHER)
+            self.assertEqual(decision["holdout_reason"], "naip_rooftop_unconfirmed")
+            self.assertEqual(decision["update_site_type"], "")
+
+    def test_process_site_skips_proximity_and_confirms(self):
+        from enrichment.constants import PROXIMITY_MAX_M
+        from enrichment.pipeline import _process_site
+
+        def classify(**_kwargs):
+            return {"site_type": "rooftop", "site_confidence": 0.8}
+
+        class BoomCursor:
+            def execute(self, *_args, **_kwargs):
+                raise AssertionError("confirm_rooftop must not query FCC/TowerSource")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            row = _process_site(
+                {
+                    "Id": "a0ZROOF000000001",
+                    "Site_Latitude__c": 43.0,
+                    "Site_Longitude__c": -89.0,
+                    "Site_Type__c": "Rooftop",
+                },
+                cursor=BoomCursor(),
+                max_m=PROXIMITY_MAX_M,
+                skip_classify=False,
+                classify_fn=classify,
+                chip_dir=Path(tmp),
+                verbose=False,
+                confirm_rooftop=True,
+            )
+        self.assertEqual(row["bucket"], BUCKET_POTENTIAL_UPDATE)
+        self.assertEqual(row["update_site_type"], "Rooftop")
+        self.assertEqual(row["match_source"], MATCH_SOURCE_NONE)
+        self.assertEqual(row["holdout_reason"], "naip_rooftop_confirm")
+
+    def test_confirm_does_not_reuse_cluster(self):
+        from enrichment.constants import PROXIMITY_MAX_M
+        from enrichment.pipeline import _process_site
+
+        calls = {"n": 0}
+
+        def classify(**_kwargs):
+            calls["n"] += 1
+            return {"site_type": "rooftop", "site_confidence": 0.8}
+
+        cache = [
+            {
+                "lat": 43.0,
+                "lon": -89.0,
+                "classified": {"site_type": "other", "site_confidence": 0.9},
+            }
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            row = _process_site(
+                {
+                    "Id": "a0ZROOF000000002",
+                    "Site_Latitude__c": 43.0,
+                    "Site_Longitude__c": -89.0,
+                    "Site_Type__c": "Rooftop",
+                },
+                cursor=None,
+                max_m=PROXIMITY_MAX_M,
+                skip_classify=False,
+                classify_fn=classify,
+                chip_dir=Path(tmp),
+                verbose=False,
+                cluster_cache=cache,
+                confirm_rooftop=True,
+            )
+        self.assertEqual(calls["n"], 1)
+        self.assertEqual(row["update_site_type"], "Rooftop")
+
+    def test_apply_sets_classified_without_holdout_or_coords(self):
+        from enrichment.sf_ops import apply_one_update
+
+        site = _FakeSiteSObject()
+        entry = apply_one_update(
+            _FakeClient(site),
+            {
+                "Id": "a0ZTEST000000099",
+                "naip_site_type": "rooftop",
+                "update_lat": "",
+                "update_lng": "",
+                "update_site_type": "Rooftop",
+                "holdout_reason": "naip_rooftop_confirm",
+            },
+            dry_run=False,
+            verbose=False,
+            write_holdout=False,
+            error_holdout=False,
+        )
+        self.assertTrue(entry["success"])
+        payload = site.calls[0][1]
+        self.assertEqual(payload["Site_Type__c"], "Rooftop")
+        self.assertTrue(payload["LLM_Classified__c"])
+        self.assertNotIn("LLM_Holdout__c", payload)
+        self.assertNotIn("Site_Latitude__c", payload)
+
+    def test_apply_paused_run_pushes_pending_confirms_only(self):
+        from enrichment.constants import DETAIL_CSV
+        from enrichment.outputs import DETAIL_COLUMNS, write_csv
+        from enrichment.pipeline import apply_paused_run
+        import enrichment.metrics as metrics_mod
+
+        site = _FakeSiteSObject()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run_dir = root / "paused"
+            run_dir.mkdir()
+            write_csv(
+                run_dir / DETAIL_CSV,
+                [
+                    {
+                        "Id": "a0ZPEND000000001",
+                        "bucket": "potential_update",
+                        "naip_site_type": "rooftop",
+                        "update_site_type": "Rooftop",
+                        "holdout_reason": "naip_rooftop_confirm",
+                        "sf_update_status": "pending",
+                        "outcome_class": "applied_rooftop",
+                    },
+                    {
+                        "Id": "a0ZSKIP000000001",
+                        "bucket": "other_or_else",
+                        "holdout_reason": "naip_rooftop_unconfirmed",
+                        "sf_update_status": "skipped",
+                        "outcome_class": "holdout_empty",
+                    },
+                ],
+                DETAIL_COLUMNS,
+            )
+            old_dir = metrics_mod.metrics_dir
+            old_sql = os.environ.get("METRICS_SQL")
+            metrics_mod.metrics_dir = lambda: root
+            os.environ["METRICS_SQL"] = "0"
+            try:
+                summary = apply_paused_run(
+                    sf_client=_FakeClient(site),
+                    run_dir=run_dir,
+                    apply=True,
+                    confirm_rooftop=True,
+                    verbose=False,
+                )
+            finally:
+                metrics_mod.metrics_dir = old_dir
+                if old_sql is None:
+                    os.environ.pop("METRICS_SQL", None)
+                else:
+                    os.environ["METRICS_SQL"] = old_sql
+        self.assertEqual(len(site.calls), 1)
+        self.assertEqual(site.calls[0][0], "a0ZPEND000000001")
+        self.assertEqual(site.calls[0][1]["Site_Type__c"], "Rooftop")
+        self.assertTrue(site.calls[0][1]["LLM_Classified__c"])
+        self.assertNotIn("Site_Latitude__c", site.calls[0][1])
+        self.assertEqual(summary["apply"]["success"], 1)
+        self.assertEqual(summary["apply"]["failed"], 0)
+
+    def test_confirm_updated_counts_as_rooftop_write(self):
+        from enrichment.metrics import rollup_kpis, snapshot_run
+
+        snap = snapshot_run(
+            [
+                {
+                    "Id": "a",
+                    "bucket": "potential_update",
+                    "update_site_type": "Rooftop",
+                    "naip_site_type": "rooftop",
+                    "holdout_reason": "naip_rooftop_confirm",
+                    "sf_update_status": "updated",
+                },
+                {
+                    "Id": "b",
+                    "bucket": "other_or_else",
+                    "holdout_reason": "naip_rooftop_unconfirmed",
+                    "sf_update_status": "skipped",
+                },
+            ],
+            run_id="confirm-test",
+            confirm_rooftop=True,
+        )
+        by_id = {r["Id"]: r for r in snap["site_records"]}
+        self.assertTrue(by_id["a"]["include_in_kpis"])
+        self.assertFalse(by_id["b"]["include_in_kpis"])
+        kpis = rollup_kpis(snap["site_records"])
+        self.assertEqual(kpis["unique_sites"], 1)
+        self.assertEqual(kpis["rooftop_sf_writes"], 1)
 
 
 if __name__ == "__main__":

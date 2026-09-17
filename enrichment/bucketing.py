@@ -730,3 +730,35 @@ def _holdout(bucket: str, reason: str, classified: dict[str, Any]) -> dict[str, 
             classified.get("cell_equipment")
         ),
     }
+
+
+def naip_rooftop_confirm_decision(
+    classified: dict[str, Any],
+    *,
+    existing_site_type: str | None = None,
+) -> dict[str, Any]:
+    """NAIP-only building-roof audit: persist Rooftop when the model says
+    rooftop. Cellular gear is ignored. No Nearmap, Verified_Site, or
+    coordinate rewrite.
+    """
+    persist = (existing_site_type or "").strip() or "Rooftop"
+    site = str(classified.get("site_type") or "").strip().lower()
+    if (
+        classified.get("error")
+        or site in {"", "no_imagery"}
+        or site != "rooftop"
+        or not _confidence_ok(classified.get("site_confidence"))
+    ):
+        return _holdout(BUCKET_OTHER, "naip_rooftop_unconfirmed", classified)
+    return {
+        "bucket": BUCKET_POTENTIAL_UPDATE,
+        "holdout_reason": "naip_rooftop_confirm",
+        "update_lat": "",
+        "update_lng": "",
+        "update_coord_source": "",
+        "update_site_type": persist,
+        "update_verified_site": "",
+        "update_verified_site_source": "",
+        "cell_equipment": classified.get("cell_equipment"),
+        "cell_equipment_confirmed": False,
+    }

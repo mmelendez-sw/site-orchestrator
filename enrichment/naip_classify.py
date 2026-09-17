@@ -17,6 +17,56 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+# ConnectX / CONFIRM_ROOFTOP: a building roof at the pin is enough.
+# Do not require cellular antennas, panels, or dual-model cell agreement.
+ROOFTOP_PRESENCE_PROMPT = """\
+You are analyzing NAIP top-down aerial imagery of one location. The only \
+question is whether a building rooftop is present at this pin.
+
+This is a building-presence check, not a cellular-equipment check. Ordinary \
+roofs, HVAC, vents, solar, parking garages, and empty rooftops all count. \
+Do not require antennas, sector panels, RRUs, dishes, or any telecom hardware.
+
+The recorded coordinates can be off by tens of meters. If the center is a \
+parking lot, driveway, or landscaping next to a building, that building still \
+counts as rooftop.
+
+site_type:
+- "rooftop": a building with a roof is visible at or immediately next to the \
+pin (commercial, industrial, residential, school, church, warehouse, parking \
+garage, etc.). Use rooftop even when no cellular gear is visible.
+- "tower": a purpose-built ground tower/mast is the main structure (monopole, \
+lattice, guyed, stealth tree). Not a building roof.
+- "other": no building roof and no tower (bare field, water, woods with no \
+structure, empty lot).
+- "unclear": image quality prevents a call.
+
+Do not label a building as "other" merely because no cellular antennas are \
+visible. cell_equipment may be true, false, or null from what you see, but it \
+must not change site_type. site_confidence is how sure you are a building roof \
+is present, not how sure cellular gear is present.
+
+When site_type is "tower", set tower_subtype; otherwise null.
+Leave asset_box_2d / asset_view null unless a tower or obvious building host \
+is easy to box. site_evidence should name the building or structure, not claim \
+cellular gear unless cell_equipment is true.
+"""
+
+
+def classification_prompt_for_run(
+    *,
+    presence_only: bool,
+    input_confidence: str = "medium",
+) -> str:
+    """Prompt for one classify call. Presence-only ignores cellular rooftop rules."""
+    if presence_only:
+        return ROOFTOP_PRESENCE_PROMPT
+    from classifier import asset_classifier as ac
+
+    return ac.build_classification_prompt(
+        {"input_confidence": input_confidence}
+    )
+
 _NEARMAP_CHIP_FILES: tuple[tuple[str, str], ...] = (
     ("Vert", "vert"),
     ("North", "north"),
@@ -180,6 +230,7 @@ def classify_site_imagery(
     pin_address_mismatch: bool = False,
     db_backed: bool = False,
     reuse_chips_dirs: list[Path] | None = None,
+    presence_only: bool = False,
 ) -> dict[str, Any]:
     """Classify one coordinate with the full Nearmap + bifurcated AI stack.
 
@@ -192,6 +243,10 @@ def classify_site_imagery(
     FCC/TowerSource is the tower path (unique hit ≤25 m skips this). No DB
     hit is the rooftop path: pick the host building (parking-lot pin vs
     Census, from ``ROOFTOP_HOST_OFFSET_M``), then buy obliques there.
+
+    ``presence_only``: Confirm a building roof at the pin (ConnectX rooftop
+    audit). Gemini does not need cellular gear. Skip Nearmap, Claude, zoom,
+    and cell-equipment gates.
 
     ``db_backed``: FCC/TowerSource already matched. NAIP towers that already
     decided cell at medium+ confidence skip Vert/obliques. OSM communication
@@ -214,6 +269,8 @@ def classify_site_imagery(
         ac.CHIP_DIR = chip_dir
 
     primary_provider, allow_claude_escalation = ac.resolve_ai_mode()
+    if presence_only:
+        allow_claude_escalation = False
     clients = _build_clients(ac, primary_provider, allow_claude_escalation)
 
     if verbose:
@@ -221,6 +278,7 @@ def classify_site_imagery(
             f"Nearmap={'off' if ac.NAIP_ONLY else ('tiered' if ac.NEARMAP_TIERED else 'on')}"
             f" | AI={primary_provider}"
             f"{'+Claude' if allow_claude_escalation else ''}"
+            + (" | rooftop presence (no cell-gear bar)" if presence_only else "")
         )
         progress.step(mode)
 
@@ -230,8 +288,10 @@ def classify_site_imagery(
     unused_point: tuple[float, float] | None = None
     osm_tower = False
 
-    row = {"id": site_id, "input_confidence": input_confidence}
-    prompt = ac.build_classification_prompt(row)
+    prompt = classification_prompt_for_run(
+        presence_only=presence_only,
+        input_confidence=input_confidence,
+    )
     input_conf = ac.normalize_input_confidence(input_confidence)
 
     skip_paid_imagery = bool(ac.NAIP_ONLY)
@@ -611,13 +671,15 @@ def classify_site_imagery(
     }
     no_nearmap_coverage = nearmap_tier_now == "no_coverage"
     pin_offset_scout = (
-        not reuse_saved
+        not presence_only
+        and not reuse_saved
         and not nearmap_blocks_rescue
         and not no_nearmap_coverage
         and ac.needs_pin_offset_scout(res)
     )
     naip_rescue = (
-        not reuse_saved
+        not presence_only
+        and not reuse_saved
         and not nearmap_blocks_rescue
         and not pin_offset_scout
         and not nearmap_looked
@@ -744,7 +806,8 @@ def classify_site_imagery(
         ("other", "unclear", "rooftop") if pin_offset_scout else ("other", "unclear")
     )
     if (
-        not ac.confident_no_asset(res)
+        not presence_only
+        and not ac.confident_no_asset(res)
         and not wide_was_other
         and ac.ZOOM_STAGE
         and res.get("site_type") in zoom_types
@@ -881,7 +944,11 @@ def classify_site_imagery(
         from_wide_rescue = False
 
     # Claude escalation after imagery stages.
-    if allow_claude_escalation and ac.should_attempt_claude_escalation(res):
+    if (
+        not presence_only
+        and allow_claude_escalation
+        and ac.should_attempt_claude_escalation(res)
+    ):
         if verbose:
             progress.step("Claude escalate?")
         res, escalation_model, escalation_reason_str = ac.maybe_escalate_to_claude(
@@ -892,55 +959,58 @@ def classify_site_imagery(
                 f"escalated ({escalation_reason_str}) → {res.get('site_type')}"
             )
 
-    # Final HVAC false-positive guard for rooftop cell=true.
-    res = ac.gate_weak_rooftop_cell_claim(res)
-    # Dual-model Haiku/Sonnet covers HVAC FPs; skip a second full-scene recheck.
-    res = ac.gate_weak_stealth_tower_claim(res)
-    # Repair missing/invalid boxes before crop + dual-model.
-    box_provider = primary_provider if not escalation_model else "claude"
-    res = ac.maybe_repair_rooftop_asset_box(box_provider, clients, res, views)
-    res = ac.gate_weak_rooftop_cell_claim(res)
-    res = ac.gate_weak_stealth_tower_claim(res)
-    # Dual-model Haiku crop confirm covers the old Gemini crop recheck.
-    # No usable box ⇒ cannot keep rooftop cell=true (proof chain incomplete).
-    res = ac.enforce_rooftop_cell_requires_box(res, views)
-    confirm_views, used_crop = ac.build_cell_confirm_views(res, views)
-    if (
-        str(res.get("site_type") or "").lower() == "rooftop"
-        and res.get("cell_equipment") is True
-        and not used_crop
-    ):
-        # Last resort: do not dual-confirm full-scene when box/crop failed.
+    if presence_only:
+        res["cell_models_agree"] = False
+    else:
+        # Final HVAC false-positive guard for rooftop cell=true.
+        res = ac.gate_weak_rooftop_cell_claim(res)
+        # Dual-model Haiku/Sonnet covers HVAC FPs; skip a second full-scene recheck.
+        res = ac.gate_weak_stealth_tower_claim(res)
+        # Repair missing/invalid boxes before crop + dual-model.
+        box_provider = primary_provider if not escalation_model else "claude"
+        res = ac.maybe_repair_rooftop_asset_box(box_provider, clients, res, views)
+        res = ac.gate_weak_rooftop_cell_claim(res)
+        res = ac.gate_weak_stealth_tower_claim(res)
+        # Dual-model Haiku crop confirm covers the old Gemini crop recheck.
+        # No usable box ⇒ cannot keep rooftop cell=true (proof chain incomplete).
         res = ac.enforce_rooftop_cell_requires_box(res, views)
         confirm_views, used_crop = ac.build_cell_confirm_views(res, views)
-    if used_crop and verbose:
-        progress.step("dual-model on cell crop")
-    res, dual_model, cell_agree = ac.confirm_rooftop_cell_with_claude(
-        res,
-        clients,
-        confirm_views,
-        already_escalated=bool(escalation_model),
-        allow_soft_keep=False,
-        from_wide_rescue=from_wide_rescue,
-        used_crop=used_crop,
-        allow_gemini_solo=False,
-        all_views=views,
-    )
-    if dual_model and not escalation_model:
-        escalation_model = dual_model
-        escalation_reason_str = escalation_reason_str or (
-            "gemini_high_conf_tower"
-            if dual_model == "gemini_strong_solo"
-            else "rooftop_dual_model_cell"
+        if (
+            str(res.get("site_type") or "").lower() == "rooftop"
+            and res.get("cell_equipment") is True
+            and not used_crop
+        ):
+            # Last resort: do not dual-confirm full-scene when box/crop failed.
+            res = ac.enforce_rooftop_cell_requires_box(res, views)
+            confirm_views, used_crop = ac.build_cell_confirm_views(res, views)
+        if used_crop and verbose:
+            progress.step("dual-model on cell crop")
+        res, dual_model, cell_agree = ac.confirm_rooftop_cell_with_claude(
+            res,
+            clients,
+            confirm_views,
+            already_escalated=bool(escalation_model),
+            allow_soft_keep=False,
+            from_wide_rescue=from_wide_rescue,
+            used_crop=used_crop,
+            allow_gemini_solo=False,
+            all_views=views,
         )
-    res["cell_models_agree"] = cell_agree
-    # Soft-keep / agree must still have a box for candidacy confidence.
-    if res.get("cell_equipment") is True:
-        res = ac.enforce_rooftop_cell_requires_box(res, views)
-        if res.get("cell_equipment") is not True:
-            cell_agree = False
-            res["cell_models_agree"] = False
-    res = ac.align_site_evidence_with_cell(res)
+        if dual_model and not escalation_model:
+            escalation_model = dual_model
+            escalation_reason_str = escalation_reason_str or (
+                "gemini_high_conf_tower"
+                if dual_model == "gemini_strong_solo"
+                else "rooftop_dual_model_cell"
+            )
+        res["cell_models_agree"] = cell_agree
+        # Soft-keep / agree must still have a box for candidacy confidence.
+        if res.get("cell_equipment") is True:
+            res = ac.enforce_rooftop_cell_requires_box(res, views)
+            if res.get("cell_equipment") is not True:
+                cell_agree = False
+                res["cell_models_agree"] = False
+        res = ac.align_site_evidence_with_cell(res)
 
     asset_lat = asset_lon = asset_offset_m = None
     asset_coord_source = None
@@ -1015,8 +1085,14 @@ def classify_naip_only(
     chip_dir: Path | None = None,
     input_confidence: str = "medium",
     verbose: bool = True,
+    presence_only: bool = False,
+    **kwargs,
 ) -> dict[str, Any]:
-    """Legacy NAIP + Gemini-only path (no Nearmap, no Claude)."""
+    """NAIP + Gemini-only path (no Nearmap, no Claude).
+
+    ``presence_only=True`` asks whether a building roof is at the pin, not
+    whether cellular gear is on that roof (ConnectX rooftop confirm).
+    """
     prior = {
         "NAIP_ONLY": os.environ.get("NAIP_ONLY"),
         "NEARMAP_TIERED": os.environ.get("NEARMAP_TIERED"),
@@ -1035,6 +1111,8 @@ def classify_naip_only(
             chip_dir=chip_dir,
             input_confidence=input_confidence,
             verbose=verbose,
+            presence_only=presence_only,
+            **kwargs,
         )
     finally:
         for key, value in prior.items():

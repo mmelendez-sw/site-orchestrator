@@ -187,16 +187,7 @@ SELECT DISTINCT SalesforceId
 FROM dbo.EnrichmentSiteOutcome
 WHERE Outcome IN (N'applied_rooftop', N'applied_tower', N'applied_db_skip', N'applied_other')
   AND ISNULL(HoldoutReason, N'') <> N'db_only_no_unique_hit'
-  AND ISNULL(SfUpdateStatus, N'') NOT IN (
-        N'dry_run', N'failed', N'dequeued', N'classified_only', N'skipped'
-      )
-  AND (
-        SfUpdateStatus = N'updated'
-        OR (
-            (SfUpdateStatus IS NULL OR LTRIM(RTRIM(SfUpdateStatus)) IN (N'', N'pending'))
-            AND Outcome IN (N'applied_rooftop', N'applied_tower')
-        )
-      )
+  AND SfUpdateStatus = N'updated'
 """
 
 
@@ -276,18 +267,7 @@ def delete_ineligible_site_rows(cursor) -> int:
                 N'applied_db_skip', N'applied_other'
             )
             AND ISNULL(HoldoutReason, N'') <> N'db_only_no_unique_hit'
-            AND ISNULL(SfUpdateStatus, N'') NOT IN (
-                N'dry_run', N'failed', N'dequeued',
-                N'classified_only', N'skipped'
-            )
-            AND (
-                SfUpdateStatus = N'updated'
-                OR (
-                    (SfUpdateStatus IS NULL
-                     OR LTRIM(RTRIM(SfUpdateStatus)) IN (N'', N'pending'))
-                    AND Outcome IN (N'applied_rooftop', N'applied_tower')
-                )
-            )
+            AND SfUpdateStatus = N'updated'
         )
         """
     )

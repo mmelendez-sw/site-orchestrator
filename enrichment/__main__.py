@@ -4,8 +4,13 @@ Salesforce blank Site_Type → FCC/TowerSource → NAIP/Nearmap + Gemini/Claude 
 Holdouts dequeue unless DEQUEUE_HOLDOUTS=0. Optional env: STATES, STAGES,
 LIMIT, OFFSET, SKIP_FROM, IDS, CARRIER_LIKE, METRO_CLASSIFICATION,
 LLM_CLASSIFIED, APPLY, DEQUEUE_HOLDOUTS, RUN_DIR, VERBOSE,
-RERUN_SITES_FROM, RERUN_HOLDOUTS_FROM, REUSE_CHIPS_FROM, DB_ONLY.
+RERUN_SITES_FROM, RERUN_HOLDOUTS_FROM, REUSE_CHIPS_FROM, DB_ONLY,
+CONFIRM_ROOFTOP, APPLY_EXISTING.
 Set APPLY=0 to classify without Salesforce writes.
+Set CONFIRM_ROOFTOP=1 to audit existing Site_Type=Rooftop with NAIP/Gemini
+only (no Nearmap, no cell-gear bar). A building roof at the pin is enough;
+cellular antennas are not required. Rooftop label → persist type +
+LLM_Classified=true. Inconclusive → no Salesforce write.
 Set DB_ONLY=1 to skip all imagery. Every processed site is marked
 LLM_Classified=true (no LLM_Holdout on success). Unique FCC/TowerSource hits ≤25 m
 (or on-structure ≤5 m) also write Site_Type and coords. Remaining blanks
@@ -20,6 +25,9 @@ rows leave the default queue via LLM_Classified=true; SKIP_FROM still
 skips prior-run Ids if you re-pull. Salesforce apply errors retry once
 with LLM_Classified=false and LLM_Holdout=true.
 Set DEQUEUE_HOLDOUTS=0 to apply successes only and leave failed holdouts as-is.
+Set APPLY_EXISTING=1 with RUN_DIR to Salesforce-apply a paused run's
+enrichment_detail.csv (no re-classify). CONFIRM_ROOFTOP=1 still writes
+Site_Type + LLM_Classified only.
 Set RERUN_SITES_FROM to run folder names or YYYY-MM-DD prefixes to re-classify
 those runs' Outreach - Verified Ids (bypasses LLM_Holdout / blank Site_Type).
 RERUN_SKIP_APPLIED=1 (default) drops Ids that already wrote Site_Type.
@@ -35,15 +43,34 @@ import os
 import sys
 from pathlib import Path
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-load_dotenv(ROOT / ".env")
 
-from enrichment.pipeline import default_run_dir, run_enrichment  # noqa: E402
+def apply_dotenv_limit(
+    file_vals: dict[str, str | None],
+    environ: dict[str, str] | None = None,
+) -> None:
+    """Queue LIMIT comes from ``.env`` only.
+
+    Leftover PowerShell ``$env:LIMIT`` stays in the process after a slice run
+    and would otherwise cap later jobs even when ``.env`` has no LIMIT.
+    """
+    env = os.environ if environ is None else environ
+    raw = str(file_vals.get("LIMIT") or "").strip()
+    if raw:
+        env["LIMIT"] = raw
+    else:
+        env.pop("LIMIT", None)
+
+
+load_dotenv(ROOT / ".env")
+apply_dotenv_limit(dotenv_values(ROOT / ".env"))
+
+from enrichment.pipeline import apply_paused_run, default_run_dir, run_enrichment  # noqa: E402
 from enrichment.outputs import (  # noqa: E402
     holdout_ids_from_run_specs,
     site_ids_from_run_specs,
@@ -55,6 +82,7 @@ from enrichment.sf_ops import (  # noqa: E402
     parse_owners,
 )
 from enrichment.constants import (  # noqa: E402
+    CONFIRM_ROOFTOP_STAGE_FILTER,
     DB_ONLY_STAGE_FILTER,
     DEFAULT_OWNER_FILTER,
 )
@@ -155,6 +183,21 @@ def main() -> int:
     print("  authenticated", flush=True)
 
     db_only = _flag("DB_ONLY") or _flag("SKIP_CLASSIFY")
+    confirm_rooftop = _flag("CONFIRM_ROOFTOP")
+    if confirm_rooftop and db_only:
+        raise SystemExit("CONFIRM_ROOFTOP=1 cannot be combined with DB_ONLY=1")
+    if confirm_rooftop:
+        os.environ["NAIP_ONLY"] = "1"
+        os.environ["GEMINI_ONLY"] = "1"
+        os.environ["BIFURCATED_AI"] = "0"
+        print(
+            "  CONFIRM_ROOFTOP=1 — NAIP/Gemini building-roof audit "
+            "(no Nearmap, no Claude, no cell-gear bar)",
+            flush=True,
+        )
+        if not stages:
+            stages = list(CONFIRM_ROOFTOP_STAGE_FILTER)
+        print(f"  lead stages: {', '.join(stages)}", flush=True)
     if db_only:
         print(
             "  DB_ONLY=1 — FCC/TowerSource unique hits only (no Nearmap/NAIP/LLM)",
@@ -163,11 +206,34 @@ def main() -> int:
         if not stages:
             stages = list(DB_ONLY_STAGE_FILTER)
         print(f"  lead stages: {', '.join(stages)}", flush=True)
-    dequeue_default = "0" if db_only else "1"
+    dequeue_default = "0" if db_only or confirm_rooftop else "1"
     owners = parse_owners(
         os.environ.get("OWNERS"),
-        default=None if db_only else DEFAULT_OWNER_FILTER,
+        default=None if db_only or confirm_rooftop else DEFAULT_OWNER_FILTER,
     )
+    metro_raw = os.environ.get("METRO_CLASSIFICATION")
+    metro_default = (
+        "none" if confirm_rooftop else "Major NFL Metro"
+    )
+
+    if _flag("APPLY_EXISTING"):
+        if not os.environ.get("RUN_DIR"):
+            raise SystemExit(
+                "APPLY_EXISTING=1 requires RUN_DIR pointing at the paused run folder"
+            )
+        print(f"  APPLY_EXISTING=1 — {run_dir}", flush=True)
+        summary = apply_paused_run(
+            sf_client=sf_client,
+            run_dir=run_dir,
+            apply=_flag("APPLY", "1"),
+            confirm_rooftop=confirm_rooftop,
+            db_only=db_only,
+            dequeue_holdouts=_flag("DEQUEUE_HOLDOUTS", dequeue_default),
+            verbose=_flag("VERBOSE"),
+            max_sites=int(limit_raw) if limit_raw else None,
+        )
+        failed = (summary.get("apply") or {}).get("failed", 0)
+        return 0 if not failed else 2
 
     summary = run_enrichment(
         sf_client=sf_client,
@@ -181,7 +247,7 @@ def main() -> int:
         owners=owners,
         carrier_like=parse_carrier_like(os.environ.get("CARRIER_LIKE")),
         metro_classification=parse_metro_classification(
-            os.environ.get("METRO_CLASSIFICATION")
+            metro_raw, default=metro_default
         ),
         llm_classified=_flag("LLM_CLASSIFIED", "0"),
         apply=_flag("APPLY", "1"),
@@ -189,6 +255,7 @@ def main() -> int:
         verbose=_flag("VERBOSE"),
         reuse_chips_dirs=reuse_chips_dirs,
         db_only=db_only,
+        confirm_rooftop=confirm_rooftop,
     )
     failed = (summary.get("apply") or {}).get("failed", 0)
     return 0 if not failed else 2

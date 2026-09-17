@@ -205,11 +205,16 @@ def snapshot_run(
     run_id: str,
     apply_summary: dict[str, Any] | None = None,
     db_only: bool = False,
+    confirm_rooftop: bool = False,
 ) -> dict[str, Any]:
     sites = [site_record(r, run_id=run_id) for r in rows if str(r.get("Id") or "")]
     if db_only:
         for rec in sites:
             rec["db_only"] = True
+            rec["include_in_kpis"] = is_successful_sf_write(rec)
+    if confirm_rooftop:
+        for rec in sites:
+            rec["confirm_rooftop"] = True
             rec["include_in_kpis"] = is_successful_sf_write(rec)
     n = len(sites)
     empty_nm = sum(1 for s in sites if s["empty_to_nearmap"])
@@ -326,31 +331,22 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
 APPLIED_OUTCOMES = frozenset(
     {"applied_rooftop", "applied_tower", "applied_db_skip", "applied_other"}
 )
-NON_WRITE_STATUS = frozenset(
-    {"dry_run", "failed", "dequeued", "classified_only", "skipped"}
-)
-
-
 def _sf_status(rec: dict[str, Any]) -> str:
     return str(rec.get("sf_update_status") or "").strip().lower()
 
 
 def is_successful_sf_write(rec: dict[str, Any]) -> bool:
-    """True when Salesforce received site type/coords, not a holdout or classified-only flag."""
+    """True when Salesforce accepted a site-type/coords update.
+
+    Dry-runs (``pending`` / ``dry_run`` / blank) never count. UniqueSites is
+    live writes only (``sf_update_status=updated``).
+    """
     outcome = str(rec.get("outcome") or "").strip().lower()
     if outcome not in APPLIED_OUTCOMES:
         return False
     if str(rec.get("holdout_reason") or "").strip() == "db_only_no_unique_hit":
         return False
-    status = _sf_status(rec)
-    if status in NON_WRITE_STATUS:
-        return False
-    if status == "updated":
-        return True
-    if outcome == "applied_db_skip":
-        return False
-    # Legacy imagery rooftop/tower applies snapshotted as pending/blank.
-    return status in {"", "pending"}
+    return _sf_status(rec) == "updated"
 
 
 def kpi_eligible(rec: dict[str, Any]) -> bool:
@@ -491,6 +487,7 @@ def record_run(
     detail_rows: list[dict[str, Any]],
     apply_summary: dict[str, Any] | None = None,
     db_only: bool = False,
+    confirm_rooftop: bool = False,
     write_sql: bool | None = None,
 ) -> dict[str, Any]:
     """Append this run to the ledger and refresh kpis.json.
@@ -499,7 +496,9 @@ def record_run(
     Cumulative KPIs / ``sites.jsonl`` / Azure SQL site rows only take a
     Salesforce Id on its first successful enrichment write (site type/coords).
     Holdouts, classified-only flags, dry-runs, and failed applies stay on
-    this-run only. ``write_sql=False`` skips Azure SQL (dry-run APPLY=0).
+    this-run only. NAIP rooftop confirms count when Salesforce accepted the
+    write (``sf_update_status=updated``). ``APPLY=0`` writes the run header
+    locally but does not append UniqueSites, rewrite ``kpis.json``, or upsert SQL.
     """
     run_id = run_dir.name
     snap = snapshot_run(
@@ -507,8 +506,10 @@ def record_run(
         run_id=run_id,
         apply_summary=apply_summary,
         db_only=db_only,
+        confirm_rooftop=confirm_rooftop,
     )
     snap["db_only"] = db_only
+    snap["confirm_rooftop"] = confirm_rooftop
     root = metrics_dir()
     root.mkdir(parents=True, exist_ok=True)
     prior_sites = _read_jsonl(root / SITES_JSONL)
@@ -524,11 +525,19 @@ def record_run(
     ]
     run_rec = {k: v for k, v in snap.items() if k != "site_records"}
     _append_jsonl(root / RUNS_JSONL, [run_rec])
-    _append_jsonl(root / SITES_JSONL, ledger_sites)
-    kpis = rollup_kpis(prior_sites + ledger_sites)
-    (root / KPIS_JSON).write_text(json.dumps(kpis, indent=2), encoding="utf-8")
-    snap["kpis"] = kpis
-    should_sql = bool(apply_summary) if write_sql is None else write_sql
+    live_apply = apply_summary is not None
+    should_sql = live_apply if write_sql is None else write_sql
+    if ledger_sites and (live_apply or should_sql):
+        _append_jsonl(root / SITES_JSONL, ledger_sites)
+        kpis = rollup_kpis(prior_sites + ledger_sites)
+        (root / KPIS_JSON).write_text(json.dumps(kpis, indent=2), encoding="utf-8")
+        snap["kpis"] = kpis
+    elif live_apply:
+        kpis = rollup_kpis(prior_sites)
+        (root / KPIS_JSON).write_text(json.dumps(kpis, indent=2), encoding="utf-8")
+        snap["kpis"] = kpis
+    else:
+        snap["kpis"] = None
     if should_sql:
         from enrichment.metrics_store import try_write_snapshot
 
