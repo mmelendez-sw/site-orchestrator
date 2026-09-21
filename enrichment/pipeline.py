@@ -1,4 +1,4 @@
-"""Enrichment pipeline: SF blank Site_Type → FCC/TowerSource → imagery classify → CSVs."""
+"""Enrichment pipeline: SF blank Site_Type → FCC/TowerSource → imagery classify → Salesforce."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import csv
 import json
 import logging
 import time
+from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -17,7 +18,7 @@ from enrichment.bucketing import (
     verified_source_for_match,
 )
 from enrichment.metrics import RUN_METRIC_KEYS, outcome_class, record_run
-from enrichment.naip_classify import classify_naip_only, classify_site_imagery
+from enrichment.naip_classify import classify_site_imagery
 from enrichment.constants import (
     APPLY_LOG_CSV,
     BUCKET_OTHER,
@@ -29,7 +30,6 @@ from enrichment.constants import (
     MATCH_SOURCE_NONE,
     PROXIMITY_MAX_M,
     DEFAULT_STAGE_FILTER,
-    DEFAULT_OWNER_FILTER,
     HIGH_INPUT_CONFIDENCE_STAGES,
 )
 from enrichment.geo import (
@@ -52,13 +52,17 @@ from enrichment.outputs import (
 )
 from enrichment import progress
 from enrichment.sf_ops import (
+    apply_one_update,
     apply_updates_idempotent,
     is_enrichment_payload,
     parse_sf_lat_lng,
     query_blank_site_type_sites,
     query_sites_by_ids,
 )
-from salesforce.site_type_mapping import site_type_from_db_asset_type
+from salesforce.site_type_mapping import (
+    is_sales_tower_type,
+    site_type_from_db_asset_type,
+)
 from paths import runs_dir
 
 
@@ -83,6 +87,7 @@ def apply_paused_run(
     run_dir: Path,
     apply: bool = True,
     confirm_rooftop: bool = False,
+    confirm_existing: bool = False,
     db_only: bool = False,
     dequeue_holdouts: bool = False,
     verbose: bool = True,
@@ -90,9 +95,11 @@ def apply_paused_run(
 ) -> dict[str, Any]:
     """Apply Salesforce updates from a classify run that never reached stage 4/4.
 
-    Reads ``enrichment_detail.csv`` (rewritten after each site). Does not
-    re-query Salesforce or re-classify. Confirm path writes Site_Type +
-    LLM_Classified only for ``potential_update`` rows still pending.
+    Reads ``enrichment_detail.csv`` (rewritten after each site). Live runs
+    also Salesforce-apply after each site; use this when a job died before
+    that write. Does not re-query Salesforce or re-classify. Confirm path
+    writes Site_Type + LLM_Classified only for ``potential_update`` rows
+    still pending.
     """
     path = run_dir / DETAIL_CSV
     if not path.is_file():
@@ -113,6 +120,7 @@ def apply_paused_run(
         dequeue_holdouts=dequeue_holdouts,
         db_only=db_only,
         confirm_rooftop=confirm_rooftop,
+        confirm_existing=confirm_existing,
         verbose=verbose,
     )
 
@@ -142,6 +150,20 @@ def apply_queue_window(
     return sites[start : start + max(0, int(limit))]
 
 
+def _use_rooftop_confirm(
+    site: dict[str, Any],
+    *,
+    confirm_rooftop: bool,
+    confirm_existing: bool,
+) -> bool:
+    """Rooftop presence path vs FCC/NAIP tower path for one Salesforce row."""
+    if confirm_rooftop:
+        return True
+    if not confirm_existing:
+        return False
+    return not is_sales_tower_type(site.get("Site_Type__c"))
+
+
 def run_enrichment(
     *,
     sf_client,
@@ -161,14 +183,21 @@ def run_enrichment(
     states: list[str] | None = None,
     stages: list[str] | None = None,
     owners: list[str] | None = None,
+    exclude_owners: list[str] | None = None,
+    site_type: str | None = None,
     llm_classified: bool = False,
     verbose: bool = True,
     apply: bool = True,
     dequeue_holdouts: bool = True,
     reuse_chips_dirs: list[Path] | None = None,
     confirm_rooftop: bool = False,
+    confirm_existing: bool = False,
 ) -> dict[str, Any]:
-    """Run proximity + NAIP/Nearmap/Claude enrichment, write CSVs, auto-apply.
+    """Run proximity + NAIP/Nearmap/Claude enrichment and Salesforce-apply.
+
+    Each classified site is written to ``enrichment_detail.csv`` and, when
+    ``apply`` is true, pushed to Salesforce before the next site. An
+    end-of-run sweep applies any rows still pending.
 
     Certain rooftops and high-conf towers become Salesforce updates
     (LLM_Classified=true, LLM_Holdout=false). Remaining rows dequeue
@@ -181,10 +210,15 @@ def run_enrichment(
     true until a later flip. Failed Salesforce writes retry once with
     LLM_Classified=false and LLM_Holdout=true.
 
-    ``confirm_rooftop`` queries existing Site_Type=Rooftop rows, classifies
-    NAIP/Gemini for building-roof presence (not cellular gear), and writes
-    Site_Type + LLM_Classified=true when NAIP labels rooftop. Inconclusive
+    ``confirm_rooftop`` does not filter Site_Type. It classifies NAIP then
+    Nearmap only if NAIP does not confirm a building roof (unless NAIP_ONLY=1).
+    Success keeps the existing Site_Type (blank → Rooftop). Inconclusive
     rows are left unchanged (no holdout).
+
+    ``confirm_existing`` is the Outreach - Verified sales-typed path: rooftop
+    picklist rows use the presence confirm (NAIP first, Nearmap on fail);
+    tower picklist rows use FCC/TowerSource + NAIP/Nearmap. Failures are
+    left unchanged.
     """
     run_dir.mkdir(parents=True, exist_ok=True)
     chip_dir = run_dir / "chips"
@@ -196,6 +230,7 @@ def run_enrichment(
             f"offset={offset} | limit={limit!s} | "
             f"db_only={str(db_only).lower()} | "
             f"confirm_rooftop={str(confirm_rooftop).lower()} | "
+            f"confirm_existing={str(confirm_existing).lower()} | "
             f"stages={','.join(stages or list(DEFAULT_STAGE_FILTER))} | "
             f"run_dir={run_dir.name}"
             + (
@@ -211,7 +246,7 @@ def run_enrichment(
         if classify_fn is None:
 
             def classify(**kwargs):
-                return classify_naip_only(presence_only=True, **kwargs)
+                return classify_site_imagery(presence_only=True, **kwargs)
 
         else:
             classify = classify_fn
@@ -219,7 +254,8 @@ def run_enrichment(
         if sql_connection is None:
             if verbose:
                 progress.stage("1/4 CONNECT SQL")
-            sql_connection = connect_mssql()
+            with progress.busy("connecting SQL") if not verbose else nullcontext():
+                sql_connection = connect_mssql()
             own_sql = True
             if verbose:
                 progress.result("connected")
@@ -233,40 +269,51 @@ def run_enrichment(
                         "2/4 QUERY SALESFORCE",
                         f"{len(site_ids)} explicit Id(s)",
                     )
-                sites = query_sites_by_ids(sf_client, site_ids)
+                with progress.busy("querying Salesforce") if not verbose else nullcontext():
+                    sites = query_sites_by_ids(sf_client, site_ids)
             else:
                 state_label = ",".join(states) if states else "all"
                 stage_filter = stages or list(DEFAULT_STAGE_FILTER)
                 stage_label = ",".join(stage_filter)
-                owner_filter = (
-                    owners if owners is not None else list(DEFAULT_OWNER_FILTER)
-                )
-                if (db_only or confirm_rooftop) and owners is None:
-                    owner_filter = None
+                owner_filter = owners
                 owner_label = ",".join(owner_filter) if owner_filter else "any"
-                queue_label = (
-                    "Site_Type=Rooftop" if confirm_rooftop else "blank Site_Type"
+                exclude_owner_label = (
+                    ",".join(exclude_owners) if exclude_owners else "none"
                 )
+                wanted_type = (site_type or "").strip()
+                omit_type = wanted_type.lower() in {"any", "all", "*", "none"}
+                if omit_type:
+                    queue_label = "any Site_Type"
+                    query_site_type = "any"
+                elif wanted_type:
+                    queue_label = f"Site_Type={wanted_type}"
+                    query_site_type = wanted_type
+                else:
+                    queue_label = "blank Site_Type"
+                    query_site_type = None
                 if verbose:
                     progress.stage(
                         "2/4 QUERY SALESFORCE",
                         f"{queue_label} | stages={stage_label} | "
                         f"owners={owner_label} | "
+                        f"exclude_owners={exclude_owner_label} | "
                         f"carrier_like={carrier_like!r} | "
                         f"metro={metro_classification!r} | "
                         f"llm_classified={str(llm_classified).lower()} | "
                         f"states={state_label}",
                     )
-                sites = query_blank_site_type_sites(
-                    sf_client,
-                    stages=stage_filter,
-                    owners=owner_filter,
-                    carrier_like=carrier_like,
-                    metro_classification=metro_classification,
-                    states=states,
-                    llm_classified=llm_classified,
-                    site_type="Rooftop" if confirm_rooftop else None,
-                )
+                with progress.busy("querying Salesforce") if not verbose else nullcontext():
+                    sites = query_blank_site_type_sites(
+                        sf_client,
+                        stages=stage_filter,
+                        owners=owner_filter,
+                        exclude_owners=exclude_owners,
+                        carrier_like=carrier_like,
+                        metro_classification=metro_classification,
+                        states=states,
+                        llm_classified=llm_classified,
+                        site_type=query_site_type,
+                    )
             if verbose:
                 progress.result(f"{len(sites)} site(s)")
         queued = len(sites)
@@ -288,6 +335,10 @@ def run_enrichment(
         detail_rows: list[dict[str, Any]] = []
         cursor = sql_connection.cursor() if sql_connection is not None else None
         cluster_cache: list[dict[str, Any]] = []
+        leave_failures = confirm_rooftop or confirm_existing
+        write_holdout = not db_only and not leave_failures
+        error_holdout = not leave_failures
+        classify_error: BaseException | None = None
 
         try:
             for index, site in enumerate(sites, start=1):
@@ -298,53 +349,83 @@ def run_enrichment(
                         f"3/4 SITE {index}/{len(sites)}",
                         f"{sf_id} | {address}".strip(" |"),
                     )
-                else:
-                    progress.row_count(
-                        index, len(sites), sf_id=sf_id, address=address
+                site_status = (
+                    progress.busy(
+                        f"[{index}/{len(sites)}] {sf_id.strip() or '-'} | "
+                        f"{address.strip() or '-'}"
                     )
-                site_t0 = time.monotonic()
-                row = _process_site(
-                    site,
-                    cursor=cursor,
-                    max_m=max_m,
-                    skip_classify=skip_classify,
-                    db_only=db_only,
-                    classify_fn=classify,
-                    chip_dir=chip_dir,
-                    verbose=verbose,
-                    cluster_cache=cluster_cache,
-                    reuse_chips_dirs=reuse_chips_dirs,
-                    confirm_rooftop=confirm_rooftop,
+                    if not verbose
+                    else nullcontext()
                 )
-                row["outcome_class"] = outcome_class(row)
-                site_elapsed = time.monotonic() - site_t0
-                row.setdefault("sf_update_status", "")
-                row.setdefault("sf_update_error", "")
-                if row.get("bucket") == BUCKET_POTENTIAL_UPDATE:
-                    row["sf_update_status"] = "pending"
-                else:
-                    row["sf_update_status"] = "skipped"
-
-                detail_rows.append(row)
-                if verbose:
-                    progress.result(
-                        f"{row.get('bucket')} | type={row.get('naip_site_type') or '—'} | "
-                        f"img={row.get('imagery_used') or '—'} | "
-                        f"tier={row.get('nearmap_tier') or '—'} | "
-                        f"ai={row.get('escalation_model') or row.get('primary_model') or '—'} | "
-                        f"src={row.get('update_verified_site_source') or '—'} | "
-                        f"sf={row.get('sf_update_status') or '—'}",
-                        elapsed_s=site_elapsed,
+                with site_status:
+                    site_t0 = time.monotonic()
+                    row = _process_site(
+                        site,
+                        cursor=cursor,
+                        max_m=max_m,
+                        skip_classify=skip_classify,
+                        db_only=db_only,
+                        classify_fn=classify,
+                        chip_dir=chip_dir,
+                        verbose=verbose,
+                        cluster_cache=cluster_cache,
+                        reuse_chips_dirs=reuse_chips_dirs,
+                        confirm_rooftop=confirm_rooftop,
+                        confirm_existing=confirm_existing,
                     )
-                write_csv(run_dir / DETAIL_CSV, detail_rows, DETAIL_COLUMNS)
+                    row["outcome_class"] = outcome_class(row)
+                    site_elapsed = time.monotonic() - site_t0
+                    row.setdefault("sf_update_status", "")
+                    row.setdefault("sf_update_error", "")
+                    if row.get("bucket") == BUCKET_POTENTIAL_UPDATE:
+                        row["sf_update_status"] = "pending"
+                    else:
+                        row["sf_update_status"] = "skipped"
+
+                    detail_rows.append(row)
+                    if apply and _row_eligible_for_apply(
+                        row,
+                        dequeue_holdouts=dequeue_holdouts,
+                        db_only=db_only,
+                        confirm_rooftop=confirm_rooftop,
+                        confirm_existing=confirm_existing,
+                    ):
+                        entry = apply_one_update(
+                            sf_client,
+                            row,
+                            dry_run=False,
+                            verbose=verbose,
+                            write_holdout=write_holdout,
+                            error_holdout=error_holdout,
+                        )
+                        stamp_apply_status([row], [entry])
+                        _append_apply_log(run_dir, [entry])
+                    if verbose:
+                        progress.result(
+                            f"{row.get('bucket')} | type={row.get('naip_site_type') or '—'} | "
+                            f"img={row.get('imagery_used') or '—'} | "
+                            f"tier={row.get('nearmap_tier') or '—'} | "
+                            f"ai={row.get('escalation_model') or row.get('primary_model') or '—'} | "
+                            f"src={row.get('update_verified_site_source') or '—'} | "
+                            f"sf={row.get('sf_update_status') or '—'}",
+                            elapsed_s=site_elapsed,
+                        )
+                    write_csv(run_dir / DETAIL_CSV, detail_rows, DETAIL_COLUMNS)
         except KeyboardInterrupt:
             if verbose:
                 progress.warn(
                     f"stopped after {len(detail_rows)} classified site(s) — "
-                    "applying Salesforce updates for completed rows"
+                    "flushing any remaining Salesforce updates"
+                )
+        except Exception as exc:
+            classify_error = exc
+            if verbose:
+                progress.warn(
+                    f"classify stopped after {len(detail_rows)} site(s): {exc} — "
+                    "flushing any remaining Salesforce updates"
                 )
 
-        return _write_and_apply_run(
+        summary = _write_and_apply_run(
             sf_client=sf_client,
             run_dir=run_dir,
             detail_rows=detail_rows,
@@ -352,8 +433,12 @@ def run_enrichment(
             dequeue_holdouts=dequeue_holdouts,
             db_only=db_only,
             confirm_rooftop=confirm_rooftop,
+            confirm_existing=confirm_existing,
             verbose=verbose,
         )
+        if classify_error is not None:
+            raise classify_error
+        return summary
     finally:
         if own_sql:
             try:
@@ -367,6 +452,110 @@ def _needs_sf_apply(row: dict[str, Any]) -> bool:
     return status not in _ALREADY_WRITTEN
 
 
+_APPLY_LOG_COLUMNS = (
+    "index",
+    "Id",
+    "success",
+    "dry_run",
+    "status",
+    "error",
+    "payload_json",
+)
+
+
+def _collect_apply_rows(
+    detail_rows: list[dict[str, Any]],
+    *,
+    dequeue_holdouts: bool,
+    db_only: bool,
+    confirm_rooftop: bool,
+    confirm_existing: bool,
+) -> list[dict[str, Any]]:
+    apply_rows = [
+        row
+        for row in detail_rows
+        if row.get("bucket") == BUCKET_POTENTIAL_UPDATE and _needs_sf_apply(row)
+    ]
+    leave_failures = confirm_rooftop or confirm_existing
+    if not leave_failures and (dequeue_holdouts or db_only):
+        apply_rows.extend(
+            row
+            for row in detail_rows
+            if row.get("bucket") != BUCKET_POTENTIAL_UPDATE and _needs_sf_apply(row)
+        )
+    return apply_rows
+
+
+def _row_eligible_for_apply(
+    row: dict[str, Any],
+    *,
+    dequeue_holdouts: bool,
+    db_only: bool,
+    confirm_rooftop: bool,
+    confirm_existing: bool,
+) -> bool:
+    return bool(
+        _collect_apply_rows(
+            [row],
+            dequeue_holdouts=dequeue_holdouts,
+            db_only=db_only,
+            confirm_rooftop=confirm_rooftop,
+            confirm_existing=confirm_existing,
+        )
+    )
+
+
+def _apply_info_from_detail(
+    detail_rows: list[dict[str, Any]],
+    *,
+    apply: bool,
+    log: str = "",
+) -> dict[str, Any]:
+    def _status(row: dict[str, Any]) -> str:
+        return str(row.get("sf_update_status") or "").strip().lower()
+
+    success = sum(1 for row in detail_rows if _status(row) == "updated")
+    dequeued = sum(1 for row in detail_rows if _status(row) == "dequeued")
+    classified_only = sum(
+        1 for row in detail_rows if _status(row) == "classified_only"
+    )
+    failed = sum(1 for row in detail_rows if _status(row) == "failed")
+    return {
+        "total": success + dequeued + classified_only + failed,
+        "success": success,
+        "dequeued_holdouts": dequeued,
+        "classified_only": classified_only,
+        "failed": failed,
+        "apply": apply,
+        "log": log,
+    }
+
+
+def _append_apply_log(run_dir: Path, results: list[dict[str, Any]]) -> Path:
+    log_path = run_dir / APPLY_LOG_CSV
+    existing: list[dict[str, Any]] = []
+    if log_path.is_file():
+        with log_path.open(newline="", encoding="utf-8-sig") as handle:
+            existing = list(csv.DictReader(handle))
+    start = len(existing)
+    new_rows = []
+    for offset, entry in enumerate(results):
+        payload = entry.get("payload") or {}
+        new_rows.append(
+            {
+                "index": entry.get("index") or start + offset + 1,
+                "Id": entry.get("Id"),
+                "success": entry.get("success"),
+                "dry_run": entry.get("dry_run"),
+                "status": entry.get("status", ""),
+                "error": entry.get("error", ""),
+                "payload_json": json.dumps(payload),
+            }
+        )
+    write_csv(log_path, existing + new_rows, _APPLY_LOG_COLUMNS)
+    return log_path
+
+
 def _write_and_apply_run(
     *,
     sf_client,
@@ -376,6 +565,7 @@ def _write_and_apply_run(
     dequeue_holdouts: bool,
     db_only: bool,
     confirm_rooftop: bool,
+    confirm_existing: bool = False,
     verbose: bool,
 ) -> dict[str, Any]:
     """Write run CSVs and optionally apply Salesforce updates."""
@@ -398,13 +588,14 @@ def _write_and_apply_run(
 
     apply_info: dict[str, Any] | None = None
     if apply:
-        apply_rows = [r for r in candidates if _needs_sf_apply(r)]
-        if not confirm_rooftop and (dequeue_holdouts or db_only):
-            apply_rows.extend(
-                r
-                for r in detail_rows
-                if r.get("bucket") != BUCKET_POTENTIAL_UPDATE and _needs_sf_apply(r)
-            )
+        apply_rows = _collect_apply_rows(
+            detail_rows,
+            dequeue_holdouts=dequeue_holdouts,
+            db_only=db_only,
+            confirm_rooftop=confirm_rooftop,
+            confirm_existing=confirm_existing,
+        )
+        leave_failures = confirm_rooftop or confirm_existing
         if apply_rows:
             batch_csv = run_dir / "_apply_batch.csv"
             write_csv(batch_csv, apply_rows, DETAIL_COLUMNS)
@@ -414,8 +605,8 @@ def _write_and_apply_run(
                 run_dir=run_dir,
                 apply=True,
                 verbose=verbose,
-                write_holdout=not db_only and not confirm_rooftop,
-                error_holdout=not confirm_rooftop,
+                write_holdout=not db_only and not leave_failures,
+                error_holdout=not leave_failures,
             )
             stamp_apply_status(
                 detail_rows, apply_info.pop("results", None) or []
@@ -430,14 +621,11 @@ def _write_and_apply_run(
                 ],
                 CANDIDATE_COLUMNS,
             )
-        else:
-            apply_info = {
-                "total": 0,
-                "success": 0,
-                "dequeued_holdouts": 0,
-                "failed": 0,
-                "apply": True,
-            }
+        apply_info = _apply_info_from_detail(
+            detail_rows,
+            apply=True,
+            log=str(run_dir / APPLY_LOG_CSV),
+        )
     else:
         for row in detail_rows:
             if row.get("sf_update_status") == "pending":
@@ -473,7 +661,7 @@ def _write_and_apply_run(
             detail_rows=detail_rows,
             apply_summary=apply_info if apply else None,
             db_only=db_only,
-            confirm_rooftop=confirm_rooftop,
+            confirm_rooftop=confirm_rooftop or confirm_existing,
             write_sql=bool(apply),
         )
         run_block = {
@@ -513,6 +701,7 @@ def _process_site(
     cluster_cache: list[dict[str, Any]] | None = None,
     reuse_chips_dirs: list[Path] | None = None,
     confirm_rooftop: bool = False,
+    confirm_existing: bool = False,
 ) -> dict[str, Any]:
     sf_id = str(site.get("Id") or "")
     coords = parse_sf_lat_lng(site)
@@ -587,6 +776,12 @@ def _process_site(
         "error": "",
     }
 
+    rooftop_confirm = _use_rooftop_confirm(
+        site,
+        confirm_rooftop=confirm_rooftop,
+        confirm_existing=confirm_existing,
+    )
+
     if coords is None:
         if verbose:
             progress.warn("Missing Salesforce lat/lng — skipping proximity/NAIP")
@@ -609,10 +804,12 @@ def _process_site(
     base["classify_lng"] = classify_lng
     base["classify_coord_source"] = "sf_pin"
 
-    if confirm_rooftop:
+    if rooftop_confirm:
         if verbose:
-            progress.step("NAIP rooftop confirm (no FCC/TowerSource, no Nearmap)")
-    if not confirm_rooftop:
+            progress.step(
+                "NAIP rooftop confirm (Nearmap only if NAIP does not confirm)"
+            )
+    if not rooftop_confirm:
         if verbose:
             progress.stage("PROXIMITY", f"≤{max_m:g} m")
         addr_lat = None
@@ -695,7 +892,7 @@ def _process_site(
         base["classify_lat"] = classify_lat
         base["classify_lng"] = classify_lng
 
-    if not confirm_rooftop:
+    if not rooftop_confirm:
         skip_reason = auto_skip_classify_reason(hit, force=db_only)
         if db_only:
             if skip_reason is not None and hit is not None:
@@ -722,7 +919,7 @@ def _process_site(
             base["holdout_reason"] = "skip_classify_no_db_hit"
             return base
 
-    if cluster_cache is not None and hit is None and not confirm_rooftop:
+    if cluster_cache is not None and hit is None and not rooftop_confirm:
         reuse = find_cluster_match(
             cluster_cache, float(classify_lat), float(classify_lng)
         )
@@ -799,6 +996,8 @@ def _process_site(
         ),
         "reuse_chips_dirs": reuse_chips_dirs or None,
     }
+    if rooftop_confirm:
+        classify_kwargs["presence_only"] = True
     try:
         classified = classify_fn(**classify_kwargs)
     except TypeError:
@@ -881,7 +1080,7 @@ def _process_site(
         except (TypeError, ValueError):
             pass
 
-    if confirm_rooftop:
+    if rooftop_confirm:
         decision = naip_rooftop_confirm_decision(
             classified,
             existing_site_type=str(site.get("Site_Type__c") or ""),
@@ -1008,34 +1207,7 @@ def apply_candidate_csv(
     )
     out_dir = run_dir or candidate_csv.parent
     out_dir.mkdir(parents=True, exist_ok=True)
-    log_path = out_dir / APPLY_LOG_CSV
-    log_rows = []
-    for entry in results:
-        payload = entry.get("payload") or {}
-        log_rows.append(
-            {
-                "index": entry.get("index"),
-                "Id": entry.get("Id"),
-                "success": entry.get("success"),
-                "dry_run": entry.get("dry_run"),
-                "status": entry.get("status", ""),
-                "error": entry.get("error", ""),
-                "payload_json": json.dumps(payload),
-            }
-        )
-    write_csv(
-        log_path,
-        log_rows,
-        (
-            "index",
-            "Id",
-            "success",
-            "dry_run",
-            "status",
-            "error",
-            "payload_json",
-        ),
-    )
+    log_path = _append_apply_log(out_dir, results)
     tower_updated = sum(
         1
         for r in results

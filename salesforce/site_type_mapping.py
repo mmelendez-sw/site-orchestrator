@@ -57,6 +57,14 @@ PERMIT_SITE_TYPE_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
 )
 
 
+def is_sales_tower_type(value: str | None) -> bool:
+    """True when Salesforce Site_Type__c is a ground-tower picklist value."""
+    text = str(value or "").strip().lower()
+    if not text:
+        return False
+    return text in {item.lower() for item in TOWER_SUBTYPE_TO_SF.values()}
+
+
 def normalize_tower_subtype(value: Any) -> str | None:
     if value is None:
         return None

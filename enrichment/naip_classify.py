@@ -20,8 +20,9 @@ logger = logging.getLogger(__name__)
 # ConnectX / CONFIRM_ROOFTOP: a building roof at the pin is enough.
 # Do not require cellular antennas, panels, or dual-model cell agreement.
 ROOFTOP_PRESENCE_PROMPT = """\
-You are analyzing NAIP top-down aerial imagery of one location. The only \
-question is whether a building rooftop is present at this pin.
+You are analyzing aerial imagery (NAIP and/or Nearmap vertical and \
+obliques) of one location. The only question is whether a building \
+rooftop is present at this pin.
 
 This is a building-presence check, not a cellular-equipment check. Ordinary \
 roofs, HVAC, vents, solar, parking garages, and empty rooftops all count. \
@@ -245,8 +246,9 @@ def classify_site_imagery(
     Census, from ``ROOFTOP_HOST_OFFSET_M``), then buy obliques there.
 
     ``presence_only``: Confirm a building roof at the pin (ConnectX rooftop
-    audit). Gemini does not need cellular gear. Skip Nearmap, Claude, zoom,
-    and cell-equipment gates.
+    audit). Gemini does not need cellular gear. Skip Claude, zoom, and
+    cell-equipment gates. NAIP first; Nearmap only if that pass does not
+    confirm a rooftop (unless NAIP_ONLY=1).
 
     ``db_backed``: FCC/TowerSource already matched. NAIP towers that already
     decided cell at medium+ confidence skip Vert/obliques. OSM communication
@@ -496,6 +498,66 @@ def classify_site_imagery(
             )
         )
         nearmap_tier = "naip_only"
+    elif presence_only:
+        from enrichment.bucketing import rooftop_presence_confirmed
+
+        if img is None and (skip_nearmap_fetch or not ac.NEARMAP_API_KEY):
+            return {
+                "site_type": "no_imagery",
+                "error": "no_naip_imagery",
+                "lat": lat,
+                "lon": lon,
+            }
+        views = build_views({})
+        if img is not None:
+            if verbose:
+                progress.step("Gemini classify (NAIP rooftop presence)")
+            res, primary_model, escalation_model, escalation_reason_str = (
+                ac.classify_with_routing(
+                    primary_provider,
+                    clients,
+                    views,
+                    prompt,
+                    input_conf,
+                    escalate=False,
+                    screen=True,
+                )
+            )
+            nearmap_tier = "naip_only"
+        else:
+            res = {"site_type": "no_imagery", "site_confidence": 0}
+            nearmap_tier = "naip_only"
+        if rooftop_presence_confirmed(res):
+            if verbose:
+                progress.result("NAIP rooftop confirmed — skip Nearmap")
+        elif skip_nearmap_fetch or not ac.NEARMAP_API_KEY:
+            if verbose:
+                progress.result("NAIP unconfirmed — no Nearmap")
+        else:
+            if verbose:
+                progress.step("NAIP unconfirmed — buy Nearmap Vert+obliques")
+            try:
+                nearmap_views, nearmap_date = ac.fetch_nearmap_views(lat, lon)
+            except Exception as exc:  # noqa: BLE001
+                nearmap_views, nearmap_date = {}, None
+                if verbose:
+                    progress.warn(f"Nearmap fetch failed: {exc}")
+            if nearmap_views:
+                views = build_views(nearmap_views)
+                res, primary_model, escalation_model, escalation_reason_str = (
+                    ac.classify_with_routing(
+                        primary_provider,
+                        clients,
+                        views,
+                        prompt,
+                        input_conf,
+                        escalate=False,
+                    )
+                )
+                has_obliques = any(name != "Vert" for name in nearmap_views)
+                nearmap_tier = "full" if has_obliques else "vert_only"
+            else:
+                nearmap_tier = "no_coverage"
     elif ac.NEARMAP_TIERED:
         if verbose:
             progress.step("Tiered Nearmap classify")
@@ -547,7 +609,11 @@ def classify_site_imagery(
     )
     first_tier = str(nearmap_tier or "").strip().lower()
     second_nearmap = ""
-    if should_spend_second_nearmap(
+    from enrichment.bucketing import rooftop_presence_confirmed
+
+    if not (
+        presence_only and rooftop_presence_confirmed(res)
+    ) and should_spend_second_nearmap(
         unused_point=unused_point,
         skip_paid_imagery=skip_nearmap_fetch,
         has_nearmap_key=bool(ac.NEARMAP_API_KEY),

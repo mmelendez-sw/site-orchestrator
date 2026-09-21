@@ -64,8 +64,9 @@ def parse_owners(
 ) -> list[str] | None:
     """Owner__c IN-list from env/CLI.
 
-    Unset/blank → ``default``. ``none`` / ``all`` / ``*`` omit the owner filter.
-    Comma-separated picklist values otherwise.
+    Unset/blank → ``default``. ``none`` / ``all`` / ``*`` omit the owner IN-list.
+    Comma-separated picklist values otherwise. Use ``OWNERS_EXCLUDE`` for
+    ``Owner__c NOT IN``.
     """
     text = "" if raw is None else str(raw).strip()
     if not text:
@@ -75,6 +76,21 @@ def parse_owners(
     if text.lower() in {"none", "all", "*"}:
         return None
     return [part.strip() for part in text.split(",") if part.strip()] or None
+
+
+def parse_site_type(raw: str | None, *, default: str | None = None) -> str | None:
+    """Site_Type__c filter from env/CLI.
+
+    Unset/blank → ``default`` (None = blank Site_Type only).
+    ``none`` / ``any`` / ``all`` / ``*`` omit the Site_Type filter.
+    Any other value is an exact picklist match (e.g. Rooftop).
+    """
+    text = "" if raw is None else str(raw).strip()
+    if not text:
+        return default
+    if text.lower() in {"none", "any", "all", "*"}:
+        return "any"
+    return text
 
 
 def _parse_optional_filter(raw: str | None, *, default: str | None) -> str | None:
@@ -100,6 +116,7 @@ def build_blank_site_type_query(
     *,
     stages: Sequence[str] = DEFAULT_STAGE_FILTER,
     owners: Sequence[str] | None = DEFAULT_OWNER_FILTER,
+    exclude_owners: Sequence[str] | None = None,
     fields: Sequence[str] = SF_QUERY_FIELDS,
     carrier_like: str | None = None,
     metro_classification: str | None = "Major NFL Metro",
@@ -110,13 +127,15 @@ def build_blank_site_type_query(
     """SOQL for enrichment queue sites.
 
     Default: blank ``Site_Type__c``. Pass ``site_type='Rooftop'`` to audit
-    rows that already have that picklist value.
+    rows that already have that picklist value. Pass ``any`` / ``all`` / ``*``
+    to omit the Site_Type filter (Nearmap rooftop confirm).
 
     `carrier_like` filters Carrier_Leasing_Source__c with LIKE '%value%'.
     Pass None/"" to skip the carrier filter (the default).
     `metro_classification` filters Metro_Classification__c with an exact
     match (default Major NFL Metro). Pass None/"" to skip.
-    `owners` None/empty omits the Owner__c filter (any owner).
+    `owners` None/empty omits the Owner__c IN-list (any owner).
+    `exclude_owners` adds Owner__c NOT IN (...) and still includes blank owner.
     `states` filters Site_State__c IN (...); pass None/empty for all states.
     `llm_classified` defaults False (sites not yet LLM-classified). True selects
     the already-flagged NFL re-queue.
@@ -126,21 +145,32 @@ def build_blank_site_type_query(
     field_list = ", ".join(fields)
     classified_sql = "true" if llm_classified else "false"
     wanted_type = (site_type or "").strip()
-    if wanted_type:
-        type_clause = f"Site_Type__c = {_soql_quote(wanted_type)}"
-    else:
-        type_clause = "(Site_Type__c = null OR Site_Type__c = '')"
-    clauses = [
-        type_clause,
-        f"LLM_Classified__c = {classified_sql}",
-        "(LLM_Holdout__c = false OR LLM_Holdout__c = null)",
-        "Site_Latitude__c != null AND Site_Latitude__c != ''",
-        "Site_Longitude__c != null AND Site_Longitude__c != ''",
-        f"Stage__c IN ({_soql_in(stages)})",
-    ]
+    clauses: list[str] = []
+    if wanted_type.lower() not in {"any", "all", "*", "none"}:
+        if wanted_type:
+            clauses.append(f"Site_Type__c = {_soql_quote(wanted_type)}")
+        else:
+            clauses.append("(Site_Type__c = null OR Site_Type__c = '')")
+    clauses.extend(
+        [
+            f"LLM_Classified__c = {classified_sql}",
+            "(LLM_Holdout__c = false OR LLM_Holdout__c = null)",
+            "Site_Latitude__c != null AND Site_Latitude__c != ''",
+            "Site_Longitude__c != null AND Site_Longitude__c != ''",
+            f"Stage__c IN ({_soql_in(stages)})",
+        ]
+    )
     owner_list = [str(v).strip() for v in (owners or []) if str(v).strip()]
     if owner_list:
         clauses.append(f"Owner__c IN ({_soql_in(owner_list)})")
+    excluded_owners = [
+        str(v).strip() for v in (exclude_owners or []) if str(v).strip()
+    ]
+    if excluded_owners:
+        clauses.append(
+            "(Owner__c = null OR Owner__c = '' OR "
+            f"Owner__c NOT IN ({_soql_in(excluded_owners)}))"
+        )
     requested = {str(s).strip() for s in stages if str(s).strip()}
     excluded = [
         stage for stage in EXCLUDED_STAGE_FILTER if stage not in requested
@@ -201,6 +231,7 @@ def query_blank_site_type_sites(
     *,
     stages: Sequence[str] = DEFAULT_STAGE_FILTER,
     owners: Sequence[str] | None = DEFAULT_OWNER_FILTER,
+    exclude_owners: Sequence[str] | None = None,
     carrier_like: str | None = None,
     metro_classification: str | None = "Major NFL Metro",
     states: Sequence[str] | None = None,
@@ -210,6 +241,7 @@ def query_blank_site_type_sites(
     soql = build_blank_site_type_query(
         stages=stages,
         owners=owners,
+        exclude_owners=exclude_owners,
         carrier_like=carrier_like,
         metro_classification=metro_classification,
         states=states,

@@ -1,11 +1,20 @@
 """Tests for Site_Type__c mapping from classifier and permit text."""
 
 from salesforce.site_type_mapping import (
+    is_sales_tower_type,
     map_site_type_for_upload,
     normalize_tower_subtype,
     site_type_from_db_asset_type,
     site_type_from_permit_text,
 )
+
+
+def test_is_sales_tower_type():
+    assert is_sales_tower_type("Monopole")
+    assert is_sales_tower_type("Self Support / Lattice Tower")
+    assert not is_sales_tower_type("Rooftop")
+    assert not is_sales_tower_type("")
+    assert not is_sales_tower_type(None)
 
 
 def test_normalize_tower_subtype_aliases():

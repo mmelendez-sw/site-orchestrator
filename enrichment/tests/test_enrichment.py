@@ -31,6 +31,7 @@ from enrichment.sf_ops import (
     build_update_payload,
     parse_carrier_like,
     parse_metro_classification,
+    parse_site_type,
 )
 
 
@@ -942,6 +943,27 @@ class SoqlTests(unittest.TestCase):
         self.assertNotIn("Metro_Classification__c =", soql)
         self.assertIn("LLM_Classified__c = false", soql)
 
+    def test_confirm_query_can_omit_site_type(self):
+        soql = build_blank_site_type_query(
+            site_type="any",
+            stages=("New/Unreviewed", "Working-Connected"),
+            owners=None,
+            metro_classification=None,
+            carrier_like="ConnectX",
+        )
+        self.assertNotIn("Site_Type__c =", soql)
+        self.assertNotIn("Site_Type__c = null", soql)
+        self.assertIn("Carrier_Leasing_Source__c LIKE '%ConnectX%'", soql)
+        self.assertIn("LLM_Classified__c = false", soql)
+
+    def test_parse_site_type_env(self):
+        self.assertIsNone(parse_site_type(None))
+        self.assertIsNone(parse_site_type(""))
+        self.assertEqual(parse_site_type("Rooftop"), "Rooftop")
+        self.assertEqual(parse_site_type("any"), "any")
+        self.assertEqual(parse_site_type("none"), "any")
+        self.assertEqual(parse_site_type(None, default="any"), "any")
+
     def test_blank_site_type_query_can_override_stages(self):
         soql = build_blank_site_type_query(
             stages=("Outreach", "Outreach - Verified"),
@@ -954,6 +976,20 @@ class SoqlTests(unittest.TestCase):
     def test_blank_site_type_query_can_omit_owner(self):
         soql = build_blank_site_type_query(owners=None)
         self.assertNotIn("Owner__c IN", soql)
+        self.assertNotIn("Owner__c NOT IN", soql)
+
+    def test_blank_site_type_query_can_exclude_owners(self):
+        soql = build_blank_site_type_query(
+            owners=None,
+            exclude_owners=("Site Acquisition Team", "Marketing Campaign"),
+            metro_classification=None,
+        )
+        self.assertNotIn("Owner__c IN ('Site Acquisition Team'", soql)
+        self.assertIn(
+            "(Owner__c = null OR Owner__c = '' OR "
+            "Owner__c NOT IN ('Site Acquisition Team', 'Marketing Campaign'))",
+            soql,
+        )
 
     def test_dotenv_limit_ignores_leftover_shell_limit(self):
         from enrichment.__main__ import apply_dotenv_limit
@@ -2397,6 +2433,14 @@ class ConfirmRooftopTests(unittest.TestCase):
                 self.assertEqual(decision["holdout_reason"], "naip_rooftop_confirm")
                 self.assertFalse(decision["cell_equipment_confirmed"])
 
+    def test_rooftop_confirm_keeps_existing_site_type(self):
+        decision = naip_rooftop_confirm_decision(
+            {"site_type": "rooftop", "site_confidence": 0.7},
+            existing_site_type="Small Cell",
+        )
+        self.assertEqual(decision["bucket"], BUCKET_POTENTIAL_UPDATE)
+        self.assertEqual(decision["update_site_type"], "Small Cell")
+
     def test_process_site_confirms_hvac_only_rooftop(self):
         from enrichment.constants import PROXIMITY_MAX_M
         from enrichment.pipeline import _process_site
@@ -2513,6 +2557,66 @@ class ConfirmRooftopTests(unittest.TestCase):
         self.assertEqual(calls["n"], 1)
         self.assertEqual(row["update_site_type"], "Rooftop")
 
+    def test_confirm_existing_rooftop_skips_sql(self):
+        from enrichment.constants import PROXIMITY_MAX_M
+        from enrichment.pipeline import _process_site
+
+        def classify(**_kwargs):
+            return {"site_type": "rooftop", "site_confidence": 0.8}
+
+        class BoomCursor:
+            def execute(self, *_args, **_kwargs):
+                raise AssertionError("rooftop confirm_existing must not query FCC")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            row = _process_site(
+                {
+                    "Id": "a0ZROOF000000010",
+                    "Site_Latitude__c": 43.0,
+                    "Site_Longitude__c": -89.0,
+                    "Site_Type__c": "Rooftop",
+                    "Stage__c": "Outreach - Verified",
+                },
+                cursor=BoomCursor(),
+                max_m=PROXIMITY_MAX_M,
+                skip_classify=False,
+                classify_fn=classify,
+                chip_dir=Path(tmp),
+                verbose=False,
+                confirm_existing=True,
+            )
+        self.assertEqual(row["bucket"], BUCKET_POTENTIAL_UPDATE)
+        self.assertEqual(row["update_site_type"], "Rooftop")
+        self.assertEqual(row["holdout_reason"], "naip_rooftop_confirm")
+
+    def test_confirm_existing_tower_uses_proximity(self):
+        from enrichment.constants import PROXIMITY_MAX_M
+        from enrichment.pipeline import _process_site
+
+        class BoomCursor:
+            def execute(self, *_args, **_kwargs):
+                raise RuntimeError("sql-called")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            row = _process_site(
+                {
+                    "Id": "a0ZTOWER00000001",
+                    "Site_Latitude__c": 43.0,
+                    "Site_Longitude__c": -89.0,
+                    "Site_Type__c": "Monopole",
+                    "Stage__c": "Outreach - Verified",
+                },
+                cursor=BoomCursor(),
+                max_m=PROXIMITY_MAX_M,
+                skip_classify=False,
+                classify_fn=lambda **_k: {"site_type": "tower", "site_confidence": 0.9},
+                chip_dir=Path(tmp),
+                verbose=False,
+                confirm_existing=True,
+            )
+        self.assertEqual(row["holdout_reason"], "sql_error")
+        self.assertIn("sql-called", row.get("error") or "")
+
     def test_apply_sets_classified_without_holdout_or_coords(self):
         from enrichment.sf_ops import apply_one_update
 
@@ -2598,6 +2702,68 @@ class ConfirmRooftopTests(unittest.TestCase):
         self.assertEqual(summary["apply"]["success"], 1)
         self.assertEqual(summary["apply"]["failed"], 0)
 
+    def test_run_enrichment_applies_salesforce_after_each_site(self):
+        from enrichment.pipeline import run_enrichment
+        import enrichment.metrics as metrics_mod
+
+        site = _FakeSiteSObject()
+        applied_before_second: list[int] = []
+
+        def classify(**_kwargs):
+            if _kwargs.get("site_id") == "a0ZSECOND000000001":
+                applied_before_second.append(len(site.calls))
+            return _rooftop_ok()
+
+        class FakeSql:
+            def cursor(self):
+                return FakeCursor()
+
+            def close(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run_dir = root / "live"
+            old_dir = metrics_mod.metrics_dir
+            old_sql = os.environ.get("METRICS_SQL")
+            metrics_mod.metrics_dir = lambda: root
+            os.environ["METRICS_SQL"] = "0"
+            try:
+                summary = run_enrichment(
+                    sf_client=_FakeClient(site),
+                    sql_connection=FakeSql(),
+                    run_dir=run_dir,
+                    sites=[
+                        {
+                            "Id": "a0ZFIRST0000000001",
+                            "Site_Latitude__c": 43.0,
+                            "Site_Longitude__c": -89.0,
+                        },
+                        {
+                            "Id": "a0ZSECOND000000001",
+                            "Site_Latitude__c": 43.1,
+                            "Site_Longitude__c": -89.1,
+                        },
+                    ],
+                    classify_fn=classify,
+                    apply=True,
+                    dequeue_holdouts=False,
+                    verbose=False,
+                )
+            finally:
+                metrics_mod.metrics_dir = old_dir
+                if old_sql is None:
+                    os.environ.pop("METRICS_SQL", None)
+                else:
+                    os.environ["METRICS_SQL"] = old_sql
+        self.assertEqual(applied_before_second, [1])
+        self.assertEqual([call[0] for call in site.calls], [
+            "a0ZFIRST0000000001",
+            "a0ZSECOND000000001",
+        ])
+        self.assertEqual(summary["apply"]["success"], 2)
+        self.assertEqual(summary["apply"]["failed"], 0)
+
     def test_confirm_updated_counts_as_rooftop_write(self):
         from enrichment.metrics import rollup_kpis, snapshot_run
 
@@ -2627,6 +2793,37 @@ class ConfirmRooftopTests(unittest.TestCase):
         kpis = rollup_kpis(snap["site_records"])
         self.assertEqual(kpis["unique_sites"], 1)
         self.assertEqual(kpis["rooftop_sf_writes"], 1)
+
+
+class ProgressBusyTests(unittest.TestCase):
+    def test_format_busy_line_includes_elapsed_and_spinner(self):
+        from enrichment.progress import format_busy_line
+
+        self.assertEqual(
+            format_busy_line("[1/3] a0Z | 1 Main St", frame="/", elapsed_s=12.4),
+            "[1/3] a0Z | 1 Main St | run 12.4s  /",
+        )
+        self.assertEqual(
+            format_busy_line("connecting SQL", elapsed_s=65),
+            "connecting SQL | run 1m05s",
+        )
+
+    def test_busy_non_tty_prints_one_line(self):
+        import io
+        from unittest.mock import patch
+
+        from enrichment import progress
+
+        buf = io.StringIO()
+        progress.reset_run_timer()
+        with patch.object(progress, "_stdout_is_tty", return_value=False):
+            with patch.object(progress.sys, "stdout", buf):
+                with progress.busy("[2/10] a0ZTEST | 1 Main St"):
+                    pass
+        text = buf.getvalue()
+        self.assertIn("[2/10] a0ZTEST | 1 Main St | run ", text)
+        self.assertNotIn("\r", text)
+        self.assertEqual(text.count("\n"), 1)
 
 
 if __name__ == "__main__":

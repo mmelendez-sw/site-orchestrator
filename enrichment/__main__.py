@@ -1,16 +1,20 @@
 """python -m enrichment
 
-Salesforce blank Site_Type → FCC/TowerSource → NAIP/Nearmap + Gemini/Claude → auto-apply.
+Salesforce blank Site_Type → FCC/TowerSource → NAIP/Nearmap + Gemini/Claude → auto-apply after each site.
 Holdouts dequeue unless DEQUEUE_HOLDOUTS=0. Optional env: STATES, STAGES,
 LIMIT, OFFSET, SKIP_FROM, IDS, CARRIER_LIKE, METRO_CLASSIFICATION,
-LLM_CLASSIFIED, APPLY, DEQUEUE_HOLDOUTS, RUN_DIR, VERBOSE,
+OWNERS, OWNERS_EXCLUDE, SITE_TYPE, LLM_CLASSIFIED, APPLY, DEQUEUE_HOLDOUTS, RUN_DIR, VERBOSE,
 RERUN_SITES_FROM, RERUN_HOLDOUTS_FROM, REUSE_CHIPS_FROM, DB_ONLY,
-CONFIRM_ROOFTOP, APPLY_EXISTING.
+CONFIRM_ROOFTOP, CONFIRM_EXISTING, APPLY_EXISTING.
 Set APPLY=0 to classify without Salesforce writes.
-Set CONFIRM_ROOFTOP=1 to audit existing Site_Type=Rooftop with NAIP/Gemini
-only (no Nearmap, no cell-gear bar). A building roof at the pin is enough;
-cellular antennas are not required. Rooftop label → persist type +
-LLM_Classified=true. Inconclusive → no Salesforce write.
+Set CONFIRM_ROOFTOP=1 to audit rooftops with a building-roof check (no
+cell-gear bar, no Claude). NAIP first; Nearmap only if that fails.
+Success keeps the existing Site_Type (blank → Rooftop). Inconclusive →
+no Salesforce write.
+Set CONFIRM_EXISTING=1 for Outreach - Verified sales-typed sites: rooftop
+picklist rows use that NAIP-then-Nearmap confirm; tower picklist rows use
+FCC/NAIP/Nearmap. Failures are left unchanged. Defaults: any owner, no
+metro, any Site_Type.
 Set DB_ONLY=1 to skip all imagery. Every processed site is marked
 LLM_Classified=true (no LLM_Holdout on success). Unique FCC/TowerSource hits ≤25 m
 (or on-structure ≤5 m) also write Site_Type and coords. Remaining blanks
@@ -18,8 +22,10 @@ stay classified true until you flip them back (blank Site_Type +
 LLM_Classified=true). Default DB-only stages: New/Unreviewed,
 Enhanced/Unreviewed, Outreach, Outreach - Verified, Marketing (any owner).
 Override stages with STAGES or LEAD_STAGES (comma-separated).
-Set OWNERS=none (DB-only default) or a comma list. METRO_CLASSIFICATION=none
-includes every metro.
+Set OWNERS=none to drop the Owner__c IN-list (honored on Nearmap runs too).
+Set OWNERS_EXCLUDE to a comma list for Owner__c NOT IN (...).
+Set SITE_TYPE=any (or none) to drop the Site_Type filter (blank and typed).
+METRO_CLASSIFICATION=none includes every metro.
 LIMIT takes the first N remaining sites (stable ORDER BY Id). Processed
 rows leave the default queue via LLM_Classified=true; SKIP_FROM still
 skips prior-run Ids if you re-pull. Salesforce apply errors retry once
@@ -80,11 +86,13 @@ from enrichment.sf_ops import (  # noqa: E402
     parse_carrier_like,
     parse_metro_classification,
     parse_owners,
+    parse_site_type,
 )
 from enrichment.constants import (  # noqa: E402
     CONFIRM_ROOFTOP_STAGE_FILTER,
     DB_ONLY_STAGE_FILTER,
     DEFAULT_OWNER_FILTER,
+    DEFAULT_STAGE_FILTER,
 )
 from paths import ensure_data_layout, runs_dir  # noqa: E402
 from salesforce.sf_client import SalesforceClient  # noqa: E402
@@ -184,19 +192,30 @@ def main() -> int:
 
     db_only = _flag("DB_ONLY") or _flag("SKIP_CLASSIFY")
     confirm_rooftop = _flag("CONFIRM_ROOFTOP")
+    confirm_existing = _flag("CONFIRM_EXISTING")
     if confirm_rooftop and db_only:
         raise SystemExit("CONFIRM_ROOFTOP=1 cannot be combined with DB_ONLY=1")
+    if confirm_existing and (confirm_rooftop or db_only):
+        raise SystemExit(
+            "CONFIRM_EXISTING=1 cannot be combined with CONFIRM_ROOFTOP=1 or DB_ONLY=1"
+        )
     if confirm_rooftop:
-        os.environ["NAIP_ONLY"] = "1"
-        os.environ["GEMINI_ONLY"] = "1"
-        os.environ["BIFURCATED_AI"] = "0"
         print(
-            "  CONFIRM_ROOFTOP=1 — NAIP/Gemini building-roof audit "
-            "(no Nearmap, no Claude, no cell-gear bar)",
+            "  CONFIRM_ROOFTOP=1 — building-roof audit "
+            "(NAIP first, Nearmap only if NAIP fails; no Claude, no cell-gear bar)",
             flush=True,
         )
         if not stages:
             stages = list(CONFIRM_ROOFTOP_STAGE_FILTER)
+        print(f"  lead stages: {', '.join(stages)}", flush=True)
+    if confirm_existing:
+        print(
+            "  CONFIRM_EXISTING=1 — keep sales Site_Type; rooftops NAIP then "
+            "Nearmap on fail; towers FCC/NAIP/Nearmap",
+            flush=True,
+        )
+        if not stages:
+            stages = list(DEFAULT_STAGE_FILTER)
         print(f"  lead stages: {', '.join(stages)}", flush=True)
     if db_only:
         print(
@@ -206,14 +225,28 @@ def main() -> int:
         if not stages:
             stages = list(DB_ONLY_STAGE_FILTER)
         print(f"  lead stages: {', '.join(stages)}", flush=True)
-    dequeue_default = "0" if db_only or confirm_rooftop else "1"
+    dequeue_default = (
+        "0" if db_only or confirm_rooftop or confirm_existing else "1"
+    )
     owners = parse_owners(
         os.environ.get("OWNERS"),
-        default=None if db_only or confirm_rooftop else DEFAULT_OWNER_FILTER,
+        default=(
+            None
+            if db_only or confirm_rooftop or confirm_existing
+            else DEFAULT_OWNER_FILTER
+        ),
+    )
+    exclude_owners = parse_owners(
+        os.environ.get("OWNERS_EXCLUDE"),
+        default=None,
+    )
+    site_type = parse_site_type(
+        os.environ.get("SITE_TYPE"),
+        default="any" if confirm_rooftop or confirm_existing else None,
     )
     metro_raw = os.environ.get("METRO_CLASSIFICATION")
     metro_default = (
-        "none" if confirm_rooftop else "Major NFL Metro"
+        "none" if confirm_rooftop or confirm_existing else "Major NFL Metro"
     )
 
     if _flag("APPLY_EXISTING"):
@@ -227,6 +260,7 @@ def main() -> int:
             run_dir=run_dir,
             apply=_flag("APPLY", "1"),
             confirm_rooftop=confirm_rooftop,
+            confirm_existing=confirm_existing,
             db_only=db_only,
             dequeue_holdouts=_flag("DEQUEUE_HOLDOUTS", dequeue_default),
             verbose=_flag("VERBOSE"),
@@ -245,6 +279,8 @@ def main() -> int:
         states=states,
         stages=stages,
         owners=owners,
+        exclude_owners=exclude_owners,
+        site_type=site_type,
         carrier_like=parse_carrier_like(os.environ.get("CARRIER_LIKE")),
         metro_classification=parse_metro_classification(
             metro_raw, default=metro_default
@@ -256,6 +292,7 @@ def main() -> int:
         reuse_chips_dirs=reuse_chips_dirs,
         db_only=db_only,
         confirm_rooftop=confirm_rooftop,
+        confirm_existing=confirm_existing,
     )
     failed = (summary.get("apply") or {}).get("failed", 0)
     return 0 if not failed else 2

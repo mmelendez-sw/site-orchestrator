@@ -1,6 +1,6 @@
 # Site Orchestrator
 
-Salesforce enrichment: pull blank `Site_Type__c` sites, snap to FCC/TowerSource, classify from NAIP + optional Nearmap with Gemini/Claude (OSM prefilter before paid imagery), then write qualifying results back to Salesforce in the same run.
+Salesforce enrichment: pull blank `Site_Type__c` sites, snap to FCC/TowerSource, classify from NAIP + optional Nearmap with Gemini/Claude (OSM prefilter before paid imagery), then write each qualifying site back to Salesforce before the next classify. An end-of-run sweep applies anything still pending.
 
 There is no upload-template or CSV-import step. Run CSVs under `../site-orchestrator-data/runs/` are an audit log.
 

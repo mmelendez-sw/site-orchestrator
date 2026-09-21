@@ -3,13 +3,22 @@
 from __future__ import annotations
 
 import sys
+import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 _run_t0: float | None = None
 _stage_t0: float | None = None
 _stage_title: str = ""
+_SPINNER_FRAMES = "|/-\\"
+_SPINNER_INTERVAL_S = 0.25
+
+
+def _stdout_is_tty() -> bool:
+    isatty = getattr(sys.stdout, "isatty", None)
+    return bool(isatty and isatty())
 
 
 def _safe_print(*args: Any, **kwargs: Any) -> None:
@@ -23,6 +32,70 @@ def _safe_print(*args: Any, **kwargs: Any) -> None:
             for arg in args
         ]
         print(*safe_args, **kwargs)
+
+
+def _safe_text(text: str) -> str:
+    encoding = getattr(sys.stdout, "encoding", None) or "ascii"
+    try:
+        text.encode(encoding)
+        return text
+    except UnicodeEncodeError:
+        return text.encode(encoding, errors="replace").decode(encoding, errors="replace")
+
+
+def format_busy_line(label: str, *, frame: str = "", elapsed_s: float | None = None) -> str:
+    """Compact live-status line used by ``busy()`` and quiet row counts."""
+    seconds = run_elapsed() if elapsed_s is None else elapsed_s
+    suffix = f"  {frame}" if frame else ""
+    return f"{label} | run {format_duration(seconds)}{suffix}"
+
+
+def _write_live(text: str, *, width: int) -> int:
+    """Rewrite the current stdout line; return the visible width for padding."""
+    text = _safe_text(text)
+    pad = max(0, width - len(text))
+    sys.stdout.write("\r" + text + (" " * pad))
+    sys.stdout.flush()
+    return max(width, len(text))
+
+
+@contextmanager
+def busy(label: str) -> Iterator[None]:
+    """Show that a quiet run is still alive.
+
+    On a TTY, rewrite one line with a spinner and run elapsed until the
+    block returns. Off a TTY (tests, redirected logs), print the label once.
+    """
+    prefix = (label or "working").strip() or "working"
+    if not _stdout_is_tty():
+        _safe_print(format_busy_line(prefix), flush=True)
+        yield
+        return
+
+    stop = threading.Event()
+    width = 0
+
+    def render(frame: str) -> None:
+        nonlocal width
+        width = _write_live(format_busy_line(prefix, frame=frame), width=width)
+
+    def spin() -> None:
+        index = 0
+        render(_SPINNER_FRAMES[0])
+        while not stop.wait(_SPINNER_INTERVAL_S):
+            index += 1
+            render(_SPINNER_FRAMES[index % len(_SPINNER_FRAMES)])
+
+    thread = threading.Thread(target=spin, daemon=True, name="enrichment-busy")
+    thread.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        thread.join(timeout=1.0)
+        render("")
+        sys.stdout.write("\n")
+        sys.stdout.flush()
 
 
 def format_duration(seconds: float) -> str:
