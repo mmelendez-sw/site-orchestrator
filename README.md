@@ -85,6 +85,8 @@ Also install the ODBC Driver 18 for SQL Server. Azure SQL uses Entra token auth 
 3. **Nearmap** vert + obliques — rooftops and towers that still need high-res sides.
 4. **Claude** — dual-model cell confirm (skipped for high-conf Gemini towers ≥ 0.85, and below 0.7 site confidence).
 
+After each Gemini classify the process sleeps `GEMINI_DELAY_S` (default 8s; override in `.env`). Run **at most two** `python -m enrichment` classify jobs at once. A third job shares the same Gemini quota (more 429 retries) and Azure SQL pool. Do not run `load_enrichment_metrics.py` during those jobs. Set `METRICS_SQL=0` on the classify terminals if Azure SQL is dropping; reload KPIs later. Live processes keep the delay they started with — Ctrl+C and restart to pick up a new default. Per-site apply already wrote finished sites.
+
 Re-score holdouts on already-purchased Nearmap JPEGs (no new Nearmap fetch; Gemini and Claude still run). Dry-run a slice first:
 
 ```powershell

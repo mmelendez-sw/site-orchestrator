@@ -43,7 +43,13 @@ from enrichment.cost_policy import (
     auto_skip_classify_reason,
     find_cluster_match,
 )
-from enrichment.mssql import connect_mssql, describe_match, find_proximity_hit
+from enrichment.mssql import (
+    connect_mssql,
+    describe_match,
+    find_proximity_hit,
+    is_sql_link_failure,
+    reconnect_mssql,
+)
 from enrichment.outputs import (
     CANDIDATE_COLUMNS,
     DETAIL_COLUMNS,
@@ -79,6 +85,7 @@ def default_run_dir(root: Path | None = None) -> Path:
 
 
 _ALREADY_WRITTEN = frozenset({"updated", "classified_only", "dequeued"})
+_SQL_ERROR_HOLDOUT = "sql_error"
 
 
 def apply_paused_run(
@@ -202,7 +209,8 @@ def run_enrichment(
     Certain rooftops and high-conf towers become Salesforce updates
     (LLM_Classified=true, LLM_Holdout=false). Remaining rows dequeue
     (LLM_Classified=false, LLM_Holdout=true) unless ``dequeue_holdouts``
-    is false — then holdouts are left untouched.
+    is false — then holdouts are left untouched. Transient ``sql_error``
+    rows are never dequeued so a dropped Azure SQL link can retry later.
 
     ``db_only`` never fetches NAIP/Nearmap/Gemini/Claude. Successful rows
     are marked LLM_Classified=true (no LLM_Holdout). Unique FCC or
@@ -261,6 +269,7 @@ def run_enrichment(
                 progress.result("connected")
         classify = None if db_only else (classify_fn or classify_site_imagery)
 
+    sql_state: dict[str, Any] = {"conn": sql_connection, "cursor": None}
     try:
         if sites is None:
             if site_ids:
@@ -334,6 +343,7 @@ def run_enrichment(
 
         detail_rows: list[dict[str, Any]] = []
         cursor = sql_connection.cursor() if sql_connection is not None else None
+        sql_state["cursor"] = cursor
         cluster_cache: list[dict[str, Any]] = []
         leave_failures = confirm_rooftop or confirm_existing
         write_holdout = not db_only and not leave_failures
@@ -361,7 +371,8 @@ def run_enrichment(
                     site_t0 = time.monotonic()
                     row = _process_site(
                         site,
-                        cursor=cursor,
+                        cursor=sql_state.get("cursor"),
+                        sql_state=sql_state,
                         max_m=max_m,
                         skip_classify=skip_classify,
                         db_only=db_only,
@@ -442,7 +453,9 @@ def run_enrichment(
     finally:
         if own_sql:
             try:
-                sql_connection.close()
+                conn = sql_state.get("conn") or sql_connection
+                if conn is not None:
+                    conn.close()
             except Exception:  # pragma: no cover
                 pass
 
@@ -481,7 +494,9 @@ def _collect_apply_rows(
         apply_rows.extend(
             row
             for row in detail_rows
-            if row.get("bucket") != BUCKET_POTENTIAL_UPDATE and _needs_sf_apply(row)
+            if row.get("bucket") != BUCKET_POTENTIAL_UPDATE
+            and _needs_sf_apply(row)
+            and str(row.get("holdout_reason") or "") != _SQL_ERROR_HOLDOUT
         )
     return apply_rows
 
@@ -688,6 +703,50 @@ def _write_and_apply_run(
     return summary
 
 
+def _active_sql_cursor(cursor, sql_state: dict[str, Any] | None):
+    if sql_state is not None and sql_state.get("cursor") is not None:
+        return sql_state["cursor"]
+    return cursor
+
+
+def _proximity_hit(
+    cursor,
+    sql_state: dict[str, Any] | None,
+    sf_lat: float,
+    sf_lng: float,
+    *,
+    max_m: float,
+    address_lat,
+    address_lng,
+    verbose: bool,
+):
+    """FCC/TowerSource lookup; reconnect once on a dropped ODBC link."""
+    try:
+        return find_proximity_hit(
+            _active_sql_cursor(cursor, sql_state),
+            sf_lat,
+            sf_lng,
+            max_m=max_m,
+            address_lat=address_lat,
+            address_lng=address_lng,
+        )
+    except Exception as exc:
+        if sql_state is None or not is_sql_link_failure(exc):
+            raise
+        logger.warning("SQL link failed; reconnecting once: %s", exc)
+        if verbose:
+            progress.warn("SQL link dropped — reconnecting once")
+        reconnect_mssql(sql_state)
+        return find_proximity_hit(
+            sql_state["cursor"],
+            sf_lat,
+            sf_lng,
+            max_m=max_m,
+            address_lat=address_lat,
+            address_lng=address_lng,
+        )
+
+
 def _process_site(
     site: dict[str, Any],
     *,
@@ -702,6 +761,7 @@ def _process_site(
     reuse_chips_dirs: list[Path] | None = None,
     confirm_rooftop: bool = False,
     confirm_existing: bool = False,
+    sql_state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     sf_id = str(site.get("Id") or "")
     coords = parse_sf_lat_lng(site)
@@ -838,19 +898,21 @@ def _process_site(
                         f"Census address {offset_m:.0f} m from pin{extra}"
                     )
         try:
-            hit = find_proximity_hit(
+            hit = _proximity_hit(
                 cursor,
+                sql_state,
                 sf_lat,
                 sf_lng,
                 max_m=max_m,
                 address_lat=addr_lat,
                 address_lng=addr_lng,
+                verbose=verbose,
             )
         except Exception as exc:  # noqa: BLE001
             if verbose:
                 progress.warn(f"SQL proximity failed: {exc}")
             base["error"] = f"sql_proximity_failed: {exc}"
-            base["holdout_reason"] = "sql_error"
+            base["holdout_reason"] = _SQL_ERROR_HOLDOUT
             return base
 
         if hit is not None:

@@ -1,7 +1,8 @@
 """python -m enrichment
 
 Salesforce blank Site_Type → FCC/TowerSource → NAIP/Nearmap + Gemini/Claude → auto-apply after each site.
-Holdouts dequeue unless DEQUEUE_HOLDOUTS=0. Optional env: STATES, STAGES,
+Holdouts dequeue unless DEQUEUE_HOLDOUTS=0. Transient sql_error rows stay
+in the Salesforce queue either way. Optional env: STATES, STAGES,
 LIMIT, OFFSET, SKIP_FROM, IDS, CARRIER_LIKE, METRO_CLASSIFICATION,
 OWNERS, OWNERS_EXCLUDE, SITE_TYPE, LLM_CLASSIFIED, APPLY, DEQUEUE_HOLDOUTS, RUN_DIR, VERBOSE,
 RERUN_SITES_FROM, RERUN_HOLDOUTS_FROM, REUSE_CHIPS_FROM, DB_ONLY,

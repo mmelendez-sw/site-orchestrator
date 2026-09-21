@@ -180,7 +180,9 @@ MODELS = [
 ]
 _model_idx = 0
 API_DELAY_S = float(os.environ.get("CLAUDE_DELAY_S", "12"))
-GEMINI_DELAY_S = float(os.environ.get("GEMINI_DELAY_S", "30"))
+# Post-classify pause. 15s (fbd3e173) then 30s (084faa99, 2026-07-13) for NAIP
+# tower 429s; 8s is enough for two parallel jobs. Raise if Gemini 429s return.
+GEMINI_DELAY_S = float(os.environ.get("GEMINI_DELAY_S", "8"))
 GEMINI_RETRIES = int(os.environ.get("GEMINI_RETRIES", "6"))
 GEMINI_RETRY_BASE_S = float(os.environ.get("GEMINI_RETRY_BASE_S", "20"))
 INPUT_CSV = "data/assets.csv"    # columns: id; lat+lon OR address; optional: label, input_confidence

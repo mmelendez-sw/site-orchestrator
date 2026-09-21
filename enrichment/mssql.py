@@ -302,6 +302,39 @@ def _is_expired_sql_login(exc: BaseException) -> bool:
     )
 
 
+def is_sql_link_failure(exc: BaseException) -> bool:
+    """True when the ODBC session is dead and a new connection can recover it."""
+    chunks = [str(exc)]
+    chunks.extend(str(arg) for arg in getattr(exc, "args", ()))
+    text = " ".join(chunks).lower()
+    needles = (
+        "08s01",
+        "08001",
+        "hy010",
+        "communication link failure",
+        "invalid cursor state",
+        "physical connection is not usable",
+        "connection is closed",
+        "tcp provider",
+    )
+    return any(needle in text for needle in needles)
+
+
+def reconnect_mssql(sql_state: dict[str, Any]) -> None:
+    """Close a dead Azure SQL session and replace ``conn`` / ``cursor`` in place."""
+    old = sql_state.get("conn")
+    if old is not None:
+        try:
+            old.close()
+        except Exception:
+            pass
+    sql_state["conn"] = None
+    sql_state["cursor"] = None
+    conn = connect_mssql()
+    sql_state["conn"] = conn
+    sql_state["cursor"] = conn.cursor()
+
+
 def _entra_sql_token() -> str:
     """Entra token for Azure SQL. Prefer az.cmd on Windows; refresh before expiry."""
     cached = _cached_token_if_fresh()

@@ -2214,6 +2214,120 @@ class SqlTokenCacheTests(unittest.TestCase):
         )
         self.assertFalse(_is_expired_sql_login(Exception("Login timeout expired")))
 
+    def test_sql_link_failure_detection(self):
+        from enrichment.mssql import is_sql_link_failure
+
+        self.assertTrue(
+            is_sql_link_failure(Exception("[08S01] Communication link failure"))
+        )
+        self.assertTrue(is_sql_link_failure(Exception("Invalid cursor state")))
+        self.assertFalse(is_sql_link_failure(Exception("Login timeout expired")))
+        self.assertFalse(is_sql_link_failure(RuntimeError("sql-called")))
+
+
+class SqlReconnectTests(unittest.TestCase):
+    def test_sql_link_failure_reconnects_once(self):
+        from unittest.mock import patch
+
+        from enrichment import mssql as mssql_mod
+        from enrichment.constants import PROXIMITY_MAX_M
+        from enrichment.pipeline import _process_site
+
+        calls = {"n": 0}
+
+        def fake_hit(_cursor, *_args, **_kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise Exception("[08S01] Communication link failure")
+            return None
+
+        class LiveConn:
+            def cursor(self):
+                return object()
+
+            def close(self):
+                pass
+
+        live = LiveConn()
+        dead = LiveConn()
+        sql_state = {"conn": dead, "cursor": object()}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(mssql_mod, "connect_mssql", return_value=live):
+                with patch("enrichment.pipeline.find_proximity_hit", fake_hit):
+                    row = _process_site(
+                        {
+                            "Id": "a0ZSQLR000000001",
+                            "Site_Latitude__c": 43.0,
+                            "Site_Longitude__c": -89.0,
+                        },
+                        cursor=sql_state["cursor"],
+                        sql_state=sql_state,
+                        max_m=PROXIMITY_MAX_M,
+                        skip_classify=False,
+                        classify_fn=lambda **_k: {
+                            "site_type": "rooftop",
+                            "site_confidence": 0.9,
+                        },
+                        chip_dir=Path(tmp),
+                        verbose=False,
+                    )
+        self.assertEqual(calls["n"], 2)
+        self.assertIs(sql_state["conn"], live)
+        self.assertNotEqual(row.get("holdout_reason"), "sql_error")
+
+    def test_non_link_sql_error_does_not_reconnect(self):
+        from unittest.mock import patch
+
+        from enrichment import mssql as mssql_mod
+        from enrichment.constants import PROXIMITY_MAX_M
+        from enrichment.pipeline import _process_site
+
+        class BoomCursor:
+            def execute(self, *_args, **_kwargs):
+                raise RuntimeError("sql-called")
+
+        sql_state = {"conn": object(), "cursor": BoomCursor()}
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(mssql_mod, "connect_mssql") as connect:
+                row = _process_site(
+                    {
+                        "Id": "a0ZSQLNR00000001",
+                        "Site_Latitude__c": 43.0,
+                        "Site_Longitude__c": -89.0,
+                    },
+                    cursor=sql_state["cursor"],
+                    sql_state=sql_state,
+                    max_m=PROXIMITY_MAX_M,
+                    skip_classify=False,
+                    classify_fn=lambda **_k: {"site_type": "tower"},
+                    chip_dir=Path(tmp),
+                    verbose=False,
+                )
+        connect.assert_not_called()
+        self.assertEqual(row["holdout_reason"], "sql_error")
+
+    def test_sql_error_is_not_dequeued(self):
+        from enrichment.constants import BUCKET_OTHER
+        from enrichment.pipeline import _collect_apply_rows
+
+        rows = [
+            {
+                "Id": "a0ZSQLERR0000001",
+                "bucket": BUCKET_OTHER,
+                "holdout_reason": "sql_error",
+                "sf_update_status": "skipped",
+            }
+        ]
+        apply_rows = _collect_apply_rows(
+            rows,
+            dequeue_holdouts=True,
+            db_only=False,
+            confirm_rooftop=False,
+            confirm_existing=False,
+        )
+        self.assertEqual(apply_rows, [])
+
 
 class HoldoutRerunTests(unittest.TestCase):
     def test_holdout_ids_from_run_folder(self):
