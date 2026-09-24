@@ -43,8 +43,8 @@ Set REUSE_CHIPS_FROM to classify saved JPEGs (no Nearmap fetch). If unset,
 chips are reused from RERUN_SITES_FROM or RERUN_HOLDOUTS_FROM.
 SKIP_FROM=sql skips every Id any live run already recorded in Azure SQL
 (dbo.EnrichmentSiteOutcome); combine with run folders / dates by comma.
-Throughput: CLASSIFY_WORKERS (default 3) parallel classify threads in one
-process; GEMINI_RPM / CLAUDE_RPM (default 30 / 50) pace every model call.
+Throughput: CLASSIFY_WORKERS (default 10) parallel classify threads in one
+process; GEMINI_RPM / CLAUDE_RPM (default 120 / 50) pace every model call.
 APPLY_BATCH_SIZE (default 25) / APPLY_FLUSH_S (default 60) batch live
 Salesforce writes through sObject Collections; 1 writes each site at once.
 """

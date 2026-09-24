@@ -119,13 +119,13 @@ MAX_CLASSIFY_WORKERS = 32
 
 
 def classify_workers() -> int:
-    """Parallel imagery-classify threads (``CLASSIFY_WORKERS``, default 3, max 32).
+    """Parallel imagery-classify threads (``CLASSIFY_WORKERS``, default 10, max 32).
 
     Throughput tops out at the shared model pacing, not the thread count:
     roughly GEMINI_RPM / (Gemini calls per site) sites per minute. Raise
     GEMINI_RPM with CLASSIFY_WORKERS, up to your Gemini quota.
     """
-    return max(1, min(MAX_CLASSIFY_WORKERS, env_int("CLASSIFY_WORKERS", 3)))
+    return max(1, min(MAX_CLASSIFY_WORKERS, env_int("CLASSIFY_WORKERS", 10)))
 
 
 def apply_batch_size() -> int:

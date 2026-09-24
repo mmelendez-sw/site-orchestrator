@@ -89,11 +89,11 @@ Also install the ODBC Driver 18 for SQL Server. For tests and lint: `pip install
 
 ### Throughput and pacing
 
-One process classifies `CLASSIFY_WORKERS` sites at once (default 3). Pins within `PIN_CLUSTER_M` of each other stay in one worker so nearby-pin reuse still saves imagery. Every Gemini / Claude call waits on a shared limiter — `GEMINI_RPM` (default 30) and `CLAUDE_RPM` (default 50) — and a 429/503 pauses all workers together. This replaces the old fixed `GEMINI_DELAY_S` sleep after each site (`GEMINI_DELAY_S` / `CLAUDE_DELAY_S` are ignored now). Run **one** terminal and raise `CLASSIFY_WORKERS` instead of opening more; separate processes do not share the limiter. Lower `GEMINI_RPM` if 429 retries show up.
+One process classifies `CLASSIFY_WORKERS` sites at once (default 10). Pins within `PIN_CLUSTER_M` of each other stay in one worker so nearby-pin reuse still saves imagery. Every Gemini / Claude call waits on a shared limiter — `GEMINI_RPM` (default 120) and `CLAUDE_RPM` (default 50) — and a 429/503 pauses all workers together. This replaces the old fixed `GEMINI_DELAY_S` sleep after each site (`GEMINI_DELAY_S` / `CLAUDE_DELAY_S` are ignored now). Run **one** terminal and raise `CLASSIFY_WORKERS` instead of opening more; separate processes do not share the limiter. Every 429 prints a `WARNING Gemini 429 … all workers pause` line; if those repeat, lower `GEMINI_RPM` (e.g. 90 or 60).
 
 With `VERBOSE=1` and more than one worker, each site's steps print as one block when that site finishes (tagged `[index/total Id]`), followed by its result line. `CLASSIFY_WORKERS=1` restores live step-by-step output.
 
-Scaling: `CLASSIFY_WORKERS` goes up to 32, but the ceiling is model pacing — roughly `GEMINI_RPM` ÷ Gemini calls per site (typically 2–5) sites per minute. More workers only help once `GEMINI_RPM` is raised to match, up to your Gemini project quota. Each worker also opens up to `NEARMAP_TILE_WORKERS` (8) tile downloads at once.
+Scaling: `CLASSIFY_WORKERS` goes up to 32, but the ceiling is model pacing — roughly `GEMINI_RPM` ÷ Gemini calls per site (typically 2–5) sites per minute. More workers only help once `GEMINI_RPM` is raised to match, up to your Gemini project quota. Each worker also opens up to `NEARMAP_TILE_WORKERS` tile downloads at once (default 4, so 40 concurrent at 10 workers).
 
 Before classifying, the run geocodes the whole queue in Census batch requests (cached in `../site-orchestrator-data/cache/census_geocode.jsonl`) and looks up FCC/TowerSource for all pins in a few temp-table joins instead of two to four queries per site. If the bulk lookup fails, sites fall back to per-site queries automatically.
 

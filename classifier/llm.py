@@ -66,7 +66,7 @@ class RateLimiter:
             )
 
 
-GEMINI_LIMITER = RateLimiter(env_float("GEMINI_RPM", 30))
+GEMINI_LIMITER = RateLimiter(env_float("GEMINI_RPM", 120))
 CLAUDE_LIMITER = RateLimiter(env_float("CLAUDE_RPM", 50))
 
 
@@ -191,8 +191,10 @@ def call_gemini_json(
                 attempt += 1
                 wait = _gemini_retry_wait_s(attempt, exc)
                 label = "rate limit" if status == 429 else "service unavailable"
-                logger.info(
-                    "transient Gemini %s (%s), cooling down %.0fs (%s/%s)",
+                # WARNING so it reaches the terminal: the signal to lower GEMINI_RPM.
+                logger.warning(
+                    "Gemini %s (%s) — all workers pause %.0fs (retry %s/%s); "
+                    "lower GEMINI_RPM if this repeats",
                     status, label, wait, attempt, max_retries,
                 )
                 GEMINI_LIMITER.cooldown(wait)
@@ -276,6 +278,10 @@ def call_claude_json(
                 raise
             if attempt < retries:
                 attempt += 1
+                logger.warning(
+                    "Claude 429 on %s — all workers pause %.0fs (retry %s/%s)",
+                    use_model, CLAUDE_RETRY_BASE_S * attempt, attempt, retries,
+                )
                 CLAUDE_LIMITER.cooldown(CLAUDE_RETRY_BASE_S * attempt)
                 continue
             if _hop_model(use_model, "rate limited"):
@@ -298,6 +304,10 @@ def call_claude_json(
                 ) from e
             if e.status_code in (429, 529, 503, 500) and attempt < retries:
                 attempt += 1
+                logger.warning(
+                    "Claude %s on %s — all workers pause %.0fs (retry %s/%s)",
+                    e.status_code, use_model, CLAUDE_RETRY_BASE_S * attempt, attempt, retries,
+                )
                 CLAUDE_LIMITER.cooldown(CLAUDE_RETRY_BASE_S * attempt)
                 continue
             if e.status_code in (429, 529) and _hop_model(use_model, "overloaded"):
