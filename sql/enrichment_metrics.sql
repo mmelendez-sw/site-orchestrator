@@ -267,9 +267,11 @@ SELECT
     SUM(EmptyToRooftopApply) AS NaipEmptyToRooftopApply,
     CAST(SUM(EmptyToRooftopApply) * 1.0 / NULLIF(SUM(EmptyToNearmapEver), 0) AS decimal(6,3))
         AS EmptyToRooftopApplyRate,
-    CAST(SUM(RooftopWrite) * 1.0 / NULLIF(COUNT(*), 0) AS decimal(6,3)) AS RooftopWriteRate,
-    CAST(SUM(TowerWrite) * 1.0 / NULLIF(COUNT(*), 0) AS decimal(6,3)) AS TowerWriteRate,
-    CAST(SUM(IsWritten) * 1.0 / NULLIF(COUNT(*), 0) AS decimal(6,3)) AS TotalWriteRate
+    -- Yield over sites processed; mix and DB-match share over sites enriched.
+    CAST(SUM(IsWritten) * 1.0 / NULLIF(COUNT(*), 0) AS decimal(6,3)) AS TotalWriteRate,
+    CAST(SUM(RooftopWrite) * 1.0 / NULLIF(SUM(IsWritten), 0) AS decimal(6,3)) AS RooftopWriteRate,
+    CAST(SUM(TowerWrite) * 1.0 / NULLIF(SUM(IsWritten), 0) AS decimal(6,3)) AS TowerWriteRate,
+    CAST(SUM(DbSkipWrite) * 1.0 / NULLIF(SUM(IsWritten), 0) AS decimal(6,3)) AS DbMatchRate
 FROM dbo.vEnrichmentSiteFacts
 GROUP BY GROUPING SETS ((), (SiteState), (MatchSource))
 GO

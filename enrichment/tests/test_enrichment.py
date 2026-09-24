@@ -1777,8 +1777,9 @@ class CostPolicyTests(unittest.TestCase):
         self.assertEqual(kpis["holdout_empty_confirmed"], 1)
         self.assertEqual(kpis["holdout_empty"], 0)
         self.assertEqual(kpis["naip_empty_to_rooftop_apply"], 1)
-        self.assertEqual(kpis["rooftop_write_rate"], 0.333)
-        self.assertEqual(kpis["tower_write_rate"], 0.333)
+        # Mix is a share of enriched sites; yield is enriched / processed.
+        self.assertEqual(kpis["rooftop_write_rate"], 0.5)
+        self.assertEqual(kpis["tower_write_rate"], 0.5)
         self.assertEqual(kpis["total_write_rate"], 0.667)
 
     def test_rollup_counts_misses_and_failures_as_processed(self):

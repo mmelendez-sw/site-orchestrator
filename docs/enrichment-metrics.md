@@ -18,18 +18,25 @@ Local fallback (same grain as SQL):
 
 ## Counting rules
 
+Headline KPIs for leadership (`dbo.vEnrichmentKpis`, `kpis.json`):
+
+| Question | KPI (column) | Definition |
+|---|---|---|
+| How much ground did we cover? | **Sites processed** (`UniqueSites`) | Distinct Salesforce Ids a live run evaluated — applied, held out, DB-only miss, failed apply, skipped, or error |
+| How much did we deliver? | **Sites enriched** (`WrittenSites`) | Distinct Ids with a Salesforce-accepted Site_Type write (`sf_update_status=updated`) |
+| How well does it convert? | **Enrichment yield** (`TotalWriteRate`) | Sites enriched ÷ sites processed |
+| What did we deliver? | **Tower share / Rooftop share** (`TowerWriteRate` / `RooftopWriteRate`) | `TowerSfWrites` / `RooftopSfWrites` ÷ sites enriched — by the Site_Type written, whether imagery or the tower database decided it |
+| How cheaply? | **DB-match share** (`DbMatchRate`) | `AppliedDbSkip` (unique FCC/TowerSource hit, no imagery or AI spend) ÷ sites enriched |
+
+Supporting counts:
+
 | KPI | Definition |
 |---|---|
-| **UniqueSites** | Distinct Salesforce Ids any live run processed — applied, held out, DB-only miss, failed apply, skipped, or error. |
-| **WrittenSites** | Distinct Ids with at least one Salesforce-accepted site-type/coords write (`sf_update_status=updated`, outcome `applied_*`). |
-| RooftopSfWrites / TowerSfWrites | WrittenSites split by the Site_Type written — rooftop vs any tower type — whether imagery or the tower database decided it. |
-| AppliedDbSkip | The share of WrittenSites decided by a unique FCC/TowerSource hit (no imagery). Overlaps the rooftop/tower counts (≈99% towers). Imagery-decided writes = WrittenSites − AppliedDbSkip. |
-| TotalWriteRate | WrittenSites / UniqueSites. Rooftop / Tower rates use the same denominator. |
 | Outcome counts (holdouts, errors, misses) | Each Id's **latest** observation. A site held out in one run and written in a later run counts as written, once. |
 | NearmapSites / ClaudeSites | Ids where paid imagery / Claude **ever** ran (spend proxy, not applies). |
 | NaipEmptyToNearmap / …RooftopApply | Ids whose NAIP screen was empty but Nearmap ran / then wrote a rooftop. |
 
-Before this change UniqueSites counted only successful writes (that number is now **WrittenSites**), and TotalWriteRate left out DB-skip writes.
+`TowerSfWrites + RooftopSfWrites = WrittenSites` (plus the rare `applied_other`). Imagery-decided writes = `WrittenSites − AppliedDbSkip`. Yield swings with the queue: DB-only runs over wide stages evaluate many sites with no tower match, which lowers yield without anything being wrong — slice by `MatchSource` or run type to compare like with like.
 
 ## Objects (2 tables, 7 views)
 

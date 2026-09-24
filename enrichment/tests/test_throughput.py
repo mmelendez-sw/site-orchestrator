@@ -510,6 +510,7 @@ class WriteGroupingTests(unittest.TestCase):
         self.assertEqual(kpis["rooftop_sf_writes"], 2)
         self.assertEqual(kpis["db_skip_sf_writes"], 2)
         self.assertEqual(kpis["tower_write_rate"], 0.5)
+        self.assertEqual(kpis["db_match_rate"], 0.5)
 
 
 class MetricsSinkTests(unittest.TestCase):

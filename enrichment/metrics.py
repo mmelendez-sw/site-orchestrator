@@ -322,6 +322,7 @@ def rollup_kpis(site_rows: list[dict[str, Any]]) -> dict[str, Any]:
     write_types = Counter(written_site_type(rec) for rec in written.values())
     rooftop = write_types.get("rooftop", 0)
     tower = write_types.get("tower", 0)
+    db_skip = sum(1 for rec in written.values() if rec.get("outcome") == "applied_db_skip")
     empty_nm = len(ever["empty_nm"])
     empty_rt_apply = sum(
         1 for rec in written.values() if is_true(rec.get("empty_to_rooftop_apply"))
@@ -331,12 +332,12 @@ def rollup_kpis(site_rows: list[dict[str, Any]]) -> dict[str, Any]:
         "written_sites": len(written),
         "rooftop_sf_writes": rooftop,
         "tower_sf_writes": tower,
-        "db_skip_sf_writes": sum(
-            1 for rec in written.values() if rec.get("outcome") == "applied_db_skip"
-        ),
-        "rooftop_write_rate": _rate(rooftop, n),
-        "tower_write_rate": _rate(tower, n),
+        "db_skip_sf_writes": db_skip,
+        # Yield over sites processed; mix and DB share over sites enriched.
         "total_write_rate": _rate(len(written), n),
+        "rooftop_write_rate": _rate(rooftop, len(written)),
+        "tower_write_rate": _rate(tower, len(written)),
+        "db_match_rate": _rate(db_skip, len(written)),
         "nearmap_sites": len(ever["nearmap"]),
         "claude_sites": len(ever["claude"]),
         "naip_empty_to_nearmap": empty_nm,
@@ -390,8 +391,9 @@ KPI_METRIC_KEYS: tuple[str, ...] = (
     "tower_sf_writes",
     "db_skip_sf_writes",
     "total_write_rate",
-    "rooftop_write_rate",
     "tower_write_rate",
+    "rooftop_write_rate",
+    "db_match_rate",
     "naip_empty_to_nearmap",
     "naip_empty_to_rooftop_apply",
     "empty_to_rooftop_apply_rate",
@@ -425,6 +427,13 @@ def format_metric_value(key: str, value: Any) -> str:
 # Terminal labels. Keep JSON/SQL keys (nearmap_sites / claude_sites) stable;
 # those counts are spend (imagery/model ran), not successful applies.
 METRIC_DISPLAY_NAMES: dict[str, str] = {
+    "unique_sites": "sites_processed",
+    "written_sites": "sites_enriched",
+    "total_write_rate": "enrichment_yield (enriched / processed)",
+    "tower_write_rate": "tower_share (of enriched)",
+    "rooftop_write_rate": "rooftop_share (of enriched)",
+    "db_match_rate": "db_match_share (of enriched, no imagery/AI)",
+    "db_skip_sf_writes": "db_matched_writes",
     "nearmap_sites": "nearmap_imagery_ran",
     "claude_sites": "claude_ai_ran",
 }
