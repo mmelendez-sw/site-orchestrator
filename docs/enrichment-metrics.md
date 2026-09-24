@@ -22,7 +22,8 @@ Local fallback (same grain as SQL):
 |---|---|
 | **UniqueSites** | Distinct Salesforce Ids any live run processed — applied, held out, DB-only miss, failed apply, skipped, or error. |
 | **WrittenSites** | Distinct Ids with at least one Salesforce-accepted site-type/coords write (`sf_update_status=updated`, outcome `applied_*`). |
-| RooftopSfWrites / TowerSfWrites / AppliedDbSkip | WrittenSites split by how the write was decided: imagery rooftop, imagery tower, unique FCC/TowerSource hit. They sum to WrittenSites (plus the rare `applied_other`). |
+| RooftopSfWrites / TowerSfWrites | WrittenSites split by the Site_Type written — rooftop vs any tower type — whether imagery or the tower database decided it. |
+| AppliedDbSkip | The share of WrittenSites decided by a unique FCC/TowerSource hit (no imagery). Overlaps the rooftop/tower counts (≈99% towers). Imagery-decided writes = WrittenSites − AppliedDbSkip. |
 | TotalWriteRate | WrittenSites / UniqueSites. Rooftop / Tower rates use the same denominator. |
 | Outcome counts (holdouts, errors, misses) | Each Id's **latest** observation. A site held out in one run and written in a later run counts as written, once. |
 | NearmapSites / ClaudeSites | Ids where paid imagery / Claude **ever** ran (spend proxy, not applies). |

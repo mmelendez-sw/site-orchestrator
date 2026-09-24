@@ -491,6 +491,27 @@ class OutcomeClassTests(unittest.TestCase):
         self.assertEqual(outcome_class({"holdout_reason": "sql_error"}), "error")
 
 
+class WriteGroupingTests(unittest.TestCase):
+    def test_db_matched_towers_count_as_tower_writes(self):
+        from enrichment.metrics import rollup_kpis
+
+        kpis = rollup_kpis([
+            {"Id": "img", "outcome": "applied_tower", "final_site_type": "tower",
+             "sf_update_status": "updated"},
+            {"Id": "db", "outcome": "applied_db_skip", "final_site_type": "tower",
+             "sf_update_status": "updated"},
+            {"Id": "dbroof", "outcome": "applied_db_skip", "final_site_type": "rooftop",
+             "sf_update_status": "updated"},
+            {"Id": "roof", "outcome": "applied_rooftop", "final_site_type": "rooftop",
+             "sf_update_status": "updated"},
+        ])
+        self.assertEqual(kpis["written_sites"], 4)
+        self.assertEqual(kpis["tower_sf_writes"], 2)
+        self.assertEqual(kpis["rooftop_sf_writes"], 2)
+        self.assertEqual(kpis["db_skip_sf_writes"], 2)
+        self.assertEqual(kpis["tower_write_rate"], 0.5)
+
+
 class MetricsSinkTests(unittest.TestCase):
     def test_sink_upserts_header_then_each_site(self):
         from enrichment import metrics_store

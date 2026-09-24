@@ -227,6 +227,17 @@ def is_successful_sf_write(rec: dict[str, Any]) -> bool:
     return lower_text(rec.get("sf_update_status")) == "updated"
 
 
+_OUTCOME_SITE_TYPE = {"applied_rooftop": "rooftop", "applied_tower": "tower"}
+
+
+def written_site_type(rec: dict[str, Any]) -> str:
+    """rooftop | tower | other for a write, whoever decided it (imagery or DB)."""
+    final = lower_text(rec.get("final_site_type"))
+    if final in {"rooftop", "tower"}:
+        return final
+    return _OUTCOME_SITE_TYPE.get(lower_text(rec.get("outcome")), "other")
+
+
 def _outcome_counts(records: Iterable[dict[str, Any]]) -> Counter:
     return Counter(str(rec.get("outcome") or "holdout_other") for rec in records)
 
@@ -306,9 +317,11 @@ def rollup_kpis(site_rows: list[dict[str, Any]]) -> dict[str, Any]:
             ever["empty_nm"].add(sid)
     n = len(latest)
     by_outcome = _outcome_counts(latest.values())
-    write_kinds = _outcome_counts(written.values())
-    rooftop = write_kinds.get("applied_rooftop", 0)
-    tower = write_kinds.get("applied_tower", 0)
+    # Grouped by the Site_Type written (imagery or tower-database decided);
+    # db_skip_sf_writes is the tower-database share of those, not a third kind.
+    write_types = Counter(written_site_type(rec) for rec in written.values())
+    rooftop = write_types.get("rooftop", 0)
+    tower = write_types.get("tower", 0)
     empty_nm = len(ever["empty_nm"])
     empty_rt_apply = sum(
         1 for rec in written.values() if is_true(rec.get("empty_to_rooftop_apply"))
@@ -318,7 +331,9 @@ def rollup_kpis(site_rows: list[dict[str, Any]]) -> dict[str, Any]:
         "written_sites": len(written),
         "rooftop_sf_writes": rooftop,
         "tower_sf_writes": tower,
-        "db_skip_sf_writes": write_kinds.get("applied_db_skip", 0),
+        "db_skip_sf_writes": sum(
+            1 for rec in written.values() if rec.get("outcome") == "applied_db_skip"
+        ),
         "rooftop_write_rate": _rate(rooftop, n),
         "tower_write_rate": _rate(tower, n),
         "total_write_rate": _rate(len(written), n),

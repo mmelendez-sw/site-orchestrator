@@ -207,8 +207,12 @@ SELECT
     l.MatchSource,
     l.Outcome,
     CASE WHEN w.SalesforceId IS NULL THEN 0 ELSE 1 END AS IsWritten,
-    CASE WHEN w.Outcome = N'applied_rooftop' THEN 1 ELSE 0 END AS RooftopWrite,
-    CASE WHEN w.Outcome = N'applied_tower' THEN 1 ELSE 0 END AS TowerWrite,
+    -- Rooftop / tower by the Site_Type written (imagery or tower database);
+    -- DbSkipWrite is the tower-database share of those.
+    CASE WHEN w.FinalSiteType = N'rooftop'
+          OR (w.FinalSiteType IS NULL AND w.Outcome = N'applied_rooftop') THEN 1 ELSE 0 END AS RooftopWrite,
+    CASE WHEN w.FinalSiteType = N'tower'
+          OR (w.FinalSiteType IS NULL AND w.Outcome = N'applied_tower') THEN 1 ELSE 0 END AS TowerWrite,
     CASE WHEN w.Outcome = N'applied_db_skip' THEN 1 ELSE 0 END AS DbSkipWrite,
     CASE WHEN w.EmptyToRooftopApply = 1 THEN 1 ELSE 0 END AS EmptyToRooftopApply,
     e.NearmapEver,
