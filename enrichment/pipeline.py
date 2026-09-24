@@ -115,9 +115,17 @@ _SQL_ERROR_HOLDOUT = "sql_error"
 _NOT_PREFETCHED = object()
 
 
+MAX_CLASSIFY_WORKERS = 32
+
+
 def classify_workers() -> int:
-    """Parallel imagery-classify threads (``CLASSIFY_WORKERS``, default 3)."""
-    return max(1, env_int("CLASSIFY_WORKERS", 3))
+    """Parallel imagery-classify threads (``CLASSIFY_WORKERS``, default 3, max 32).
+
+    Throughput tops out at the shared model pacing, not the thread count:
+    roughly GEMINI_RPM / (Gemini calls per site) sites per minute. Raise
+    GEMINI_RPM with CLASSIFY_WORKERS, up to your Gemini quota.
+    """
+    return max(1, min(MAX_CLASSIFY_WORKERS, env_int("CLASSIFY_WORKERS", 3)))
 
 
 def apply_batch_size() -> int:
@@ -1213,8 +1221,9 @@ class _RunState:
 
     def _report(self, row: dict[str, Any], elapsed_s: float) -> None:
         if self.verbose:
+            who = f"{row.get('Id')} | " if self.compact else ""
             progress.result(
-                f"{row.get('bucket')} | type={row.get('naip_site_type') or '—'} | "
+                f"{who}{row.get('bucket')} | type={row.get('naip_site_type') or '—'} | "
                 f"img={row.get('imagery_used') or '—'} | "
                 f"tier={row.get('nearmap_tier') or '—'} | "
                 f"ai={row.get('escalation_model') or row.get('primary_model') or '—'} | "
@@ -1286,12 +1295,17 @@ def _classify_all(
                 if stop.is_set():
                     break
                 index, prep = preps[member]
-                with progress.site_context(f"{index}/{total} {prep.base['Id']}"):
-                    try:
-                        results.put(("row", run_one(index, prep)))
-                    except BaseException as exc:  # noqa: BLE001 — surface on main thread
-                        results.put(("error", exc))
-                        return
+                # Hand the row over only after the site's buffered block has
+                # printed, so its result line follows its own steps.
+                try:
+                    with progress.site_context(
+                        f"{index}/{total} {prep.base['Id']}", buffered=verbose
+                    ):
+                        outcome = run_one(index, prep)
+                except BaseException as exc:  # noqa: BLE001 — surface on main thread
+                    results.put(("error", exc))
+                    return
+                results.put(("row", outcome))
         finally:
             results.put(("group_done", None))
 

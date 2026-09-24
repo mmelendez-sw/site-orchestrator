@@ -91,6 +91,10 @@ Also install the ODBC Driver 18 for SQL Server. For tests and lint: `pip install
 
 One process classifies `CLASSIFY_WORKERS` sites at once (default 3). Pins within `PIN_CLUSTER_M` of each other stay in one worker so nearby-pin reuse still saves imagery. Every Gemini / Claude call waits on a shared limiter — `GEMINI_RPM` (default 30) and `CLAUDE_RPM` (default 50) — and a 429/503 pauses all workers together. This replaces the old fixed `GEMINI_DELAY_S` sleep after each site (`GEMINI_DELAY_S` / `CLAUDE_DELAY_S` are ignored now). Run **one** terminal and raise `CLASSIFY_WORKERS` instead of opening more; separate processes do not share the limiter. Lower `GEMINI_RPM` if 429 retries show up.
 
+With `VERBOSE=1` and more than one worker, each site's steps print as one block when that site finishes (tagged `[index/total Id]`), followed by its result line. `CLASSIFY_WORKERS=1` restores live step-by-step output.
+
+Scaling: `CLASSIFY_WORKERS` goes up to 32, but the ceiling is model pacing — roughly `GEMINI_RPM` ÷ Gemini calls per site (typically 2–5) sites per minute. More workers only help once `GEMINI_RPM` is raised to match, up to your Gemini project quota. Each worker also opens up to `NEARMAP_TILE_WORKERS` (8) tile downloads at once.
+
 Before classifying, the run geocodes the whole queue in Census batch requests (cached in `../site-orchestrator-data/cache/census_geocode.jsonl`) and looks up FCC/TowerSource for all pins in a few temp-table joins instead of two to four queries per site. If the bulk lookup fails, sites fall back to per-site queries automatically.
 
 Salesforce writes, Azure SQL, and the detail CSV all stay on the main thread. The first Ctrl+C finishes in-flight sites and flushes pending writes; a second aborts. Salesforce writes go out in sObject Collections batches of `APPLY_BATCH_SIZE` (default 25, max 200) or after `APPLY_FLUSH_S` (default 60 s), whichever comes first; `APPLY_BATCH_SIZE=1` writes each site as it finishes. Every finished site is in `enrichment_detail.csv` (status `pending`) before its batch is sent, so after a hard crash `APPLY_EXISTING=1` with that `RUN_DIR` pushes whatever had not gone out.

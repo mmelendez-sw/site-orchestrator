@@ -27,14 +27,27 @@ def _stdout_is_tty() -> bool:
 
 
 @contextmanager
-def site_context(label: str | None) -> Iterator[None]:
-    """Prefix this thread's output lines with ``[label]`` (parallel workers)."""
+def site_context(label: str | None, *, buffered: bool = False) -> Iterator[None]:
+    """Tag this thread's lines with ``[label]``; optionally hold them as a block.
+
+    ``buffered=True`` (parallel workers) collects every line printed inside
+    the block and writes them together when it exits, so one site's steps
+    read top to bottom instead of interleaving with other workers.
+    """
     prior = getattr(_local, "label", None)
+    prior_buffer = getattr(_local, "buffer", None)
     _local.label = label
+    _local.buffer = [] if buffered else None
     try:
         yield
     finally:
+        held = _local.buffer
         _local.label = prior
+        _local.buffer = prior_buffer
+        if held:
+            with _print_lock:
+                for args, kwargs in held:
+                    _print(*args, **kwargs)
 
 
 def _tag(text: str) -> str:
@@ -46,19 +59,27 @@ def _tag(text: str) -> str:
     )
 
 
-def _safe_print(*args: Any, **kwargs: Any) -> None:
+def _print(*args: Any, **kwargs: Any) -> None:
     """Print without crashing on cp1252 consoles (checkmark, arrows, dashes)."""
+    try:
+        print(*args, **kwargs)
+    except UnicodeEncodeError:
+        encoding = getattr(kwargs.get("file") or sys.stdout, "encoding", None) or "ascii"
+        safe_args = [
+            str(arg).encode(encoding, errors="replace").decode(encoding, errors="replace")
+            for arg in args
+        ]
+        print(*safe_args, **kwargs)
+
+
+def _safe_print(*args: Any, **kwargs: Any) -> None:
     args = tuple(_tag(str(arg)) for arg in args)
+    held = getattr(_local, "buffer", None)
+    if held is not None:
+        held.append((args, kwargs))
+        return
     with _print_lock:
-        try:
-            print(*args, **kwargs)
-        except UnicodeEncodeError:
-            encoding = getattr(kwargs.get("file") or sys.stdout, "encoding", None) or "ascii"
-            safe_args = [
-                str(arg).encode(encoding, errors="replace").decode(encoding, errors="replace")
-                for arg in args
-            ]
-            print(*safe_args, **kwargs)
+        _print(*args, **kwargs)
 
 
 def emit(message: str) -> None:

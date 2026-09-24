@@ -2934,6 +2934,35 @@ class ProgressBusyTests(unittest.TestCase):
             "connecting SQL | run 1m05s",
         )
 
+    def test_buffered_site_context_prints_each_site_as_one_block(self):
+        import io
+        import threading
+        from unittest.mock import patch
+
+        from enrichment import progress
+
+        buf = io.StringIO()
+        both_started = threading.Barrier(2)
+
+        def worker(label):
+            with progress.site_context(label, buffered=True):
+                progress.step("first")
+                both_started.wait()
+                progress.step("second")
+
+        with patch.object(progress.sys, "stdout", buf):
+            threads = [threading.Thread(target=worker, args=(n,)) for n in ("A", "B")]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        lines = [line for line in buf.getvalue().splitlines() if line]
+        self.assertEqual(len(lines), 4)
+        for start in (0, 2):
+            label = lines[start][1]
+            self.assertEqual(lines[start], f"[{label}]   -> first")
+            self.assertEqual(lines[start + 1], f"[{label}]   -> second")
+
     def test_busy_non_tty_prints_one_line(self):
         import io
         from unittest.mock import patch
