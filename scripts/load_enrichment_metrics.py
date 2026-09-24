@@ -1,17 +1,25 @@
-"""One-time: create enrichment metric tables in Azure SQL and load the JSONL ledger.
+"""Create/alter the enrichment metric tables in Azure SQL and load the JSONL ledger.
 
 Uses the same Entra token connection as FCC/TowerSource (az login).
 
-  python scripts/load_enrichment_metrics.py
   python scripts/load_enrichment_metrics.py --dry-run
+  python scripts/load_enrichment_metrics.py
+  python scripts/load_enrichment_metrics.py --backfill-processed --dry-run
+  python scripts/load_enrichment_metrics.py --backfill-processed
 
-Idempotent. Re-running replaces rows for run_ids present in metrics/runs.jsonl.
+Default: upsert every run in metrics/runs.jsonl with its site rows from
+metrics/sites.jsonl (idempotent per run_id).
+
+--backfill-processed: rebuild metrics/sites.jsonl from each live run's
+enrichment_detail.csv so UniqueSites counts every processed site (applied,
+held out, missed, errored) for runs recorded when the ledger only kept
+successful writes. Replaces all EnrichmentSiteOutcome rows with the rebuilt
+set. Combine with --dry-run to compare counts without writing anything.
 """
 
 from __future__ import annotations
 
 import argparse
-import csv
 import sys
 from pathlib import Path
 
@@ -23,160 +31,113 @@ from dotenv import load_dotenv
 
 load_dotenv(ROOT / ".env")
 
-from enrichment.constants import DETAIL_CSV  # noqa: E402
 from enrichment.metrics import (  # noqa: E402
+    KPIS_JSON,
     RUNS_JSONL,
     SITES_JSONL,
     _read_jsonl,
-    apply_slice_fields,
-    kpi_eligible,
-    refresh_kpis_from_ledger,
+    _rewrite_jsonl,
+    rebuild_site_ledger,
+    rollup_kpis,
 )
-from paths import metrics_dir, runs_dir  # noqa: E402
 from enrichment.metrics_store import (  # noqa: E402
     delete_all_site_outcomes,
-    delete_ineligible_site_rows,
     ensure_tables,
     upsert_snapshot,
 )
-from enrichment.mssql import connect_mssql  # noqa: E402
+from paths import metrics_dir, runs_dir  # noqa: E402
 
 
-def _load_ledger() -> tuple[list[dict], list[dict]]:
-    root = metrics_dir()
-    runs = _read_jsonl(root / RUNS_JSONL)
-    sites = _read_jsonl(root / SITES_JSONL)
-    return runs, sites
-
-
-def _detail_by_id(run_id: str) -> dict[str, dict]:
-    path = runs_dir() / run_id / DETAIL_CSV
-    if not path.is_file():
-        return {}
-    with path.open(encoding="utf-8", newline="") as handle:
-        return {
-            str(row.get("Id") or ""): row
-            for row in csv.DictReader(handle)
-            if row.get("Id")
-        }
-
-
-def _hydrate_site(rec: dict, detail: dict[str, dict]) -> dict:
-    csv_row = detail.get(str(rec.get("Id") or ""))
-    merged = {**(csv_row or {}), **rec}
-    return apply_slice_fields(merged)
-
-
-def _snaps_from_ledger(
-    runs: list[dict], sites: list[dict]
-) -> list[dict]:
+def _snapshots(runs: list[dict], sites: list[dict]) -> list[dict]:
+    """One snapshot per run_id (last header wins) with that run's site rows."""
     by_run: dict[str, list[dict]] = {}
     for rec in sites:
-        rid = str(rec.get("run_id") or "")
-        if rid:
-            by_run.setdefault(rid, []).append(rec)
-    snaps: list[dict] = []
+        by_run.setdefault(str(rec.get("run_id") or ""), []).append(rec)
+    headers: dict[str, dict] = {}
     for run in runs:
         rid = str(run.get("run_id") or "")
-        if not rid:
-            continue
-        detail = _detail_by_id(rid)
-        snap = dict(run)
-        records = []
-        for rec in by_run.get(rid, []):
-            if not kpi_eligible(rec):
-                continue
-            records.append(_hydrate_site(rec, detail))
-        snap["site_records"] = records
-        snaps.append(snap)
-    return snaps
+        if rid:
+            headers[rid] = run
+    return [
+        {**header, "site_records": by_run.get(rid, [])}
+        for rid, header in headers.items()
+    ]
+
+
+def _print_kpis(label: str, kpis: dict) -> None:
+    print(
+        f"{label}: unique_sites={kpis.get('unique_sites')} "
+        f"written_sites={kpis.get('written_sites')} "
+        f"rooftop={kpis.get('rooftop_sf_writes')} tower={kpis.get('tower_sf_writes')} "
+        f"db_skip={kpis.get('db_skip_sf_writes')} outcomes={kpis.get('outcomes')}"
+    )
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--dry-run", action="store_true", help="Print counts; write nothing")
     parser.add_argument(
-        "--dry-run",
+        "--backfill-processed",
         action="store_true",
-        help="Print counts; do not connect or write",
+        help="Rebuild sites.jsonl + SQL site rows from run CSVs (every processed site)",
     )
     parser.add_argument(
         "--rebuild-sites",
         action="store_true",
-        help="Delete all EnrichmentSiteOutcome rows, then reload net-new writes",
+        help="Delete all EnrichmentSiteOutcome rows before loading the ledger",
     )
     args = parser.parse_args()
-    kpis = refresh_kpis_from_ledger()
-    print(
-        f"local unique_sites={kpis.get('unique_sites')} "
-        f"rooftop={kpis.get('rooftop_sf_writes')} "
-        f"tower={kpis.get('tower_sf_writes')} "
-        f"outcomes={kpis.get('outcomes')}"
-    )
-    runs, sites = _load_ledger()
-    snaps = _snaps_from_ledger(runs, sites)
-    eligible = sum(len(snap.get("site_records") or []) for snap in snaps)
-    print(
-        f"ledger runs={len(runs)} site_rows={len(sites)} "
-        f"eligible_write_rows={eligible} snaps={len(snaps)}"
-    )
-    for snap in snaps:
-        n = len(snap.get("site_records") or [])
-        if n:
-            print(
-                f"  {snap.get('run_id')}: writes={n} "
-                f"applied_rooftop={snap.get('applied_rooftop')}"
-            )
+
+    root = metrics_dir()
+    runs = _read_jsonl(root / RUNS_JSONL)
+    sites = _read_jsonl(root / SITES_JSONL)
+    _print_kpis("ledger now", rollup_kpis(sites))
+    if args.backfill_processed:
+        sites, stats = rebuild_site_ledger(runs_root=runs_dir(), root=root)
+        print(f"backfill: {stats}")
+        _print_kpis("after backfill", rollup_kpis(sites))
+    snaps = _snapshots(runs, sites)
+    print(f"runs={len(snaps)} site_rows={sum(len(s['site_records']) for s in snaps)}")
     if args.dry_run:
-        print("dry-run — no SQL writes")
+        print("dry-run — no JSONL or SQL writes")
         return 0
 
-    leftover = 0
-    row = fact = holdouts_left = None
+    if args.backfill_processed:
+        _rewrite_jsonl(root / SITES_JSONL, sites)
+    kpis = rollup_kpis(sites)
+    import json
+
+    (root / KPIS_JSON).write_text(json.dumps(kpis, indent=2), encoding="utf-8")
+
+    from enrichment.mssql import connect_mssql
+
     conn = connect_mssql()
     try:
         cursor = conn.cursor()
         ensure_tables(cursor)
-        if args.rebuild_sites:
+        if args.rebuild_sites or args.backfill_processed:
             delete_all_site_outcomes(cursor)
             print("cleared dbo.EnrichmentSiteOutcome")
-        total_sites = 0
+        total = 0
         for snap in snaps:
-            n = upsert_snapshot(cursor, snap)
-            total_sites += n
-            if n:
-                print(f"  upserted {snap.get('run_id')} ({n} site rows)")
-        leftover = delete_ineligible_site_rows(cursor)
+            total += upsert_snapshot(cursor, snap)
         conn.commit()
-        cursor.execute("SELECT UniqueSites, RooftopSfWrites, TowerSfWrites, AppliedDbSkip FROM dbo.vEnrichmentKpis")
-        row = cursor.fetchone()
-        cursor.execute("SELECT COUNT(*) FROM dbo.EnrichmentSiteOutcome")
-        fact = cursor.fetchone()
         cursor.execute(
-            """
-            SELECT COUNT(*) FROM dbo.EnrichmentSiteOutcome
-            WHERE Outcome NOT IN (
-                N'applied_rooftop', N'applied_tower',
-                N'applied_db_skip', N'applied_other'
-            )
-            """
+            "SELECT UniqueSites, WrittenSites, RooftopSfWrites, TowerSfWrites, "
+            "AppliedDbSkip FROM dbo.vEnrichmentKpis"
         )
-        holdouts_left = cursor.fetchone()
+        row = cursor.fetchone()
     except Exception:
         conn.rollback()
         raise
     finally:
         conn.close()
-    print(f"done — {len(snaps)} run(s), {total_sites} site row(s) inserted")
-    print(f"removed leftover ineligible rows: {leftover}")
+    print(f"done — {len(snaps)} run(s), {total} site row(s) loaded")
     if row:
         print(
-            f"sql UniqueSites={row[0]} RooftopSfWrites={row[1]} "
-            f"TowerSfWrites={row[2]} AppliedDbSkip={row[3]}"
+            f"sql UniqueSites={row[0]} WrittenSites={row[1]} RooftopSfWrites={row[2]} "
+            f"TowerSfWrites={row[3]} AppliedDbSkip={row[4]}"
         )
-    if fact:
-        print(f"sql EnrichmentSiteOutcome rows={fact[0]}")
-    if holdouts_left:
-        print(f"sql non-apply outcome rows={holdouts_left[0]}")
     print("query: SELECT * FROM dbo.vEnrichmentKpis")
     return 0
 

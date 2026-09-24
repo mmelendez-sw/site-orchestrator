@@ -7,11 +7,13 @@ import math
 import os
 import struct
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
+from enrichment.coerce import to_float as _to_float
 from enrichment.geo import haversine_meters
+from envutil import env_int
 
 from enrichment.constants import (
     BBOX_BUFFER_DEG,
@@ -402,18 +404,6 @@ def connect_mssql(connection_string: str | None = None):
         )
 
 
-def _to_float(value: Any) -> float | None:
-    if value is None:
-        return None
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return None
-    if number != number:  # NaN
-        return None
-    return number
-
-
 def fcc_coordinates(row: dict[str, Any]) -> tuple[float, float] | None:
     """Prefer decimal lat/lng; fall back to calculated columns."""
     lat = _to_float(row.get("Latitude_Decimal"))
@@ -440,22 +430,33 @@ def _row_dict(cursor, row) -> dict[str, Any]:
     return dict(zip(columns, row))
 
 
+_FCC_COLUMNS = (
+    "ID, ASR_Number, Latitude_Decimal, Longitude_Decimal, "
+    "Latitude_Calculated, Longitude_Calculated, "
+    "Registration_Type, Record_Type, Entity_Name"
+)
+_TS_COLUMNS = (
+    "operator_site_identifier, asset_name, asset_type, asset_category, "
+    "latitude, longitude, fcc_asr_number, street1, city, state, postal_code"
+)
+_FCC_BBOX = (
+    "((f.Latitude_Decimal BETWEEN {a} AND {b} AND f.Longitude_Decimal BETWEEN {c} AND {d})"
+    " OR (f.Latitude_Calculated BETWEEN {a} AND {b} AND f.Longitude_Calculated BETWEEN {c} AND {d}))"
+)
+_TS_BBOX = "(t.latitude BETWEEN {a} AND {b} AND t.longitude BETWEEN {c} AND {d})"
+
+
+def _prefixed(columns: str, alias: str) -> str:
+    return ", ".join(f"{alias}.{col.strip()}" for col in columns.split(","))
+
+
 def _fetch_fcc_candidates(
     cursor, lat: float, lng: float, *, max_m: float = PROXIMITY_MAX_M
 ) -> list[dict[str, Any]]:
     min_lat, max_lat, min_lng, max_lng = _bbox(lat, lng, max_m=max_m)
-    sql = f"""
-        SELECT ID, ASR_Number, Latitude_Decimal, Longitude_Decimal,
-               Latitude_Calculated, Longitude_Calculated,
-               Registration_Type, Record_Type, Entity_Name
-        FROM {FCC_TABLE}
-        WHERE (
-                (Latitude_Decimal BETWEEN ? AND ? AND Longitude_Decimal BETWEEN ? AND ?)
-             OR (Latitude_Calculated BETWEEN ? AND ? AND Longitude_Calculated BETWEEN ? AND ?)
-              )
-    """
+    where = _FCC_BBOX.format(a="?", b="?", c="?", d="?")
     cursor.execute(
-        sql,
+        f"SELECT {_prefixed(_FCC_COLUMNS, 'f')} FROM {FCC_TABLE} AS f WHERE {where}",
         min_lat, max_lat, min_lng, max_lng,
         min_lat, max_lat, min_lng, max_lng,
     )
@@ -466,15 +467,19 @@ def _fetch_towersource_candidates(
     cursor, lat: float, lng: float, *, max_m: float = PROXIMITY_MAX_M
 ) -> list[dict[str, Any]]:
     min_lat, max_lat, min_lng, max_lng = _bbox(lat, lng, max_m=max_m)
-    sql = f"""
-        SELECT operator_site_identifier, asset_name, asset_type, asset_category,
-               latitude, longitude, fcc_asr_number, street1, city, state, postal_code
-        FROM {TOWERSOURCE_TABLE}
-        WHERE latitude BETWEEN ? AND ?
-          AND longitude BETWEEN ? AND ?
-    """
-    cursor.execute(sql, min_lat, max_lat, min_lng, max_lng)
+    where = _TS_BBOX.format(a="?", b="?", c="?", d="?")
+    cursor.execute(
+        f"SELECT {_prefixed(_TS_COLUMNS, 't')} FROM {TOWERSOURCE_TABLE} AS t WHERE {where}",
+        min_lat, max_lat, min_lng, max_lng,
+    )
     return [_row_dict(cursor, row) for row in cursor.fetchall()]
+
+
+def _first_value(row: dict[str, Any], keys: Sequence[str]) -> str | None:
+    for key in keys:
+        if row.get(key) not in (None, ""):
+            return str(row.get(key))
+    return None
 
 
 def _hits_from_rows(
@@ -504,21 +509,6 @@ def _hits_from_rows(
         # Keep if within max_m of pin OR (when address given) within max_m of address.
         if d_pin > max_m and (d_addr is None or d_addr > max_m):
             continue
-        record_id = None
-        for key in id_keys:
-            if row.get(key) not in (None, ""):
-                record_id = str(row.get(key))
-                break
-        asr_number = None
-        for key in asr_keys:
-            if row.get(key) not in (None, ""):
-                asr_number = str(row.get(key))
-                break
-        asset_type = None
-        for key in asset_type_keys:
-            if row.get(key) not in (None, ""):
-                asset_type = str(row.get(key))
-                break
         # distance_m = primary sort key: nearer of pin/address distances.
         primary = d_pin if d_addr is None else min(d_pin, d_addr)
         hits.append(
@@ -527,9 +517,9 @@ def _hits_from_rows(
                 distance_m=primary,
                 latitude=hit_lat,
                 longitude=hit_lng,
-                record_id=record_id,
-                asr_number=asr_number,
-                asset_type=asset_type,
+                record_id=_first_value(row, id_keys),
+                asr_number=_first_value(row, asr_keys),
+                asset_type=_first_value(row, asset_type_keys),
                 raw=row,
                 distance_to_pin_m=d_pin,
                 distance_to_address_m=d_addr,
@@ -552,28 +542,8 @@ def _dedupe_hits(hits: Sequence[ProximityHit]) -> list[ProximityHit]:
     return list(best.values())
 
 
-def _with_meta(
-    hit: ProximityHit,
-    *,
-    reason: str,
-    candidate_count: int,
-    runner_up_gap_m: float | None,
-) -> ProximityHit:
-    return ProximityHit(
-        source=hit.source,
-        distance_m=hit.distance_m,
-        latitude=hit.latitude,
-        longitude=hit.longitude,
-        record_id=hit.record_id,
-        asr_number=hit.asr_number,
-        asset_type=hit.asset_type,
-        raw=hit.raw,
-        distance_to_pin_m=hit.distance_to_pin_m,
-        distance_to_address_m=hit.distance_to_address_m,
-        selection_reason=reason,
-        candidate_count=candidate_count,
-        runner_up_gap_m=runner_up_gap_m,
-    )
+def _pin_distance(hit: ProximityHit) -> float:
+    return hit.distance_to_pin_m if hit.distance_to_pin_m is not None else hit.distance_m
 
 
 def select_proximity_hit(
@@ -600,34 +570,23 @@ def select_proximity_hit(
         second = min(others, key=key)
         return key(second) - key(best)
 
-    # 1) Confident: within confident_m of pin.
-    by_pin = sorted(
-        cands,
-        key=lambda h: (
-            h.distance_to_pin_m if h.distance_to_pin_m is not None else h.distance_m,
-            0 if h.source == MATCH_SOURCE_FCC else 1,
-        ),
-    )
-    confident_pin = [
-        h
-        for h in by_pin
-        if (h.distance_to_pin_m if h.distance_to_pin_m is not None else h.distance_m)
-        <= confident_m
-    ]
-    if confident_pin:
-        best = confident_pin[0]
-        gap = _gap(
+    def _pick(best: ProximityHit, reason: str, gap: float | None) -> ProximityHit:
+        return replace(
             best,
-            lambda h: h.distance_to_pin_m
-            if h.distance_to_pin_m is not None
-            else h.distance_m,
-        )
-        return _with_meta(
-            best,
-            reason="confident_pin",
+            selection_reason=reason,
             candidate_count=n,
             runner_up_gap_m=None if gap is None else round(gap, 1),
         )
+
+    # 1) Confident: within confident_m of pin.
+    by_pin = sorted(
+        cands,
+        key=lambda h: (_pin_distance(h), 0 if h.source == MATCH_SOURCE_FCC else 1),
+    )
+    confident_pin = [h for h in by_pin if _pin_distance(h) <= confident_m]
+    if confident_pin:
+        best = confident_pin[0]
+        return _pick(best, "confident_pin", _gap(best, _pin_distance))
 
     # 2) Address affinity: within affinity of geocoded address.
     with_addr = [
@@ -647,32 +606,71 @@ def select_proximity_hit(
         best = by_addr[0]
         gap = _gap(best, lambda h: h.distance_to_address_m or 1e9)
         if gap is None or gap >= ambiguity_gap_m:
-            return _with_meta(
-                best,
-                reason="address_affinity",
-                candidate_count=n,
-                runner_up_gap_m=None if gap is None else round(gap, 1),
-            )
+            return _pick(best, "address_affinity", gap)
         # Ambiguous near address — fall through to unique-nearest on pin.
 
     # 3) Extended unique nearest to pin (must clear ambiguity gap).
     best = by_pin[0]
-    gap = _gap(
-        best,
-        lambda h: h.distance_to_pin_m
-        if h.distance_to_pin_m is not None
-        else h.distance_m,
-    )
+    gap = _gap(best, _pin_distance)
     if gap is None or gap >= ambiguity_gap_m:
-        return _with_meta(
-            best,
-            reason="unique_nearest_extended",
-            candidate_count=n,
-            runner_up_gap_m=None if gap is None else round(gap, 1),
-        )
+        return _pick(best, "unique_nearest_extended", gap)
 
     # Clustered neighbors at extended range — do not auto-pick.
     return None
+
+
+def _address_differs(lat, lng, address_lat, address_lng) -> bool:
+    return (
+        address_lat is not None
+        and address_lng is not None
+        and (abs(address_lat - lat) > 1e-5 or abs(address_lng - lng) > 1e-5)
+    )
+
+
+def select_from_candidate_rows(
+    fcc_rows: Iterable[dict[str, Any]],
+    ts_rows: Iterable[dict[str, Any]],
+    lat: float,
+    lng: float,
+    *,
+    max_m: float = PROXIMITY_MAX_M,
+    address_lat: float | None = None,
+    address_lng: float | None = None,
+    confident_m: float = PROXIMITY_CONFIDENT_M,
+    ambiguity_gap_m: float = PROXIMITY_AMBIGUITY_GAP_M,
+    address_affinity_m: float = PROXIMITY_ADDRESS_AFFINITY_M,
+) -> ProximityHit | None:
+    """Turn raw FCC/TowerSource rows near a pin (and address) into one hit."""
+    common = dict(
+        pin_lat=lat,
+        pin_lng=lng,
+        max_m=max_m,
+        address_lat=address_lat,
+        address_lng=address_lng,
+    )
+    hits = _hits_from_rows(
+        fcc_rows,
+        source=MATCH_SOURCE_FCC,
+        coord_fn=fcc_coordinates,
+        id_keys=("ID",),
+        asr_keys=("ASR_Number",),
+        asset_type_keys=("Registration_Type", "Record_Type"),
+        **common,
+    ) + _hits_from_rows(
+        ts_rows,
+        source=MATCH_SOURCE_TOWERSOURCE,
+        coord_fn=towersource_coordinates,
+        id_keys=("operator_site_identifier", "asset_name"),
+        asr_keys=("fcc_asr_number",),
+        asset_type_keys=("asset_type", "asset_category"),
+        **common,
+    )
+    return select_proximity_hit(
+        hits,
+        confident_m=confident_m,
+        ambiguity_gap_m=ambiguity_gap_m,
+        address_affinity_m=address_affinity_m,
+    )
 
 
 def find_proximity_hit(
@@ -695,52 +693,126 @@ def find_proximity_hit(
     fcc_rows = _fetch_fcc_candidates(cursor, lat, lng, max_m=max_m)
     ts_rows = _fetch_towersource_candidates(cursor, lat, lng, max_m=max_m)
     # Also fetch around the address when it differs from the pin.
-    if (
-        address_lat is not None
-        and address_lng is not None
-        and (
-            abs(address_lat - lat) > 1e-5
-            or abs(address_lng - lng) > 1e-5
-        )
-    ):
+    if _address_differs(lat, lng, address_lat, address_lng):
         fcc_rows = list(fcc_rows) + _fetch_fcc_candidates(
             cursor, address_lat, address_lng, max_m=max_m
         )
         ts_rows = list(ts_rows) + _fetch_towersource_candidates(
             cursor, address_lat, address_lng, max_m=max_m
         )
-
-    hits = _hits_from_rows(
+    return select_from_candidate_rows(
         fcc_rows,
-        pin_lat=lat,
-        pin_lng=lng,
-        source=MATCH_SOURCE_FCC,
-        coord_fn=fcc_coordinates,
-        id_keys=("ID",),
-        asr_keys=("ASR_Number",),
-        asset_type_keys=("Registration_Type", "Record_Type"),
-        max_m=max_m,
-        address_lat=address_lat,
-        address_lng=address_lng,
-    ) + _hits_from_rows(
         ts_rows,
-        pin_lat=lat,
-        pin_lng=lng,
-        source=MATCH_SOURCE_TOWERSOURCE,
-        coord_fn=towersource_coordinates,
-        id_keys=("operator_site_identifier", "asset_name"),
-        asr_keys=("fcc_asr_number",),
-        asset_type_keys=("asset_type", "asset_category"),
+        lat,
+        lng,
         max_m=max_m,
         address_lat=address_lat,
         address_lng=address_lng,
-    )
-    return select_proximity_hit(
-        hits,
         confident_m=confident_m,
         ambiguity_gap_m=ambiguity_gap_m,
         address_affinity_m=address_affinity_m,
     )
+
+
+# ------------------------------ bulk proximity ------------------------------
+
+
+@dataclass(frozen=True)
+class ProximityQuery:
+    """One site's lookup: the SF pin plus an optional geocoded address."""
+
+    key: str
+    lat: float
+    lng: float
+    address_lat: float | None = None
+    address_lng: float | None = None
+
+
+PROXIMITY_BULK_CHUNK = max(1, env_int("PROXIMITY_BULK_CHUNK", 200))
+_BULK_POINTS = "#enrichment_prox_points"
+
+
+def _bulk_join_sql(columns: str, alias: str, table: str, bbox: str) -> str:
+    where = bbox.format(a="p.min_lat", b="p.max_lat", c="p.min_lng", d="p.max_lng")
+    return (
+        f"SELECT p.query_key AS query_key, {_prefixed(columns, alias)} "
+        f"FROM {_BULK_POINTS} AS p JOIN {table} AS {alias} ON {where}"
+    )
+
+
+def _bulk_points(queries: Sequence[ProximityQuery], max_m: float) -> list[tuple]:
+    points: list[tuple] = []
+    for q in queries:
+        centers = [(q.lat, q.lng)]
+        if _address_differs(q.lat, q.lng, q.address_lat, q.address_lng):
+            centers.append((q.address_lat, q.address_lng))
+        for lat, lng in centers:
+            min_lat, max_lat, min_lng, max_lng = _bbox(lat, lng, max_m=max_m)
+            points.append((q.key, min_lat, max_lat, min_lng, max_lng))
+    return points
+
+
+def _grouped_rows(cursor, sql: str) -> dict[str, list[dict[str, Any]]]:
+    cursor.execute(sql)
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for raw in cursor.fetchall():
+        row = _row_dict(cursor, raw)
+        grouped.setdefault(str(row.pop("query_key")), []).append(row)
+    return grouped
+
+
+def _bulk_chunk(cursor, queries: Sequence[ProximityQuery], max_m: float):
+    cursor.execute(
+        f"IF OBJECT_ID('tempdb..{_BULK_POINTS}') IS NOT NULL DROP TABLE {_BULK_POINTS}; "
+        f"CREATE TABLE {_BULK_POINTS} (query_key nvarchar(64) NOT NULL, "
+        "min_lat float NOT NULL, max_lat float NOT NULL, "
+        "min_lng float NOT NULL, max_lng float NOT NULL)"
+    )
+    try:
+        cursor.fast_executemany = True
+    except AttributeError:
+        pass
+    cursor.executemany(
+        f"INSERT INTO {_BULK_POINTS} (query_key, min_lat, max_lat, min_lng, max_lng) "
+        "VALUES (?, ?, ?, ?, ?)",
+        _bulk_points(queries, max_m),
+    )
+    fcc = _grouped_rows(cursor, _bulk_join_sql(_FCC_COLUMNS, "f", FCC_TABLE, _FCC_BBOX))
+    ts = _grouped_rows(
+        cursor, _bulk_join_sql(_TS_COLUMNS, "t", TOWERSOURCE_TABLE, _TS_BBOX)
+    )
+    cursor.execute(f"DROP TABLE {_BULK_POINTS}")
+    return fcc, ts
+
+
+def find_proximity_hits_bulk(
+    cursor,
+    queries: Sequence[ProximityQuery],
+    *,
+    max_m: float = PROXIMITY_MAX_M,
+    chunk_size: int = PROXIMITY_BULK_CHUNK,
+) -> dict[str, ProximityHit | None]:
+    """Same selection as ``find_proximity_hit`` for many sites in few queries.
+
+    Each chunk loads bbox points (pin, plus address when it differs) into a
+    session temp table and joins FCC and TowerSource once each, instead of
+    two to four queries per site. Raises on SQL errors; callers fall back.
+    """
+    results: dict[str, ProximityHit | None] = {}
+    for start in range(0, len(queries), max(1, int(chunk_size))):
+        chunk = list(queries[start : start + chunk_size])
+        fcc, ts = _bulk_chunk(cursor, chunk, max_m)
+        for q in chunk:
+            results[q.key] = select_from_candidate_rows(
+                fcc.get(q.key, []),
+                ts.get(q.key, []),
+                q.lat,
+                q.lng,
+                max_m=max_m,
+                address_lat=q.address_lat,
+                address_lng=q.address_lng,
+            )
+    return results
 
 
 def describe_match(hit: ProximityHit | None) -> str:

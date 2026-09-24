@@ -1775,16 +1775,18 @@ class CostPolicyTests(unittest.TestCase):
                 },
             ]
         )
-        self.assertEqual(kpis["unique_sites"], 2)
+        self.assertEqual(kpis["unique_sites"], 3)
+        self.assertEqual(kpis["written_sites"], 2)
         self.assertEqual(kpis["rooftop_sf_writes"], 1)
         self.assertEqual(kpis["tower_sf_writes"], 1)
-        self.assertEqual(kpis["holdout_empty_confirmed"], 0)
+        self.assertEqual(kpis["holdout_empty_confirmed"], 1)
+        self.assertEqual(kpis["holdout_empty"], 0)
         self.assertEqual(kpis["naip_empty_to_rooftop_apply"], 1)
-        self.assertEqual(kpis["rooftop_write_rate"], 0.5)
-        self.assertEqual(kpis["tower_write_rate"], 0.5)
-        self.assertEqual(kpis["total_write_rate"], 1.0)
+        self.assertEqual(kpis["rooftop_write_rate"], 0.333)
+        self.assertEqual(kpis["tower_write_rate"], 0.333)
+        self.assertEqual(kpis["total_write_rate"], 0.667)
 
-    def test_rollup_skips_db_only_misses_keeps_unique_hits(self):
+    def test_rollup_counts_misses_and_failures_as_processed(self):
         from enrichment.metrics import rollup_kpis, snapshot_run
 
         kpis = rollup_kpis(
@@ -1792,36 +1794,39 @@ class CostPolicyTests(unittest.TestCase):
                 {"Id": "a", "outcome": "applied_rooftop", "sf_update_status": "updated"},
                 {
                     "Id": "b",
-                    "outcome": "holdout_other",
-                    "include_in_kpis": False,
+                    "outcome": "db_only_miss",
                     "holdout_reason": "db_only_no_unique_hit",
                     "db_only": True,
+                    "sf_update_status": "classified_only",
                 },
                 {
                     "Id": "c",
                     "outcome": "applied_db_skip",
-                    "include_in_kpis": True,
                     "db_only": True,
                     "sf_update_status": "updated",
                 },
                 {
                     "Id": "d",
-                    "outcome": "applied_db_skip",
+                    "outcome": "apply_failed",
                     "db_only": True,
                     "sf_update_status": "dequeued",
                 },
                 {
                     "Id": "e",
-                    "outcome": "applied_db_skip",
-                    "db_only": True,
-                    "sf_update_status": "pending",
+                    "outcome": "error",
+                    "holdout_reason": "sql_error",
+                    "sf_update_status": "skipped",
                 },
             ]
         )
-        self.assertEqual(kpis["unique_sites"], 2)
+        self.assertEqual(kpis["unique_sites"], 5)
+        self.assertEqual(kpis["written_sites"], 2)
         self.assertEqual(kpis["rooftop_sf_writes"], 1)
-        self.assertEqual(kpis["outcomes"].get("applied_db_skip"), 1)
-        self.assertNotIn("holdout_other", kpis["outcomes"])
+        self.assertEqual(kpis["db_skip_sf_writes"], 1)
+        self.assertEqual(kpis["db_only_miss"], 1)
+        self.assertEqual(kpis["apply_failed"], 1)
+        self.assertEqual(kpis["errors"], 1)
+        self.assertEqual(kpis["total_write_rate"], 0.4)
         snap = snapshot_run(
             [
                 {
@@ -1843,12 +1848,13 @@ class CostPolicyTests(unittest.TestCase):
         )
         self.assertEqual(snap["sites"], 2)
         self.assertEqual(snap["applied_db_skip"], 1)
+        self.assertEqual(snap["db_only_miss"], 1)
         by_id = {r["Id"]: r for r in snap["site_records"]}
-        self.assertTrue(by_id["hit"]["include_in_kpis"])
-        self.assertFalse(by_id["miss"]["include_in_kpis"])
+        self.assertEqual(by_id["miss"]["outcome"], "db_only_miss")
+        self.assertEqual(rollup_kpis(snap["site_records"])["unique_sites"], 2)
 
-    def test_rollup_skips_already_written_salesforce_id(self):
-        from enrichment.metrics import kpi_eligible, rollup_kpis
+    def test_rollup_counts_retried_salesforce_id_once(self):
+        from enrichment.metrics import is_successful_sf_write, rollup_kpis
 
         first = {
             "Id": "a",
@@ -1861,11 +1867,12 @@ class CostPolicyTests(unittest.TestCase):
             "sf_update_status": "updated",
             "run_id": "later",
         }
-        self.assertTrue(kpi_eligible(first))
+        self.assertTrue(is_successful_sf_write(first))
         kpis = rollup_kpis([first, retry])
         self.assertEqual(kpis["unique_sites"], 1)
+        self.assertEqual(kpis["written_sites"], 1)
 
-    def test_dry_run_and_pending_do_not_count_unique_sites(self):
+    def test_dry_run_and_pending_are_not_writes(self):
         from enrichment.metrics import is_successful_sf_write, rollup_kpis
 
         pending = {
@@ -1886,7 +1893,9 @@ class CostPolicyTests(unittest.TestCase):
         self.assertFalse(is_successful_sf_write(pending))
         self.assertFalse(is_successful_sf_write(dry))
         self.assertTrue(is_successful_sf_write(live))
-        self.assertEqual(rollup_kpis([pending, dry, live])["unique_sites"], 1)
+        kpis = rollup_kpis([pending, dry, live])
+        self.assertEqual(kpis["written_sites"], 1)
+        self.assertEqual(kpis["tower_sf_writes"], 1)
 
     def test_record_run_apply_zero_skips_unique_sites(self):
         from enrichment.metrics import KPIS_JSON, SITES_JSONL, record_run, _rewrite_jsonl
@@ -2840,8 +2849,10 @@ class ConfirmRooftopTests(unittest.TestCase):
             run_dir = root / "live"
             old_dir = metrics_mod.metrics_dir
             old_sql = os.environ.get("METRICS_SQL")
+            old_batch = os.environ.get("APPLY_BATCH_SIZE")
             metrics_mod.metrics_dir = lambda: root
             os.environ["METRICS_SQL"] = "0"
+            os.environ["APPLY_BATCH_SIZE"] = "1"  # per-site write contract
             try:
                 summary = run_enrichment(
                     sf_client=_FakeClient(site),
@@ -2863,8 +2874,13 @@ class ConfirmRooftopTests(unittest.TestCase):
                     apply=True,
                     dequeue_holdouts=False,
                     verbose=False,
+                    workers=1,
                 )
             finally:
+                if old_batch is None:
+                    os.environ.pop("APPLY_BATCH_SIZE", None)
+                else:
+                    os.environ["APPLY_BATCH_SIZE"] = old_batch
                 metrics_mod.metrics_dir = old_dir
                 if old_sql is None:
                     os.environ.pop("METRICS_SQL", None)
@@ -2902,10 +2918,11 @@ class ConfirmRooftopTests(unittest.TestCase):
             confirm_rooftop=True,
         )
         by_id = {r["Id"]: r for r in snap["site_records"]}
-        self.assertTrue(by_id["a"]["include_in_kpis"])
-        self.assertFalse(by_id["b"]["include_in_kpis"])
+        self.assertEqual(by_id["a"]["outcome"], "applied_rooftop")
+        self.assertEqual(by_id["b"]["outcome"], "holdout_other")
         kpis = rollup_kpis(snap["site_records"])
-        self.assertEqual(kpis["unique_sites"], 1)
+        self.assertEqual(kpis["unique_sites"], 2)
+        self.assertEqual(kpis["written_sites"], 1)
         self.assertEqual(kpis["rooftop_sf_writes"], 1)
 
 

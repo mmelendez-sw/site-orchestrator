@@ -1,17 +1,27 @@
 """Cumulative enrichment KPIs for leadership reporting.
 
-Each run appends to JSONL under SITE_ORCHESTRATOR_DATA/metrics/.
-``kpis.json`` is last-wins per Salesforce Id so retries do not double-count.
+Each live run (``APPLY=1``) appends one header to ``runs.jsonl`` and one row
+per processed site to ``sites.jsonl`` under SITE_ORCHESTRATOR_DATA/metrics/.
+Azure SQL (``metrics_store``) holds the same grain.
+
+UniqueSites counts every distinct Salesforce Id a live run processed —
+applied, held out, missed, or errored. WrittenSites is the subset whose
+site type / coordinates Salesforce accepted (``sf_update_status=updated``).
+Per-Id outcome counts use that Id's latest observation, so a retry that
+later succeeds is not double-counted. Dry runs (``APPLY=0``) never touch the
+cumulative KPIs.
 """
 
 from __future__ import annotations
 
 import json
 import os
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+from enrichment.coerce import is_true, lower_text, text_or_none, to_float
 from enrichment.constants import (
     BUCKET_POTENTIAL_UPDATE,
     BUCKET_ROOFTOP,
@@ -25,63 +35,91 @@ KPIS_JSON = "kpis.json"
 
 EMPTY_SCREEN = frozenset({"other", "unclear"})
 
+# Outcome taxonomy. Every processed site gets exactly one.
+APPLIED_OUTCOMES = ("applied_rooftop", "applied_tower", "applied_db_skip", "applied_other")
+OUTCOMES: tuple[str, ...] = APPLIED_OUTCOMES + (
+    "apply_failed",
+    "holdout_empty_confirmed",
+    "holdout_weak_rooftop",
+    "holdout_weak_tower",
+    "holdout_empty",
+    "holdout_no_nearmap",
+    "holdout_no_imagery",
+    "holdout_other",
+    "db_only_miss",
+    "skipped",
+    "error",
+)
 
-def _lower(value: Any) -> str:
-    return str(value or "").strip().lower()
-
-
-def _conf(value: Any) -> float | None:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
+_ERROR_REASONS = frozenset({"classify_error", "sql_error", "missing_sf_coordinates"})
+_SKIPPED_REASONS = frozenset({"no_saved_chips", "skip_classify_no_db_hit"})
+_NO_IMAGERY_REASONS = frozenset({"no_imagery", "no_naip_imagery"})
+# Salesforce statuses meaning an eligible write did not land.
+_APPLY_FAILED_STATUSES = frozenset({"failed", "dequeued"})
 
 
 def screen_site_type(row: dict[str, Any]) -> str:
     """NAIP-screen label when stamped; else final label (legacy CSVs)."""
-    return _lower(row.get("naip_screen_site_type") or row.get("naip_site_type"))
+    return lower_text(row.get("naip_screen_site_type") or row.get("naip_site_type"))
 
 
 def final_site_type(row: dict[str, Any]) -> str:
-    return _lower(row.get("naip_site_type") or row.get("site_type"))
+    return lower_text(row.get("naip_site_type") or row.get("site_type"))
 
 
 def nearmap_ran(row: dict[str, Any]) -> bool:
-    tier = _lower(row.get("nearmap_tier"))
-    imagery = _lower(row.get("imagery_used"))
+    tier = lower_text(row.get("nearmap_tier"))
+    imagery = lower_text(row.get("imagery_used"))
     return tier in {"full", "vert_only", "wide_aoi"} or imagery.startswith("nearmap")
 
 
 def claude_ran(row: dict[str, Any]) -> bool:
-    return _lower(row.get("escalation_model")) == "claude" or row.get(
+    return lower_text(row.get("escalation_model")) == "claude" or row.get(
         "claude_cell_equipment"
     ) not in (None, "", False)
 
 
 def outcome_class(row: dict[str, Any]) -> str:
-    """Stable outcome taxonomy for rollups."""
-    bucket = _lower(row.get("bucket"))
+    """Stable outcome taxonomy for rollups (see ``OUTCOMES``).
+
+    A Salesforce-eligible row whose write was refused (``failed``, or dequeued
+    by the holdout retry) is ``apply_failed``, not an applied outcome.
+    """
+    bucket = lower_text(row.get("bucket"))
     site = final_site_type(row)
-    reason = _lower(row.get("holdout_reason"))
-    update_type = str(row.get("update_site_type") or "").strip().lower()
-    if reason == "skip_classify_db_hit":
-        return "applied_db_skip"
-    if bucket == BUCKET_POTENTIAL_UPDATE:
+    reason = lower_text(row.get("holdout_reason"))
+    update_type = lower_text(row.get("update_site_type"))
+    status = lower_text(row.get("sf_update_status"))
+    db_skip = reason == "skip_classify_db_hit"
+    if db_skip or bucket == BUCKET_POTENTIAL_UPDATE:
+        if status in _APPLY_FAILED_STATUSES:
+            return "apply_failed"
+        if db_skip:
+            return "applied_db_skip"
         if update_type == "rooftop" or site == "rooftop":
             return "applied_rooftop"
         if update_type == "tower" or site == "tower":
             return "applied_tower"
         return "applied_other"
-    if "skip_classify_db" in reason:
-        return "applied_db_skip" if bucket == BUCKET_POTENTIAL_UPDATE else "holdout_db_skip"
-    if reason in {"classify_error", "sql_error", "missing_sf_coordinates"}:
+    if reason == "db_only_no_unique_hit":
+        return "db_only_miss"
+    if reason in _SKIPPED_REASONS:
+        return "skipped"
+    if reason in _ERROR_REASONS:
         return "error"
-    if _lower(row.get("nearmap_tier")) == "no_coverage":
+    if reason in _NO_IMAGERY_REASONS:
+        return "holdout_no_imagery"
+    if lower_text(row.get("nearmap_tier")) == "no_coverage":
         return "holdout_no_nearmap"
-    conf = _conf(row.get("naip_site_confidence"))
-    if site in EMPTY_SCREEN and nearmap_ran(row) and conf is not None and conf >= NEARMAP_EMPTY_LOCK_CONF:
+    conf = to_float(row.get("naip_site_confidence"))
+    if (
+        site in EMPTY_SCREEN
+        and nearmap_ran(row)
+        and conf is not None
+        and conf >= NEARMAP_EMPTY_LOCK_CONF
+    ):
         return "holdout_empty_confirmed"
-    if bucket == BUCKET_ROOFTOP or (site == "rooftop" and bucket != BUCKET_POTENTIAL_UPDATE):
+    if bucket == BUCKET_ROOFTOP or site == "rooftop":
         return "holdout_weak_rooftop"
     if site == "tower":
         return "holdout_weak_tower"
@@ -90,20 +128,15 @@ def outcome_class(row: dict[str, Any]) -> str:
     return "holdout_other"
 
 
-def _opt(value: Any, n: int) -> str | None:
-    text = str(value or "").strip()
-    return text[:n] if text else None
+def _address_parts(row: dict[str, Any]) -> list[str]:
+    return [p.strip() for p in str(row.get("address") or "").split(",") if p.strip()]
 
 
 def site_state(row: dict[str, Any]) -> str | None:
-    raw = _opt(row.get("site_state") or row.get("Site_State__c"), 8)
+    raw = text_or_none(row.get("site_state") or row.get("Site_State__c"), 8)
     if raw:
         return raw.upper()
-    parts = [
-        p.strip()
-        for p in str(row.get("address") or "").split(",")
-        if p.strip()
-    ]
+    parts = _address_parts(row)
     if parts:
         token = parts[-1].replace(".", "")
         if 2 <= len(token) <= 3 and token.isalpha():
@@ -112,17 +145,11 @@ def site_state(row: dict[str, Any]) -> str | None:
 
 
 def site_city(row: dict[str, Any]) -> str | None:
-    raw = _opt(row.get("site_city") or row.get("Site_City__c"), 80)
+    raw = text_or_none(row.get("site_city") or row.get("Site_City__c"), 80)
     if raw:
         return raw
-    parts = [
-        p.strip()
-        for p in str(row.get("address") or "").split(",")
-        if p.strip()
-    ]
-    if len(parts) >= 2:
-        return parts[-2][:80]
-    return None
+    parts = _address_parts(row)
+    return parts[-2][:80] if len(parts) >= 2 else None
 
 
 def apply_slice_fields(row: dict[str, Any]) -> dict[str, Any]:
@@ -130,36 +157,27 @@ def apply_slice_fields(row: dict[str, Any]) -> dict[str, Any]:
     rec = dict(row)
     rec["site_state"] = site_state(rec)
     rec["site_city"] = site_city(rec)
-    rec["carrier"] = _opt(
+    rec["carrier"] = text_or_none(
         rec.get("carrier") or rec.get("Carrier_Leasing_Source__c"), 120
     )
-    rec["match_source"] = _opt(_lower(rec.get("match_source")) or None, 32)
-    rec["dual_model_resolution"] = _opt(rec.get("dual_model_resolution"), 48)
-    rec["classify_coord_source"] = _opt(rec.get("classify_coord_source"), 48)
-    rec["asset_offset_m"] = _conf(rec.get("asset_offset_m"))
+    rec["match_source"] = text_or_none(lower_text(rec.get("match_source")) or None, 32)
+    rec["dual_model_resolution"] = text_or_none(rec.get("dual_model_resolution"), 48)
+    rec["classify_coord_source"] = text_or_none(rec.get("classify_coord_source"), 48)
+    rec["asset_offset_m"] = to_float(rec.get("asset_offset_m"))
     return rec
 
 
-def _queue_states() -> str | None:
-    return _opt(os.environ.get("STATES"), 80)
-
-
 def _queue_limit() -> int | None:
-    raw = (os.environ.get("LIMIT") or "").strip()
-    if not raw:
-        return None
-    try:
-        return int(raw)
-    except ValueError:
-        return None
+    number = to_float(os.environ.get("LIMIT"))
+    return None if number is None else int(number)
 
 
 def site_record(row: dict[str, Any], *, run_id: str) -> dict[str, Any]:
+    """One processed site as stored in ``sites.jsonl`` / EnrichmentSiteOutcome."""
     screen = screen_site_type(row)
     final = final_site_type(row)
     empty_to_nearmap = screen in EMPTY_SCREEN and nearmap_ran(row)
     empty_to_rooftop = empty_to_nearmap and final == "rooftop"
-    empty_to_rooftop_apply = empty_to_rooftop and _lower(row.get("bucket")) == BUCKET_POTENTIAL_UPDATE
     rec = apply_slice_fields(row)
     return {
         "run_id": run_id,
@@ -182,21 +200,39 @@ def site_record(row: dict[str, Any], *, run_id: str) -> dict[str, Any]:
         "asset_offset_m": rec["asset_offset_m"],
         "screen_site_type": screen,
         "final_site_type": final,
-        "final_confidence": _conf(row.get("naip_site_confidence")),
+        "final_confidence": to_float(row.get("naip_site_confidence")),
         "nearmap_ran": nearmap_ran(row),
-        "nearmap_tier": _lower(row.get("nearmap_tier")),
+        "nearmap_tier": lower_text(row.get("nearmap_tier")),
         "claude_ran": claude_ran(row),
         "escalation_reason": str(row.get("escalation_reason") or ""),
         "second_nearmap": str(row.get("second_nearmap") or ""),
         "empty_to_nearmap": empty_to_nearmap,
         "empty_to_rooftop": empty_to_rooftop,
-        "empty_to_rooftop_apply": empty_to_rooftop_apply,
-        "bucket": _lower(row.get("bucket")),
+        "empty_to_rooftop_apply": empty_to_rooftop
+        and lower_text(row.get("bucket")) == BUCKET_POTENTIAL_UPDATE,
+        "bucket": lower_text(row.get("bucket")),
         "holdout_reason": str(row.get("holdout_reason") or ""),
         "update_site_type": str(row.get("update_site_type") or ""),
         "outcome": outcome_class(row),
         "sf_update_status": str(row.get("sf_update_status") or ""),
     }
+
+
+def is_successful_sf_write(rec: dict[str, Any]) -> bool:
+    """True when Salesforce accepted a site-type/coords update for this record."""
+    if lower_text(rec.get("outcome")) not in APPLIED_OUTCOMES:
+        return False
+    if str(rec.get("holdout_reason") or "").strip() == "db_only_no_unique_hit":
+        return False
+    return lower_text(rec.get("sf_update_status")) == "updated"
+
+
+def _outcome_counts(records: Iterable[dict[str, Any]]) -> Counter:
+    return Counter(str(rec.get("outcome") or "holdout_other") for rec in records)
+
+
+def _rate(part: int, whole: int) -> float | None:
+    return round(part / whole, 3) if whole else None
 
 
 def snapshot_run(
@@ -207,205 +243,102 @@ def snapshot_run(
     db_only: bool = False,
     confirm_rooftop: bool = False,
 ) -> dict[str, Any]:
+    """This-run header + one site record per processed Salesforce Id."""
     sites = [site_record(r, run_id=run_id) for r in rows if str(r.get("Id") or "")]
-    if db_only:
-        for rec in sites:
+    for rec in sites:
+        if db_only:
             rec["db_only"] = True
-            rec["include_in_kpis"] = is_successful_sf_write(rec)
-    if confirm_rooftop:
-        for rec in sites:
+        if confirm_rooftop:
             rec["confirm_rooftop"] = True
-            rec["include_in_kpis"] = is_successful_sf_write(rec)
-    n = len(sites)
+    by_outcome = _outcome_counts(sites)
     empty_nm = sum(1 for s in sites if s["empty_to_nearmap"])
-    empty_rt = sum(1 for s in sites if s["empty_to_rooftop"])
     empty_rt_apply = sum(1 for s in sites if s["empty_to_rooftop_apply"])
     apply = apply_summary or {}
-    by_outcome: dict[str, int] = {}
-    for rec in sites:
-        key = str(rec.get("outcome") or "unknown")
-        by_outcome[key] = by_outcome.get(key, 0) + 1
-    return {
+    snap: dict[str, Any] = {
         "run_id": run_id,
         "recorded_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "sites": n,
-        "applied_rooftop": by_outcome.get("applied_rooftop", 0),
-        "applied_tower": by_outcome.get("applied_tower", 0),
-        "applied_db_skip": by_outcome.get("applied_db_skip", 0),
-        "holdout_empty_confirmed": by_outcome.get("holdout_empty_confirmed", 0),
-        "holdout_weak_rooftop": by_outcome.get("holdout_weak_rooftop", 0),
-        "holdout_weak_tower": by_outcome.get("holdout_weak_tower", 0),
-        "holdout_empty": by_outcome.get("holdout_empty", 0),
-        "holdout_no_nearmap": by_outcome.get("holdout_no_nearmap", 0),
-        "errors": by_outcome.get("error", 0),
-        "nearmap_sites": sum(1 for s in sites if s["nearmap_ran"]),
-        "claude_sites": sum(1 for s in sites if s["claude_ran"]),
-        "naip_empty_to_nearmap": empty_nm,
-        "naip_empty_to_rooftop": empty_rt,
-        "naip_empty_to_rooftop_apply": empty_rt_apply,
-        "empty_to_rooftop_apply_rate": (
-            round(empty_rt_apply / empty_nm, 3) if empty_nm else None
-        ),
-        "sf_writes": int(apply.get("success") or 0),
-        "sf_holdouts_dequeued": int(apply.get("dequeued_holdouts") or 0),
-        "sf_write_failed": int(apply.get("failed") or 0),
-        "apply_enabled": 1 if apply_summary else 0,
-        "queue_states": _queue_states(),
-        "queue_limit": _queue_limit(),
-        "site_records": sites,
+        "sites": len(sites),
     }
-
-
-def _append_jsonl(path: Path, records: Iterable[dict[str, Any]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as handle:
-        for rec in records:
-            handle.write(json.dumps(rec, ensure_ascii=True) + "\n")
-
-
-def _rewrite_jsonl(path: Path, records: Iterable[dict[str, Any]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with tmp.open("w", encoding="utf-8") as handle:
-        for rec in records:
-            handle.write(json.dumps(rec, ensure_ascii=True) + "\n")
-    tmp.replace(path)
-
-
-def drop_runs_from_ledger(
-    run_ids: Iterable[str],
-    *,
-    root: Path | None = None,
-) -> dict[str, Any]:
-    """Remove run headers and site rows from the local JSONL ledger, then rewrite kpis.json."""
-    drop = {str(rid).strip() for rid in run_ids if str(rid).strip()}
-    root = root or metrics_dir()
-    runs = [
-        rec
-        for rec in _read_jsonl(root / RUNS_JSONL)
-        if str(rec.get("run_id") or "") not in drop
-    ]
-    sites = [
-        rec
-        for rec in _read_jsonl(root / SITES_JSONL)
-        if str(rec.get("run_id") or "") not in drop
-    ]
-    _rewrite_jsonl(root / RUNS_JSONL, runs)
-    _rewrite_jsonl(root / SITES_JSONL, sites)
-    kpis = rollup_kpis(sites)
-    (root / KPIS_JSON).write_text(json.dumps(kpis, indent=2), encoding="utf-8")
-    return {
-        "dropped": sorted(drop),
-        "runs": len(runs),
-        "site_rows": len(sites),
-        "kpis": kpis,
-    }
-
-
-def refresh_kpis_from_ledger(*, root: Path | None = None) -> dict[str, Any]:
-    """Rewrite kpis.json from sites.jsonl using UniqueSites write rules."""
-    root = root or metrics_dir()
-    sites = _read_jsonl(root / SITES_JSONL)
-    kpis = rollup_kpis(sites)
-    (root / KPIS_JSON).write_text(json.dumps(kpis, indent=2), encoding="utf-8")
-    return kpis
-
-
-def _read_jsonl(path: Path) -> list[dict[str, Any]]:
-    if not path.is_file():
-        return []
-    rows: list[dict[str, Any]] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            rec = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(rec, dict):
-            rows.append(rec)
-    return rows
-
-
-APPLIED_OUTCOMES = frozenset(
-    {"applied_rooftop", "applied_tower", "applied_db_skip", "applied_other"}
-)
-def _sf_status(rec: dict[str, Any]) -> str:
-    return str(rec.get("sf_update_status") or "").strip().lower()
-
-
-def is_successful_sf_write(rec: dict[str, Any]) -> bool:
-    """True when Salesforce accepted a site-type/coords update.
-
-    Dry-runs (``pending`` / ``dry_run`` / blank) never count. UniqueSites is
-    live writes only (``sf_update_status=updated``).
-    """
-    outcome = str(rec.get("outcome") or "").strip().lower()
-    if outcome not in APPLIED_OUTCOMES:
-        return False
-    if str(rec.get("holdout_reason") or "").strip() == "db_only_no_unique_hit":
-        return False
-    return _sf_status(rec) == "updated"
-
-
-def kpi_eligible(rec: dict[str, Any]) -> bool:
-    """Cumulative UniqueSites: first successful Salesforce enrichment write only."""
-    if rec.get("include_in_kpis") is False:
-        return False
-    return is_successful_sf_write(rec)
+    snap.update({key: by_outcome.get(key, 0) for key in OUTCOMES if key != "error"})
+    snap.update(
+        {
+            "errors": by_outcome.get("error", 0),
+            "nearmap_sites": sum(1 for s in sites if s["nearmap_ran"]),
+            "claude_sites": sum(1 for s in sites if s["claude_ran"]),
+            "naip_empty_to_nearmap": empty_nm,
+            "naip_empty_to_rooftop": sum(1 for s in sites if s["empty_to_rooftop"]),
+            "naip_empty_to_rooftop_apply": empty_rt_apply,
+            "empty_to_rooftop_apply_rate": _rate(empty_rt_apply, empty_nm),
+            "sf_writes": int(apply.get("success") or 0),
+            "sf_holdouts_dequeued": int(apply.get("dequeued_holdouts") or 0),
+            "sf_write_failed": int(apply.get("failed") or 0),
+            "apply_enabled": 1 if apply_summary is not None else 0,
+            "queue_states": text_or_none(os.environ.get("STATES"), 80),
+            "queue_limit": _queue_limit(),
+            "site_records": sites,
+        }
+    )
+    return snap
 
 
 def rollup_kpis(site_rows: list[dict[str, Any]]) -> dict[str, Any]:
-    """Last successful Salesforce enrichment write per Id.
+    """Cumulative KPIs over live-run site records (chronological order).
 
-    UniqueSites is distinct Ids that received site type/coords, not holdouts,
-    classified-only flags, dry-runs, or failed applies.
+    UniqueSites / outcome counts use each Id's latest record. Write counts use
+    each Id's latest accepted write. Spend and funnel counts are "ever"
+    (any live run ran Nearmap / Claude on that Id).
     """
     latest: dict[str, dict[str, Any]] = {}
+    written: dict[str, dict[str, Any]] = {}
+    ever: dict[str, set[str]] = {"nearmap": set(), "claude": set(), "empty_nm": set()}
     for rec in site_rows:
-        if not kpi_eligible(rec):
-            continue
         sid = str(rec.get("Id") or "")
-        if sid:
-            latest[sid] = rec
-    sites = list(latest.values())
-    n = len(sites)
-    empty_nm = sum(1 for s in sites if s.get("empty_to_nearmap"))
-    empty_rt_apply = sum(1 for s in sites if s.get("empty_to_rooftop_apply"))
-    by_outcome: dict[str, int] = {}
-    for rec in sites:
-        key = str(rec.get("outcome") or "unknown")
-        by_outcome[key] = by_outcome.get(key, 0) + 1
-    rooftop_writes = by_outcome.get("applied_rooftop", 0)
-    tower_writes = by_outcome.get("applied_tower", 0)
-    total_writes = rooftop_writes + tower_writes
-    return {
+        if not sid:
+            continue
+        latest[sid] = rec
+        if is_successful_sf_write(rec):
+            written[sid] = rec
+        if is_true(rec.get("nearmap_ran")):
+            ever["nearmap"].add(sid)
+        if is_true(rec.get("claude_ran")):
+            ever["claude"].add(sid)
+        if is_true(rec.get("empty_to_nearmap")):
+            ever["empty_nm"].add(sid)
+    n = len(latest)
+    by_outcome = _outcome_counts(latest.values())
+    write_kinds = _outcome_counts(written.values())
+    rooftop = write_kinds.get("applied_rooftop", 0)
+    tower = write_kinds.get("applied_tower", 0)
+    empty_nm = len(ever["empty_nm"])
+    empty_rt_apply = sum(
+        1 for rec in written.values() if is_true(rec.get("empty_to_rooftop_apply"))
+    )
+    kpis: dict[str, Any] = {
         "unique_sites": n,
-        "rooftop_sf_writes": rooftop_writes,
-        "tower_sf_writes": tower_writes,
-        "holdout_empty_confirmed": by_outcome.get("holdout_empty_confirmed", 0),
-        "holdout_weak_rooftop": by_outcome.get("holdout_weak_rooftop", 0),
-        "holdout_weak_tower": by_outcome.get("holdout_weak_tower", 0),
-        "holdout_empty": by_outcome.get("holdout_empty", 0),
-        "errors": by_outcome.get("error", 0),
-        "nearmap_sites": sum(1 for s in sites if rec_true(s.get("nearmap_ran"))),
-        "claude_sites": sum(1 for s in sites if rec_true(s.get("claude_ran"))),
+        "written_sites": len(written),
+        "rooftop_sf_writes": rooftop,
+        "tower_sf_writes": tower,
+        "db_skip_sf_writes": write_kinds.get("applied_db_skip", 0),
+        "rooftop_write_rate": _rate(rooftop, n),
+        "tower_write_rate": _rate(tower, n),
+        "total_write_rate": _rate(len(written), n),
+        "nearmap_sites": len(ever["nearmap"]),
+        "claude_sites": len(ever["claude"]),
         "naip_empty_to_nearmap": empty_nm,
         "naip_empty_to_rooftop_apply": empty_rt_apply,
-        "empty_to_rooftop_apply_rate": (
-            round(empty_rt_apply / empty_nm, 3) if empty_nm else None
-        ),
-        "rooftop_write_rate": round(rooftop_writes / n, 3) if n else None,
-        "tower_write_rate": round(tower_writes / n, 3) if n else None,
-        "total_write_rate": round(total_writes / n, 3) if n else None,
-        "outcomes": by_outcome,
-        "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "empty_to_rooftop_apply_rate": _rate(empty_rt_apply, empty_nm),
     }
+    kpis.update(
+        {key: by_outcome.get(key, 0) for key in OUTCOMES if key not in APPLIED_OUTCOMES}
+    )
+    kpis["errors"] = kpis.pop("error")
+    kpis["outcomes"] = dict(by_outcome)
+    kpis["updated_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return kpis
 
 
 def rec_true(value: Any) -> bool:
-    return value is True or str(value).strip().lower() in {"true", "1"}
+    return is_true(value)
 
 
 RUN_METRIC_KEYS: tuple[str, ...] = (
@@ -413,11 +346,16 @@ RUN_METRIC_KEYS: tuple[str, ...] = (
     "applied_rooftop",
     "applied_tower",
     "applied_db_skip",
+    "apply_failed",
     "holdout_empty_confirmed",
     "holdout_weak_rooftop",
     "holdout_weak_tower",
     "holdout_empty",
     "holdout_no_nearmap",
+    "holdout_no_imagery",
+    "holdout_other",
+    "db_only_miss",
+    "skipped",
     "errors",
     "nearmap_sites",
     "claude_sites",
@@ -432,18 +370,26 @@ RUN_METRIC_KEYS: tuple[str, ...] = (
 
 KPI_METRIC_KEYS: tuple[str, ...] = (
     "unique_sites",
+    "written_sites",
     "rooftop_sf_writes",
     "tower_sf_writes",
+    "db_skip_sf_writes",
+    "total_write_rate",
     "rooftop_write_rate",
     "tower_write_rate",
-    "total_write_rate",
     "naip_empty_to_nearmap",
     "naip_empty_to_rooftop_apply",
     "empty_to_rooftop_apply_rate",
+    "apply_failed",
     "holdout_empty_confirmed",
     "holdout_weak_rooftop",
     "holdout_weak_tower",
     "holdout_empty",
+    "holdout_no_nearmap",
+    "holdout_no_imagery",
+    "holdout_other",
+    "db_only_miss",
+    "skipped",
     "errors",
     "nearmap_sites",
     "claude_sites",
@@ -472,13 +418,180 @@ METRIC_DISPLAY_NAMES: dict[str, str] = {
 def metric_lines(data: dict[str, Any] | None, keys: tuple[str, ...]) -> list[str]:
     if not data:
         return []
-    lines: list[str] = []
-    for key in keys:
-        if key not in data:
+    return [
+        f"    {METRIC_DISPLAY_NAMES.get(key, key)}: {format_metric_value(key, data.get(key))}"
+        for key in keys
+        if key in data
+    ]
+
+
+# ------------------------------ JSONL ledger --------------------------------
+
+
+def _append_jsonl(path: Path, records: Iterable[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        for rec in records:
+            handle.write(json.dumps(rec, ensure_ascii=True) + "\n")
+
+
+def _rewrite_jsonl(path: Path, records: Iterable[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as handle:
+        for rec in records:
+            handle.write(json.dumps(rec, ensure_ascii=True) + "\n")
+    tmp.replace(path)
+
+
+def _read_jsonl(path: Path) -> list[dict[str, Any]]:
+    if not path.is_file():
+        return []
+    rows: list[dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
             continue
-        label = METRIC_DISPLAY_NAMES.get(key, key)
-        lines.append(f"    {label}: {format_metric_value(key, data.get(key))}")
-    return lines
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(rec, dict):
+            rows.append(rec)
+    return rows
+
+
+def _write_kpis(root: Path, site_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    kpis = rollup_kpis(site_rows)
+    (root / KPIS_JSON).write_text(json.dumps(kpis, indent=2), encoding="utf-8")
+    return kpis
+
+
+def drop_runs_from_ledger(
+    run_ids: Iterable[str],
+    *,
+    root: Path | None = None,
+) -> dict[str, Any]:
+    """Remove run headers and site rows from the local JSONL ledger, then rewrite kpis.json."""
+    drop = {str(rid).strip() for rid in run_ids if str(rid).strip()}
+    root = root or metrics_dir()
+
+    def keep(rec: dict[str, Any]) -> bool:
+        return str(rec.get("run_id") or "") not in drop
+
+    runs = [rec for rec in _read_jsonl(root / RUNS_JSONL) if keep(rec)]
+    sites = [rec for rec in _read_jsonl(root / SITES_JSONL) if keep(rec)]
+    _rewrite_jsonl(root / RUNS_JSONL, runs)
+    _rewrite_jsonl(root / SITES_JSONL, sites)
+    return {
+        "dropped": sorted(drop),
+        "runs": len(runs),
+        "site_rows": len(sites),
+        "kpis": _write_kpis(root, sites),
+    }
+
+
+def refresh_kpis_from_ledger(*, root: Path | None = None, write: bool = True) -> dict[str, Any]:
+    """KPIs from sites.jsonl; rewrites kpis.json unless ``write`` is False."""
+    root = root or metrics_dir()
+    sites = _read_jsonl(root / SITES_JSONL)
+    return _write_kpis(root, sites) if write else rollup_kpis(sites)
+
+
+_LIVE_STATUSES = frozenset({"updated", "dequeued", "classified_only", "failed"})
+
+
+def _read_csv(path: Path) -> list[dict[str, Any]]:
+    if not path.is_file():
+        return []
+    import csv
+
+    with path.open(newline="", encoding="utf-8-sig") as handle:
+        return list(csv.DictReader(handle))
+
+
+def _run_is_live(header: dict[str, Any], detail: list[dict[str, Any]]) -> bool:
+    """Live run? Old headers predate ``apply_enabled``; infer from SF statuses."""
+    if "apply_enabled" in header:
+        return is_true(header.get("apply_enabled"))
+    return any(
+        lower_text(row.get("sf_update_status")) in _LIVE_STATUSES for row in detail
+    )
+
+
+def _stamp_statuses_from_apply_log(run_dir: Path, detail: list[dict[str, Any]]) -> None:
+    """Fill missing/pending sf_update_status from the run's apply log (old runs)."""
+    from enrichment.constants import APPLY_LOG_CSV
+
+    log = {
+        str(row.get("Id") or "").strip(): row
+        for row in _read_csv(run_dir / APPLY_LOG_CSV)
+        if str(row.get("Id") or "").strip()
+    }
+    for row in detail:
+        if lower_text(row.get("sf_update_status")) not in {"", "pending"}:
+            continue
+        entry = log.get(str(row.get("Id") or "").strip())
+        if not entry:
+            continue
+        try:
+            payload = json.loads(entry.get("payload_json") or "{}")
+        except json.JSONDecodeError:
+            payload = {}
+        from enrichment.sf_ops import status_from_entry
+
+        row["sf_update_status"] = status_from_entry(
+            {
+                "success": is_true(entry.get("success")),
+                "dry_run": is_true(entry.get("dry_run")),
+                "payload": payload,
+            }
+        )
+
+
+def rebuild_site_ledger(
+    *, runs_root: Path, root: Path | None = None
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Every processed site of every live run, from the runs' own CSVs.
+
+    Backfills the "all processed sites" grain for runs recorded when
+    ``sites.jsonl`` only kept successful writes. Runs whose
+    ``enrichment_detail.csv`` is gone keep their existing ledger rows.
+    Returns (site records in run order, per-run counts).
+    """
+    from enrichment.constants import DETAIL_CSV
+
+    root = root or metrics_dir()
+    headers: dict[str, dict[str, Any]] = {}
+    for rec in _read_jsonl(root / RUNS_JSONL):
+        rid = str(rec.get("run_id") or "")
+        if rid:
+            headers[rid] = rec  # re-applied runs: last header wins
+    old_by_run: dict[str, list[dict[str, Any]]] = {}
+    for rec in _read_jsonl(root / SITES_JSONL):
+        old_by_run.setdefault(str(rec.get("run_id") or ""), []).append(rec)
+    ordered = sorted(headers.values(), key=lambda h: str(h.get("recorded_at") or ""))
+    sites: list[dict[str, Any]] = []
+    stats = {"runs": 0, "from_csv": 0, "kept_ledger_rows": 0, "skipped_dry_runs": 0}
+    for header in ordered:
+        rid = str(header["run_id"])
+        run_dir = runs_root / rid
+        detail = _read_csv(run_dir / DETAIL_CSV)
+        if not detail:
+            kept = old_by_run.get(rid, [])
+            sites.extend(kept)
+            stats["kept_ledger_rows"] += len(kept)
+            stats["runs"] += 1 if kept else 0
+            continue
+        _stamp_statuses_from_apply_log(run_dir, detail)
+        if not _run_is_live(header, detail):
+            stats["skipped_dry_runs"] += 1
+            continue
+        records = [site_record(row, run_id=rid) for row in detail if row.get("Id")]
+        sites.extend(records)
+        stats["runs"] += 1
+        stats["from_csv"] += len(records)
+    return sites, stats
 
 
 def record_run(
@@ -490,15 +603,11 @@ def record_run(
     confirm_rooftop: bool = False,
     write_sql: bool | None = None,
 ) -> dict[str, Any]:
-    """Append this run to the ledger and refresh kpis.json.
+    """Append this run to the ledger, refresh kpis.json, and upsert Azure SQL.
 
-    The run header always keeps this-run successes and misses.
-    Cumulative KPIs / ``sites.jsonl`` / Azure SQL site rows only take a
-    Salesforce Id on its first successful enrichment write (site type/coords).
-    Holdouts, classified-only flags, dry-runs, and failed applies stay on
-    this-run only. NAIP rooftop confirms count when Salesforce accepted the
-    write (``sf_update_status=updated``). ``APPLY=0`` writes the run header
-    locally but does not append UniqueSites, rewrite ``kpis.json``, or upsert SQL.
+    The run header is always appended (``apply_enabled`` says whether it was
+    live). Live runs also append every processed site and rewrite
+    ``kpis.json``. ``APPLY=0`` leaves the cumulative ledger and SQL alone.
     """
     run_id = run_dir.name
     snap = snapshot_run(
@@ -512,36 +621,15 @@ def record_run(
     snap["confirm_rooftop"] = confirm_rooftop
     root = metrics_dir()
     root.mkdir(parents=True, exist_ok=True)
-    prior_sites = _read_jsonl(root / SITES_JSONL)
-    already = {
-        str(rec.get("Id") or "")
-        for rec in prior_sites
-        if kpi_eligible(rec) and rec.get("Id")
-    }
-    ledger_sites = [
-        rec
-        for rec in snap["site_records"]
-        if kpi_eligible(rec) and str(rec.get("Id") or "") not in already
-    ]
-    run_rec = {k: v for k, v in snap.items() if k != "site_records"}
-    _append_jsonl(root / RUNS_JSONL, [run_rec])
-    live_apply = apply_summary is not None
-    should_sql = live_apply if write_sql is None else write_sql
-    if ledger_sites and (live_apply or should_sql):
-        _append_jsonl(root / SITES_JSONL, ledger_sites)
-        kpis = rollup_kpis(prior_sites + ledger_sites)
-        (root / KPIS_JSON).write_text(json.dumps(kpis, indent=2), encoding="utf-8")
-        snap["kpis"] = kpis
-    elif live_apply:
-        kpis = rollup_kpis(prior_sites)
-        (root / KPIS_JSON).write_text(json.dumps(kpis, indent=2), encoding="utf-8")
-        snap["kpis"] = kpis
-    else:
-        snap["kpis"] = None
-    if should_sql:
+    _append_jsonl(root / RUNS_JSONL, [{k: v for k, v in snap.items() if k != "site_records"}])
+    live = apply_summary is not None
+    snap["kpis"] = None
+    if live:
+        prior_sites = _read_jsonl(root / SITES_JSONL)
+        _append_jsonl(root / SITES_JSONL, snap["site_records"])
+        snap["kpis"] = _write_kpis(root, prior_sites + snap["site_records"])
+    if live if write_sql is None else write_sql:
         from enrichment.metrics_store import try_write_snapshot
 
-        sql_snap = dict(snap)
-        sql_snap["site_records"] = ledger_sites
-        try_write_snapshot(sql_snap)
+        try_write_snapshot(snap)
     return snap

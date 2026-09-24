@@ -4,6 +4,14 @@ from __future__ import annotations
 
 from typing import Any
 
+from classifier.evidence import (
+    HEDGE_CUES,
+    STEALTH_MAST_WRITE_CUES,
+    WRITE_GATE_TELECOM_CUES,
+    evidence_text,
+    has_any,
+)
+from classifier.views import is_oblique_label, parse_box_2d
 from salesforce.site_type_mapping import (
     cell_equipment_confirmed,
     map_site_type_for_upload,
@@ -55,80 +63,16 @@ def _rooftop_cell_confidence_ok(
 
 def _telecom_evidence_cues(classified: dict[str, Any]) -> bool:
     """True when evidence text cites antenna/panel/dish/RRU-style gear."""
-    text = " ".join(
-        str(classified.get(key) or "")
-        for key in ("cell_equipment_evidence", "site_evidence")
-    ).lower()
-    cues = (
-        "antenna",
-        "sector",
-        "rru",
-        "microwave",
-        "backhaul",
-        "panel",
-        "parapet mast",
-        "radio",
-        "telecom",
-        "dish",
-        "facade mount",
-        "wall-mounted",
-        "wall mounted",
-    )
-    return any(cue in text for cue in cues)
+    return has_any(evidence_text(classified), WRITE_GATE_TELECOM_CUES)
 
 
 def _parse_asset_box_2d(classified: dict[str, Any]) -> list[int] | None:
-    raw = classified.get("asset_box_2d")
-    if raw is None or raw == "":
-        return None
-    value: Any = raw
-    if isinstance(value, str):
-        import json
-
-        try:
-            value = json.loads(value)
-        except json.JSONDecodeError:
-            return None
-    if not isinstance(value, (list, tuple)) or len(value) < 4:
-        return None
-    try:
-        ymin, xmin, ymax, xmax = (int(round(float(v))) for v in value[:4])
-    except (TypeError, ValueError):
-        return None
-    if ymin > ymax:
-        ymin, ymax = ymax, ymin
-    if xmin > xmax:
-        xmin, xmax = xmax, xmin
-    if not (0 <= ymin < ymax <= 1000 and 0 <= xmin < xmax <= 1000):
-        return None
-    return [ymin, xmin, ymax, xmax]
+    return parse_box_2d(classified.get("asset_box_2d"))
 
 
 def _hedged_cell_claim(classified: dict[str, Any]) -> bool:
     """True when evidence sounds guessed (HVAC FP / 'likely conceals' language)."""
-    text = " ".join(
-        str(classified.get(key) or "")
-        for key in ("cell_equipment_evidence", "site_evidence")
-    ).lower()
-    hedges = (
-        "likely",
-        "probably",
-        "possibly",
-        "possible",
-        "may be",
-        "might be",
-        "appears to",
-        "seem to",
-        "cannot confirm",
-        "can't confirm",
-        "uncertain",
-        "typical for this type",
-        "low resolution",
-        "too small to",
-        "hard to tell",
-        "unable to distinguish",
-    )
-    return any(h in text for h in hedges)
+    return has_any(evidence_text(classified), HEDGE_CUES)
 
 
 def _rooftop_cell_certain(classified: dict[str, Any]) -> bool:
@@ -202,12 +146,7 @@ def _has_asset_box(classified: dict[str, Any]) -> bool:
 
 
 def _asset_view_is_nearmap_oblique(classified: dict[str, Any]) -> bool:
-    view = str(classified.get("asset_view") or "").strip().lower()
-    if not view or "naip" in view:
-        return False
-    if "oblique" in view:
-        return True
-    return any(d in view for d in ("north", "east", "south", "west"))
+    return is_oblique_label(classified.get("asset_view"))
 
 
 def _view_evidence_consistent(classified: dict[str, Any]) -> bool:
@@ -228,21 +167,7 @@ def _view_evidence_consistent(classified: dict[str, Any]) -> bool:
 
 def _stealth_mast_cues(classified: dict[str, Any]) -> bool:
     """True when evidence names a disguised mast (monopalm/canister/etc.)."""
-    text = " ".join(
-        str(classified.get(key) or "")
-        for key in ("cell_equipment_evidence", "site_evidence")
-    ).lower()
-    cues = (
-        "monopalm",
-        "monopine",
-        "canister",
-        "faux palm",
-        "faux pine",
-        "palm frond",
-        "shroud",
-        "antenna bay",
-    )
-    return any(cue in text for cue in cues)
+    return has_any(evidence_text(classified), STEALTH_MAST_WRITE_CUES)
 
 
 def _tower_claimed_keep_ok(classified: dict[str, Any]) -> bool:

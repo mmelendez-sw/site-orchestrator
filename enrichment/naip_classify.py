@@ -3,7 +3,8 @@
 Honors classifier env flags from `.env` / process env:
   NEARMAP_TIERED, BIFURCATED_AI, GEMINI_ONLY, NAIP_ONLY, ZOOM_STAGE, WIDE_AOI_STAGE
 
-`classify_naip_only` remains as an explicit NAIP/Gemini-only escape hatch.
+Safe to call from several threads at once: per-site state stays local, model
+clients are shared, and Gemini/Claude pacing lives in ``classifier.llm``.
 """
 
 from __future__ import annotations
@@ -11,9 +12,11 @@ from __future__ import annotations
 import json
 import logging
 import os
-import time
+import threading
 from pathlib import Path
 from typing import Any
+
+from envutil import env_float
 
 logger = logging.getLogger(__name__)
 
@@ -155,6 +158,8 @@ def saved_chip_pack_usable(pack: dict[str, Any] | None) -> bool:
 
 def _refresh_classifier_flags(ac: Any) -> None:
     """Re-bind module flags from current env (enrichment may import after .env load)."""
+    from classifier import imagery
+
     ac.NAIP_ONLY = ac._env_flag("NAIP_ONLY", default="0")
     ac.NEARMAP_TIERED = ac._env_flag("NEARMAP_TIERED", default="1")
     ac.BIFURCATED_AI = ac._env_flag("BIFURCATED_AI", default="1")
@@ -172,32 +177,28 @@ def _refresh_classifier_flags(ac: Any) -> None:
     ac.GEMINI_THINKING_LEVEL = ac._parse_thinking_level(
         os.environ.get("GEMINI_THINKING_LEVEL"), "MEDIUM"
     )
-    ac.NEARMAP_API_KEY = (os.environ.get("NEARMAP_API_KEY") or "").strip()
-    try:
-        ac.CHIP_SIZE_M = float(os.environ.get("CHIP_SIZE_M", "300"))
-    except ValueError:
-        ac.CHIP_SIZE_M = 300.0
-    try:
-        ac.GEMINI_SOLO_CELL_CONF = float(os.environ.get("GEMINI_SOLO_CELL_CONF", "0.85"))
-    except ValueError:
-        ac.GEMINI_SOLO_CELL_CONF = 0.85
-    try:
-        ac.EMPTY_CHIP_LOCK_CONF = float(os.environ.get("NEARMAP_EMPTY_LOCK_CONF", "0.90"))
-    except ValueError:
-        ac.EMPTY_CHIP_LOCK_CONF = 0.90
-    try:
-        ac.NAIP_MAX_AGE_YEARS = float(os.environ.get("NAIP_MAX_AGE_YEARS", "2"))
-    except ValueError:
-        ac.NAIP_MAX_AGE_YEARS = 2.0
-    try:
-        ac.NAIP_AGE_HIGH_CONF_OVERRIDE = float(
-            os.environ.get("NAIP_AGE_HIGH_CONF_OVERRIDE", "0.85")
-        )
-    except ValueError:
-        ac.NAIP_AGE_HIGH_CONF_OVERRIDE = 0.85
+    ac.NEARMAP_API_KEY = imagery.nearmap_api_key()
+    ac.CHIP_SIZE_M = env_float("CHIP_SIZE_M", 300)
+    ac.GEMINI_SOLO_CELL_CONF = env_float("GEMINI_SOLO_CELL_CONF", 0.85)
+    ac.EMPTY_CHIP_LOCK_CONF = env_float("NEARMAP_EMPTY_LOCK_CONF", 0.90)
+    ac.NAIP_MAX_AGE_YEARS = env_float("NAIP_MAX_AGE_YEARS", 2)
+    ac.NAIP_AGE_HIGH_CONF_OVERRIDE = env_float("NAIP_AGE_HIGH_CONF_OVERRIDE", 0.85)
+
+
+_clients: dict[tuple[str, bool], dict[str, object]] = {}
+_clients_lock = threading.Lock()
 
 
 def _build_clients(ac: Any, primary_provider: str, allow_claude: bool) -> dict[str, object]:
+    """Gemini/Claude SDK clients, created once per mode and shared by workers."""
+    key = (primary_provider, bool(allow_claude))
+    with _clients_lock:
+        if key not in _clients:
+            _clients[key] = _new_clients(primary_provider, allow_claude)
+        return _clients[key]
+
+
+def _new_clients(primary_provider: str, allow_claude: bool) -> dict[str, object]:
     from google import genai
     from anthropic import Anthropic
 
@@ -213,6 +214,28 @@ def _build_clients(ac: Any, primary_provider: str, allow_claude: bool) -> dict[s
             )
         clients["claude"] = Anthropic()
     return clients
+
+
+def _labeled_views(
+    ac: Any,
+    naip_img,
+    naip_chip_m: float,
+    nearmap_views: dict,
+    *,
+    chip_dir: Path | None,
+    site_id: str,
+) -> list:
+    """NAIP view (when present) + Nearmap views; save Nearmap JPEGs for review/reuse."""
+    from classifier.views import nearmap_view_label
+
+    views = []
+    if naip_img is not None:
+        views.append((ac._naip_view_label(naip_chip_m), naip_img))
+    for name, vimg in nearmap_views.items():
+        if chip_dir is not None:
+            vimg.save(chip_dir / f"{site_id}_nearmap_{name.lower()}.jpg", quality=90)
+        views.append((nearmap_view_label(name), vimg))
+    return views
 
 
 def classify_site_imagery(
@@ -262,6 +285,8 @@ def classify_site_imagery(
     """
     from enrichment import progress
     from classifier import asset_classifier as ac
+    from classifier import imagery
+    from classifier.views import has_obliques, nearmap_tier_for
 
     _refresh_classifier_flags(ac)
     ac.QUIET = True
@@ -404,7 +429,7 @@ def classify_site_imagery(
         nearmap_views = dict(saved_pack.get("nearmap_views") or {})
     elif not skip_nearmap_fetch and not ac.NEARMAP_TIERED:
         try:
-            nearmap_views, nearmap_date = ac.fetch_nearmap_views(lat, lon)
+            nearmap_views, nearmap_date = imagery.fetch_nearmap_views(lat, lon)
         except Exception as exc:  # noqa: BLE001
             if verbose:
                 progress.warn(f"Nearmap fetch failed: {exc}")
@@ -422,22 +447,14 @@ def classify_site_imagery(
         }
 
     def build_views(nm_views, naip_img=None, chip_m=None):
-        views = []
-        source_img = img if naip_img is None else naip_img
-        side_m = naip_chip_m if chip_m is None else chip_m
-        if source_img is not None:
-            views.append((ac._naip_view_label(side_m), source_img))
-        for name, vimg in nm_views.items():
-            if chip_dir is not None:
-                vpath = chip_dir / f"{site_id}_nearmap_{name.lower()}.jpg"
-                vimg.save(vpath, quality=90)
-            label = (
-                "Nearmap top-down"
-                if name == "Vert"
-                else f"Nearmap oblique ({name})"
-            )
-            views.append((label, vimg))
-        return views
+        return _labeled_views(
+            ac,
+            img if naip_img is None else naip_img,
+            naip_chip_m if chip_m is None else chip_m,
+            nm_views,
+            chip_dir=chip_dir,
+            site_id=site_id,
+        )
 
     chip_path = None
     if img is not None and chip_dir is not None:
@@ -467,13 +484,7 @@ def classify_site_imagery(
                 screen=False,
             )
         )
-        has_obliques = any(name != "Vert" for name in nearmap_views)
-        if has_obliques:
-            nearmap_tier = "full"
-        elif nearmap_views:
-            nearmap_tier = "vert_only"
-        else:
-            nearmap_tier = "naip_only"
+        nearmap_tier = nearmap_tier_for(nearmap_views)
         classification_stage = "chip_reuse"
     elif skip_paid_imagery:
         if img is None:
@@ -537,7 +548,7 @@ def classify_site_imagery(
             if verbose:
                 progress.step("NAIP unconfirmed — buy Nearmap Vert+obliques")
             try:
-                nearmap_views, nearmap_date = ac.fetch_nearmap_views(lat, lon)
+                nearmap_views, nearmap_date = imagery.fetch_nearmap_views(lat, lon)
             except Exception as exc:  # noqa: BLE001
                 nearmap_views, nearmap_date = {}, None
                 if verbose:
@@ -554,8 +565,7 @@ def classify_site_imagery(
                         escalate=False,
                     )
                 )
-                has_obliques = any(name != "Vert" for name in nearmap_views)
-                nearmap_tier = "full" if has_obliques else "vert_only"
+                nearmap_tier = nearmap_tier_for(nearmap_views)
             else:
                 nearmap_tier = "no_coverage"
     elif ac.NEARMAP_TIERED:
@@ -630,31 +640,24 @@ def classify_site_imagery(
         if verbose:
             progress.step("Nearmap at other rooftop-host point")
         try:
-            other_nm, other_date = ac.fetch_nearmap_views(o_lat, o_lon)
+            other_nm, other_date = imagery.fetch_nearmap_views(o_lat, o_lon)
         except Exception as exc:  # noqa: BLE001
             other_nm, other_date = {}, None
             if verbose:
                 progress.warn(f"other-point Nearmap failed: {exc}")
         if other_nm:
             other_img, other_meta, other_geo = ac.fetch_chip(o_lat, o_lon)
-            other_views = []
             other_chip_m = (other_meta or {}).get("naip_chip_m") or ac.CHIP_SIZE_M
-            if other_img is not None:
-                other_views.append((ac._naip_view_label(other_chip_m), other_img))
-                if chip_dir is not None:
-                    other_img.save(
-                        chip_dir / f"{site_id}_NAIP_mismatch.jpg", quality=90
-                    )
-            for name, vimg in other_nm.items():
-                if chip_dir is not None:
-                    vpath = chip_dir / f"{site_id}_nearmap_{name.lower()}.jpg"
-                    vimg.save(vpath, quality=90)
-                label = (
-                    "Nearmap top-down"
-                    if name == "Vert"
-                    else f"Nearmap oblique ({name})"
-                )
-                other_views.append((label, vimg))
+            if other_img is not None and chip_dir is not None:
+                other_img.save(chip_dir / f"{site_id}_NAIP_mismatch.jpg", quality=90)
+            other_views = _labeled_views(
+                ac,
+                other_img,
+                other_chip_m,
+                other_nm,
+                chip_dir=chip_dir,
+                site_id=site_id,
+            )
             other_res, _, _, _ = ac.classify_with_routing(
                 primary_provider,
                 clients,
@@ -687,8 +690,7 @@ def classify_site_imagery(
                 nearmap_views = other_nm
                 nearmap_date = other_date or nearmap_date
                 views = other_views
-                has_obliques = any(n != "Vert" for n in nearmap_views)
-                nearmap_tier = "full" if has_obliques else "vert_only"
+                nearmap_tier = nearmap_tier_for(nearmap_views)
                 classification_stage = "mismatch_second_look"
                 pin_eps = 1e-5
                 if (
@@ -717,17 +719,17 @@ def classify_site_imagery(
                     "first Nearmap locked empty @0.90 — skip second pack"
                 )
 
-    nearmap_aoi_m = ac.NEARMAP_CHIP_M if nearmap_views else None
+    nearmap_aoi_m = imagery.NEARMAP_CHIP_M if nearmap_views else None
     stage_provider = primary_provider
 
-    has_obliques = any(name != "Vert" for name in nearmap_views)
+    obliques = has_obliques(nearmap_views)
     nearmap_settled_other = (
         nearmap_tier == "full"
-        and has_obliques
+        and obliques
         and res.get("site_type") in ("other", "unclear")
     )
     nearmap_blocks_rescue = ac.nearmap_full_blocks_rescue(
-        res, nearmap_tier=nearmap_tier, has_obliques=has_obliques
+        res, nearmap_tier=nearmap_tier, has_obliques=obliques
     )
     nearmap_tier_now = str(nearmap_tier or "").strip().lower()
     nearmap_looked = nearmap_tier_now in {
@@ -788,9 +790,9 @@ def classify_site_imagery(
     ):
         try:
             if verbose:
-                progress.step(f"Nearmap wide AOI ({ac.NEARMAP_FALLBACK_CHIP_M}m)")
-            wide_views, wide_date = ac.fetch_nearmap_views(
-                lat, lon, ac.NEARMAP_FALLBACK_CHIP_M
+                progress.step(f"Nearmap wide AOI ({imagery.NEARMAP_FALLBACK_CHIP_M}m)")
+            wide_views, wide_date = imagery.fetch_nearmap_views(
+                lat, lon, imagery.NEARMAP_FALLBACK_CHIP_M
             )
         except Exception as exc:  # noqa: BLE001
             wide_views, wide_date = {}, None
@@ -799,7 +801,7 @@ def classify_site_imagery(
         if wide_views:
             nearmap_views = wide_views
             nearmap_date = wide_date or nearmap_date
-            nearmap_aoi_m = ac.NEARMAP_FALLBACK_CHIP_M
+            nearmap_aoi_m = imagery.NEARMAP_FALLBACK_CHIP_M
             views = build_views(wide_views)
             res, _, _, _ = ac.classify_with_routing(
                 stage_provider,
@@ -934,11 +936,11 @@ def classify_site_imagery(
                 box = None
         located = None
         box_view = res.get("asset_view")
-        if box and ac._is_naip_view(box_view) and naip_geo:
-            located = ac.box_to_latlon(naip_geo, box)
+        if box and imagery._is_naip_view(box_view) and naip_geo:
+            located = imagery.box_to_latlon(naip_geo, box)
         elif box and box_view and "top-down" in str(box_view).lower():
-            chip_m = float(nearmap_aoi_m or ac.NEARMAP_CHIP_M)
-            located = ac.box_to_latlon_centered(lat, lon, chip_m, box)
+            chip_m = float(nearmap_aoi_m or imagery.NEARMAP_CHIP_M)
+            located = imagery.box_to_latlon_centered(lat, lon, chip_m, box)
         if located:
             cand_lat, cand_lon, cand_offset = located
             if cand_offset >= 20:
@@ -947,7 +949,7 @@ def classify_site_imagery(
                         f"re-center Nearmap ({cand_offset:.0f}m from pin)"
                     )
                 try:
-                    recenter_views, recenter_date = ac.fetch_nearmap_views(
+                    recenter_views, recenter_date = imagery.fetch_nearmap_views(
                         cand_lat, cand_lon
                     )
                 except Exception as exc:  # noqa: BLE001
@@ -973,10 +975,9 @@ def classify_site_imagery(
                         lat, lon = cand_lat, cand_lon
                         nearmap_views = recenter_views
                         nearmap_date = recenter_date or nearmap_date
-                        nearmap_aoi_m = ac.NEARMAP_CHIP_M
-                        has_obliques = any(n != "Vert" for n in nearmap_views)
+                        nearmap_aoi_m = imagery.NEARMAP_CHIP_M
                         classification_stage = "pin_recenter"
-                        nearmap_tier = "full" if has_obliques else "vert_only"
+                        nearmap_tier = nearmap_tier_for(nearmap_views)
                         if verbose:
                             progress.result(
                                 f"re-center confirmed → {res.get('site_type')} "
@@ -1082,7 +1083,7 @@ def classify_site_imagery(
     asset_coord_source = None
     box, box_view = res.get("asset_box_2d"), res.get("asset_view")
     if box:
-        located = ac.locate_asset_box_latlon(
+        located = imagery.locate_asset_box_latlon(
             lat=lat,
             lon=lon,
             box=box,
@@ -1092,11 +1093,6 @@ def classify_site_imagery(
         )
         if located:
             asset_lat, asset_lon, asset_offset_m, asset_coord_source = located
-
-    delay = ac.GEMINI_DELAY_S if primary_provider == "gemini" else ac.API_DELAY_S
-    if verbose and delay:
-        progress.step(f"pause {delay:g}s")
-    time.sleep(delay)
 
     return {
         "lat": lat,
@@ -1141,48 +1137,3 @@ def classify_site_imagery(
         "chip_path": str(chip_path) if chip_path else None,
         "error": None,
     }
-
-
-def classify_naip_only(
-    *,
-    site_id: str,
-    lat: float,
-    lon: float,
-    chip_dir: Path | None = None,
-    input_confidence: str = "medium",
-    verbose: bool = True,
-    presence_only: bool = False,
-    **kwargs,
-) -> dict[str, Any]:
-    """NAIP + Gemini-only path (no Nearmap, no Claude).
-
-    ``presence_only=True`` asks whether a building roof is at the pin, not
-    whether cellular gear is on that roof (ConnectX rooftop confirm).
-    """
-    prior = {
-        "NAIP_ONLY": os.environ.get("NAIP_ONLY"),
-        "NEARMAP_TIERED": os.environ.get("NEARMAP_TIERED"),
-        "BIFURCATED_AI": os.environ.get("BIFURCATED_AI"),
-        "GEMINI_ONLY": os.environ.get("GEMINI_ONLY"),
-    }
-    try:
-        os.environ["NAIP_ONLY"] = "1"
-        os.environ["NEARMAP_TIERED"] = "0"
-        os.environ["BIFURCATED_AI"] = "0"
-        os.environ["GEMINI_ONLY"] = "1"
-        return classify_site_imagery(
-            site_id=site_id,
-            lat=lat,
-            lon=lon,
-            chip_dir=chip_dir,
-            input_confidence=input_confidence,
-            verbose=verbose,
-            presence_only=presence_only,
-            **kwargs,
-        )
-    finally:
-        for key, value in prior.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value

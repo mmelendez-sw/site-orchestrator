@@ -11,26 +11,19 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any
 
+from envutil import env_flag, env_float, env_str
+
 logger = logging.getLogger(__name__)
 
-OVERPASS_URL = os.environ.get(
-    "OVERPASS_URL", "https://overpass-api.de/api/interpreter"
-).strip()
-OSM_RADIUS_M = float(os.environ.get("OSM_RADIUS_M", "80"))
-OSM_TIMEOUT_S = float(os.environ.get("OSM_TIMEOUT_S", "8"))
-
-
-def _env_flag(name: str, default: str = "1") -> bool:
-    return os.environ.get(name, default).strip().lower() in ("1", "true", "yes")
-
-
-OSM_PREFILTER = _env_flag("OSM_PREFILTER", default="1")
+OVERPASS_URL = env_str("OVERPASS_URL", "https://overpass-api.de/api/interpreter")
+OSM_RADIUS_M = env_float("OSM_RADIUS_M", 80)
+OSM_TIMEOUT_S = env_float("OSM_TIMEOUT_S", 8)
+OSM_PREFILTER = env_flag("OSM_PREFILTER", True)
 
 _TOWER_VALUES = frozenset({"tower", "mast", "communications_tower", "antenna"})
 _COMM_TOWER_TYPES = frozenset(

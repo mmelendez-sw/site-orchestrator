@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import logging
-import time
 from typing import Any, Iterable, Sequence
 
 from salesforce.field_map import OBJECT_NAME
 from salesforce.sf_client import SalesforceClient
 
+from enrichment.coerce import is_missing, to_bool, to_float
 from enrichment.constants import (
     DEFAULT_OWNER_FILTER,
     DEFAULT_STAGE_FILTER,
@@ -281,7 +281,7 @@ def query_sites_by_ids(
 def parse_sf_lat_lng(row: dict[str, Any]) -> tuple[float, float] | None:
     lat_raw = row.get("Site_Latitude__c")
     lng_raw = row.get("Site_Longitude__c")
-    if _is_missing(lat_raw) or _is_missing(lng_raw):
+    if is_missing(lat_raw) or is_missing(lng_raw):
         return None
     try:
         return float(lat_raw), float(lng_raw)
@@ -383,6 +383,93 @@ def update_site(
     return {"id": record_id, "status": result, "success": True}
 
 
+def build_row_payload(row: dict[str, Any], *, write_holdout: bool = True) -> dict[str, Any]:
+    """Salesforce payload for one detail row (site fields + queue flags)."""
+    payload = row.get("payload")
+    if not isinstance(payload, dict):
+        site_fields = build_update_payload(
+            latitude=to_float(row.get("update_lat")),
+            longitude=to_float(row.get("update_lng")),
+            site_type=(row.get("update_site_type") or None) or None,
+            verified_site=to_bool(row.get("update_verified_site")),
+            verified_site_source=(row.get("update_verified_site_source") or None)
+            or None,
+        )
+        return apply_queue_flags(site_fields, write_holdout=write_holdout)
+    # Preserve explicit queue flags on prebuilt payloads; fill any gaps.
+    payload = dict(payload)
+    is_enrich = is_enrichment_payload(payload)
+    if "LLM_Classified__c" not in payload:
+        payload["LLM_Classified__c"] = True if not write_holdout else is_enrich
+    if write_holdout and "LLM_Holdout__c" not in payload:
+        payload["LLM_Holdout__c"] = not is_enrich
+    if not write_holdout:
+        payload.pop("LLM_Holdout__c", None)
+    return payload
+
+
+def _row_sf_id(row: dict[str, Any]) -> str:
+    return str(row.get("Id") or row.get("sf_id") or "").strip()
+
+
+def validate_row_payload(row: dict[str, Any], payload: dict[str, Any]) -> None:
+    """Raise ValueError when a row must not write these site fields."""
+    if not _row_sf_id(row):
+        raise ValueError("Missing Salesforce Id")
+    naip_site_type = str(row.get("naip_site_type") or "").strip().lower()
+    payload_site_type = str(payload.get("Site_Type__c") or "").strip()
+    db_skip = str(row.get("holdout_reason") or "").strip() == "skip_classify_db_hit"
+    if is_enrichment_payload(payload) and naip_site_type not in {"tower", "rooftop"}:
+        if not (db_skip and payload_site_type):
+            raise ValueError(
+                f"Salesforce updates require NAIP site_type=tower|rooftop; got "
+                f"{naip_site_type or 'blank'}"
+            )
+    if not payload:
+        raise ValueError("Empty update payload")
+
+
+def _new_entry(sf_id: str, payload: dict[str, Any], *, dry_run: bool) -> dict[str, Any]:
+    return {
+        "Id": sf_id,
+        "success": False,
+        "dry_run": dry_run,
+        "error": "",
+        "status": "",
+        "payload": payload,
+    }
+
+
+def _needs_error_fallback(
+    entry: dict[str, Any], *, error_holdout: bool, dry_run: bool
+) -> bool:
+    return (
+        error_holdout
+        and not dry_run
+        and bool(entry["Id"])
+        and not _is_holdout_fallback_payload(entry["payload"])
+    )
+
+
+def _mark_fallback(entry: dict[str, Any], error: str, fallback_error: str | None) -> None:
+    """Record the outcome of the LLM_Holdout retry after a failed write."""
+    original = entry["error"]
+    entry["payload"] = dict(APPLY_ERROR_HOLDOUT_PAYLOAD)
+    if fallback_error is None:
+        entry["success"] = True
+        entry["status"] = "updated_holdout_after_error"
+        entry["error"] = f"fallback after apply error: {original}"
+        logger.warning(
+            "SF write failed for %s — dequeued LLM_Holdout=true: %s", entry["Id"], error
+        )
+    else:
+        entry["status"] = "failed"
+        entry["error"] = (
+            f"holdout fallback also failed: {fallback_error} (original: {original})"
+        )
+        logger.warning("holdout fallback failed for %s: %s", entry["Id"], fallback_error)
+
+
 def apply_one_update(
     client: SalesforceClient,
     row: dict[str, Any],
@@ -406,52 +493,11 @@ def apply_one_update(
     """
     from enrichment import progress
 
-    sf_id = str(row.get("Id") or row.get("sf_id") or "").strip()
-    payload = row.get("payload")
-    if not isinstance(payload, dict):
-        site_fields = build_update_payload(
-            latitude=_optional_float(row.get("update_lat")),
-            longitude=_optional_float(row.get("update_lng")),
-            site_type=(row.get("update_site_type") or None) or None,
-            verified_site=_optional_bool(row.get("update_verified_site")),
-            verified_site_source=(row.get("update_verified_site_source") or None)
-            or None,
-        )
-        payload = apply_queue_flags(site_fields, write_holdout=write_holdout)
-    else:
-        # Preserve explicit queue flags on prebuilt payloads; fill any gaps.
-        payload = dict(payload)
-        is_enrich = is_enrichment_payload(payload)
-        if "LLM_Classified__c" not in payload:
-            payload["LLM_Classified__c"] = True if not write_holdout else is_enrich
-        if write_holdout and "LLM_Holdout__c" not in payload:
-            payload["LLM_Holdout__c"] = not is_enrich
-        if not write_holdout:
-            payload.pop("LLM_Holdout__c", None)
-    entry = {
-        "Id": sf_id,
-        "success": False,
-        "dry_run": dry_run,
-        "error": "",
-        "status": "",
-        "payload": payload,
-    }
+    sf_id = _row_sf_id(row)
+    payload = build_row_payload(row, write_holdout=write_holdout)
+    entry = _new_entry(sf_id, payload, dry_run=dry_run)
     try:
-        if not sf_id:
-            raise ValueError("Missing Salesforce Id")
-        naip_site_type = str(row.get("naip_site_type") or "").strip().lower()
-        has_enrichment = is_enrichment_payload(payload)
-        allowed_types = {"tower", "rooftop"}
-        payload_site_type = str(payload.get("Site_Type__c") or "").strip()
-        db_skip = str(row.get("holdout_reason") or "").strip() == "skip_classify_db_hit"
-        if has_enrichment and naip_site_type not in allowed_types:
-            if not (db_skip and payload_site_type):
-                raise ValueError(
-                    f"Salesforce updates require NAIP site_type=tower|rooftop; got "
-                    f"{naip_site_type or 'blank'}"
-                )
-        if not payload:
-            raise ValueError("Empty update payload")
+        validate_row_payload(row, payload)
         if dry_run:
             entry["success"] = True
             entry["status"] = "dry_run"
@@ -463,53 +509,44 @@ def apply_one_update(
         entry["status"] = "updated"
         if verbose:
             progress.result(_format_apply_result(payload, dry_run=False))
+        return entry
     except Exception as exc:  # noqa: BLE001 — per-row resilience
-        if (
-            error_holdout
-            and not dry_run
-            and sf_id
-            and not _is_holdout_fallback_payload(payload)
-        ):
-            fallback = dict(APPLY_ERROR_HOLDOUT_PAYLOAD)
-            try:
-                update_site(client, sf_id, fallback, verbose=False)
-                entry["success"] = True
-                entry["status"] = "updated_holdout_after_error"
-                entry["payload"] = fallback
-                entry["error"] = f"fallback after apply error: {exc}"
-                logger.warning(
-                    "SF write failed for %s — dequeued LLM_Holdout=true: %s",
-                    sf_id,
-                    exc,
-                )
-                if verbose:
-                    progress.warn(
-                        "SF write failed — dequeued "
-                        "(LLM_Classified=false, LLM_Holdout=true)"
-                    )
-                return entry
-            except Exception as fallback_exc:  # noqa: BLE001
-                entry["error"] = (
-                    f"holdout fallback also failed: {fallback_exc} "
-                    f"(original: {exc})"
-                )
-                entry["status"] = "failed"
-                entry["payload"] = fallback
-                logger.warning(
-                    "holdout fallback failed for %s: %s", sf_id, fallback_exc
-                )
-                if verbose:
-                    progress.warn(
-                        f"SF update failed — continuing: {entry['error']}"
-                    )
-                return entry
-
         entry["error"] = str(exc)
         entry["status"] = "failed"
-        logger.warning("update failed for %s: %s", sf_id, exc)
+        if not _needs_error_fallback(entry, error_holdout=error_holdout, dry_run=dry_run):
+            logger.warning("update failed for %s: %s", sf_id, exc)
+            if verbose:
+                progress.warn(f"SF update failed — continuing: {exc}")
+            return entry
+    try:
+        update_site(client, sf_id, dict(APPLY_ERROR_HOLDOUT_PAYLOAD), verbose=False)
+        _mark_fallback(entry, entry["error"], None)
         if verbose:
-            progress.warn(f"SF update failed — continuing: {exc}")
+            progress.warn(
+                "SF write failed — dequeued (LLM_Classified=false, LLM_Holdout=true)"
+            )
+    except Exception as fallback_exc:  # noqa: BLE001
+        _mark_fallback(entry, entry["error"], str(fallback_exc))
+        if verbose:
+            progress.warn(f"SF update failed — continuing: {entry['error']}")
     return entry
+
+
+def status_from_entry(entry: dict[str, Any]) -> str:
+    """detail-row ``sf_update_status`` for one apply result."""
+    if entry.get("dry_run"):
+        return "dry_run"
+    if not entry.get("success"):
+        return "failed"
+    payload = entry.get("payload")
+    payload = payload if isinstance(payload, dict) else {}
+    if is_enrichment_payload(payload):
+        return "updated"
+    if payload.get("LLM_Holdout__c") is True:
+        return "dequeued"
+    if payload.get("LLM_Classified__c"):
+        return "classified_only"
+    return "dequeued"
 
 
 def _format_apply_result(
@@ -541,92 +578,180 @@ def _format_apply_result(
     return f"{prefix} | verified={verified} | type={site_type} | {coords}"
 
 
-def apply_updates_idempotent(
+# ---------------------------- sObject Collections ---------------------------
+
+# Salesforce caps sObject Collections at 200 records per request.
+COLLECTION_LIMIT = 200
+
+
+def _collection_errors(result: dict[str, Any]) -> str:
+    errors = result.get("errors") or []
+    return "; ".join(
+        f"{err.get('statusCode') or 'ERROR'}: {err.get('message') or ''}".strip()
+        for err in errors
+        if isinstance(err, dict)
+    ) or "unknown Salesforce error"
+
+
+def update_sites_collection(
+    client: SalesforceClient,
+    updates: Sequence[tuple[str, dict[str, Any]]],
+) -> list[str | None]:
+    """PATCH up to 200 Site__c rows in one call. Per-row error text or None.
+
+    ``allOrNone=false``: each record succeeds or fails independently.
+    Raises only when the whole request fails (transport / auth).
+    """
+    if not updates:
+        return []
+    if len(updates) > COLLECTION_LIMIT:
+        raise ValueError(f"at most {COLLECTION_LIMIT} records per collection call")
+    body = {
+        "allOrNone": False,
+        "records": [
+            {"attributes": {"type": OBJECT_NAME}, "id": sf_id, **payload}
+            for sf_id, payload in updates
+        ],
+    }
+    response = client.sf.restful("composite/sobjects", method="PATCH", json=body)
+    if not isinstance(response, list) or len(response) != len(updates):
+        raise RuntimeError(f"unexpected sObject Collections reply: {response!r}")
+    return [
+        None if (item or {}).get("success") else _collection_errors(item or {})
+        for item in response
+    ]
+
+
+def _send_updates(
+    client: SalesforceClient, updates: Sequence[tuple[str, dict[str, Any]]]
+) -> list[str | None]:
+    """One PATCH for a single row, sObject Collections for several."""
+    if len(updates) == 1:
+        sf_id, payload = updates[0]
+        try:
+            update_site(client, sf_id, payload, verbose=False)
+            return [None]
+        except Exception as exc:  # noqa: BLE001
+            return [str(exc)]
+    return update_sites_collection(client, updates)
+
+
+def apply_updates_batch(
     client: SalesforceClient,
     rows: Iterable[dict[str, Any]],
     *,
-    dry_run: bool = True,
+    dry_run: bool = False,
     verbose: bool = True,
     write_holdout: bool = True,
     error_holdout: bool = True,
+    chunk_size: int = COLLECTION_LIMIT,
 ) -> list[dict[str, Any]]:
-    """Apply updates one row at a time; failures are logged and skipped."""
+    """Apply many rows with the same rules as ``apply_one_update``.
+
+    Rows go out in sObject Collections chunks. Failed records get the same
+    LLM_Holdout retry, also batched. If a whole collection call fails, that
+    chunk falls back to row-by-row ``apply_one_update``.
+    """
     from enrichment import progress
 
     rows_list = list(rows)
-    results: list[dict[str, Any]] = []
-    for index, row in enumerate(rows_list, start=1):
-        sf_id = str(row.get("Id") or row.get("sf_id") or "").strip()
-        address = progress.format_site_address(row)
-        if verbose:
-            progress.step(f"[{index}/{len(rows_list)}] Id={sf_id or '—'}")
-        else:
-            progress.row_count(
-                index, len(rows_list), sf_id=sf_id, address=address
-            )
-        row_t0 = time.monotonic()
-        entry = apply_one_update(
+    chunk_size = max(1, min(COLLECTION_LIMIT, int(chunk_size)))
+    entries: list[dict[str, Any]] = []
+    for start in range(0, len(rows_list), chunk_size):
+        chunk_entries: list[dict[str, Any]] = []
+        prepared: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        for row in rows_list[start : start + chunk_size]:
+            payload = build_row_payload(row, write_holdout=write_holdout)
+            entry = _new_entry(_row_sf_id(row), payload, dry_run=dry_run)
+            try:
+                validate_row_payload(row, payload)
+            except ValueError as exc:
+                entry["error"] = str(exc)
+                entry["status"] = "failed"
+            else:
+                if dry_run:
+                    entry["success"] = True
+                    entry["status"] = "dry_run"
+                else:
+                    prepared.append((row, entry))
+            chunk_entries.append(entry)
+        entries.extend(chunk_entries)
+        if dry_run:
+            continue
+        handled: set[int] = set()
+        if prepared:
+            try:
+                errors = _send_updates(
+                    client, [(entry["Id"], entry["payload"]) for _row, entry in prepared]
+                )
+            except Exception as exc:  # noqa: BLE001 — whole call failed
+                logger.warning(
+                    "sObject Collections call failed (%s); applying row by row", exc
+                )
+                for row, entry in prepared:
+                    entry.update(
+                        apply_one_update(
+                            client,
+                            row,
+                            dry_run=False,
+                            verbose=False,
+                            write_holdout=write_holdout,
+                            error_holdout=error_holdout,
+                        )
+                    )
+                    handled.add(id(entry))
+            else:
+                for (_row, entry), error in zip(prepared, errors):
+                    if error is None:
+                        entry["success"] = True
+                        entry["status"] = "updated"
+                    else:
+                        entry["error"] = error
+                        entry["status"] = "failed"
+        _fallback_failed(
             client,
-            row,
-            dry_run=dry_run,
-            verbose=False,
-            write_holdout=write_holdout,
+            [entry for entry in chunk_entries if id(entry) not in handled],
             error_holdout=error_holdout,
         )
-        row_elapsed = time.monotonic() - row_t0
+    for index, entry in enumerate(entries, start=1):
         entry["index"] = index
         if verbose:
             if entry.get("success"):
                 progress.result(
-                    _format_apply_result(
+                    f"{entry['Id']} | "
+                    + _format_apply_result(
                         entry.get("payload") or {},
                         dry_run=dry_run,
                         status=str(entry.get("status") or ""),
-                    ),
-                    elapsed_s=row_elapsed,
+                    )
                 )
             else:
                 progress.warn(
-                    f"SF update failed — continuing: {entry.get('error') or 'unknown'}",
-                    elapsed_s=row_elapsed,
+                    f"{entry['Id']} | SF update failed — continuing: "
+                    f"{entry.get('error') or 'unknown'}"
                 )
-        results.append(entry)
-    return results
+    return entries
 
 
-def _is_missing(value: Any) -> bool:
-    """True for None/blank/NaN — never send these in a Salesforce JSON payload."""
-    if value is None:
-        return True
-    if isinstance(value, float):
-        try:
-            return value != value  # NaN
-        except Exception:
-            return False
-    if isinstance(value, str) and not value.strip():
-        return True
-    if isinstance(value, str) and value.strip().lower() == "nan":
-        return True
-    return False
-
-
-def _optional_float(value: Any) -> float | None:
-    if _is_missing(value):
-        return None
+def _fallback_failed(
+    client: SalesforceClient,
+    entries: list[dict[str, Any]],
+    *,
+    error_holdout: bool,
+) -> None:
+    """LLM_Holdout retry for every failed entry that qualifies (one batch)."""
+    retry = [
+        entry
+        for entry in entries
+        if entry["status"] == "failed"
+        and _needs_error_fallback(entry, error_holdout=error_holdout, dry_run=False)
+    ]
+    if not retry:
+        return
+    payload = dict(APPLY_ERROR_HOLDOUT_PAYLOAD)
     try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _optional_bool(value: Any) -> bool | None:
-    if _is_missing(value):
-        return None
-    if isinstance(value, bool):
-        return value
-    text = str(value).strip().lower()
-    if text in {"true", "1", "yes"}:
-        return True
-    if text in {"false", "0", "no"}:
-        return False
-    return None
+        errors = _send_updates(client, [(entry["Id"], payload) for entry in retry])
+    except Exception as exc:  # noqa: BLE001
+        errors = [str(exc)] * len(retry)
+    for entry, error in zip(retry, errors):
+        _mark_fallback(entry, entry["error"], error)

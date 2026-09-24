@@ -41,6 +41,12 @@ RERUN_SKIP_APPLIED=1 (default) drops Ids that already wrote Site_Type.
 Set RERUN_HOLDOUTS_FROM to re-classify holdout Ids only.
 Set REUSE_CHIPS_FROM to classify saved JPEGs (no Nearmap fetch). If unset,
 chips are reused from RERUN_SITES_FROM or RERUN_HOLDOUTS_FROM.
+SKIP_FROM=sql skips every Id any live run already recorded in Azure SQL
+(dbo.EnrichmentSiteOutcome); combine with run folders / dates by comma.
+Throughput: CLASSIFY_WORKERS (default 3) parallel classify threads in one
+process; GEMINI_RPM / CLAUDE_RPM (default 30 / 50) pace every model call.
+APPLY_BATCH_SIZE (default 25) / APPLY_FLUSH_S (default 60) batch live
+Salesforce writes through sObject Collections; 1 writes each site at once.
 """
 
 from __future__ import annotations
@@ -99,15 +105,30 @@ from paths import ensure_data_layout, runs_dir  # noqa: E402
 from salesforce.sf_client import SalesforceClient  # noqa: E402
 
 
-def _csv_env(name: str) -> list[str] | None:
-    raw = (os.environ.get(name) or "").strip()
-    if not raw:
-        return None
-    return [part.strip() for part in raw.split(",") if part.strip()]
+from envutil import env_csv as _csv_env  # noqa: E402
+from envutil import env_flag  # noqa: E402
+
+_RETIRED_DELAYS = ("GEMINI_DELAY_S", "CLAUDE_DELAY_S")
+_SQL_SKIP_SPEC = "sql"
 
 
 def _flag(name: str, default: str = "0") -> bool:
-    return (os.environ.get(name) or default).strip().lower() in {"1", "true", "yes"}
+    return env_flag(name, default)
+
+
+def skip_ids_from_specs(specs: list[str] | None) -> list[str]:
+    """SKIP_FROM Ids: run folders / YYYY-MM-DD prefixes, plus ``sql`` for Azure SQL."""
+    if not specs:
+        return []
+    ids: list[str] = []
+    run_specs = [spec for spec in specs if spec.lower() != _SQL_SKIP_SPEC]
+    if run_specs:
+        ids.extend(site_ids_from_run_specs(run_specs, runs_root=runs_dir(), stages=[]))
+    if len(run_specs) != len(specs):
+        from enrichment.metrics_store import processed_ids
+
+        ids.extend(sorted(processed_ids()))
+    return list(dict.fromkeys(ids))
 
 
 def main() -> int:
@@ -173,14 +194,16 @@ def main() -> int:
             f"  reuse chips from {len(reuse_chips_dirs)} folder(s) (no Nearmap fetch)",
             flush=True,
         )
-    skip_from = _csv_env("SKIP_FROM")
-    skip_ids: list[str] = []
-    if skip_from:
-        skip_ids = site_ids_from_run_specs(
-            skip_from,
-            runs_root=runs_dir(),
-            stages=[],
+    retired = [name for name in _RETIRED_DELAYS if os.environ.get(name)]
+    if retired:
+        print(
+            f"  note: {', '.join(retired)} no longer used — pacing is GEMINI_RPM / "
+            "CLAUDE_RPM shared across CLASSIFY_WORKERS",
+            flush=True,
         )
+    skip_from = _csv_env("SKIP_FROM")
+    skip_ids = skip_ids_from_specs(skip_from)
+    if skip_from:
         print(
             f"  skip already attempted from {', '.join(skip_from)}: "
             f"{len(skip_ids)} id(s)",

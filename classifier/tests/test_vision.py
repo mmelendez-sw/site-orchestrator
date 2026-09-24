@@ -1,10 +1,8 @@
 """Tests for NAIP box helpers (no network / paid APIs)."""
 
-from classifier.asset_classifier import (
-    coerce_asset_box,
-    locate_asset_box_latlon,
-    normalize_model_result,
-)
+from classifier.asset_classifier import normalize_model_result
+from classifier.imagery import locate_asset_box_latlon
+from classifier.views import coerce_asset_box
 
 
 def test_coerce_asset_box_accepts_tight_antenna_box():

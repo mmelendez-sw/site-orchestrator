@@ -142,6 +142,35 @@ def write_csv(path: Path, rows: Iterable[dict[str, Any]], columns: Sequence[str]
             writer.writerow({col: row.get(col, "") for col in columns})
 
 
+class CsvAppender:
+    """Append rows to a CSV as they finish (header once, flushed per row).
+
+    Keeps a crash-safe file on disk without rewriting every prior row after
+    each site. ``truncate=True`` starts a fresh file.
+    """
+
+    def __init__(self, path: Path, columns: Sequence[str], *, truncate: bool = False) -> None:
+        self.path = path
+        self.columns = list(columns)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fresh = truncate or not path.is_file() or path.stat().st_size == 0
+        self._handle = path.open("w" if fresh else "a", newline="", encoding="utf-8")
+        self._writer = csv.DictWriter(
+            self._handle, fieldnames=self.columns, extrasaction="ignore"
+        )
+        if fresh:
+            self._writer.writeheader()
+            self._handle.flush()
+
+    def append(self, row: dict[str, Any]) -> None:
+        self._writer.writerow({col: row.get(col, "") for col in self.columns})
+        self._handle.flush()
+
+    def close(self) -> None:
+        if not self._handle.closed:
+            self._handle.close()
+
+
 def expand_run_specs(specs: Sequence[str] | None, *, runs_root: Path) -> list[Path]:
     """Resolve run-folder names or ``YYYY-MM-DD`` prefixes to existing directories.
 

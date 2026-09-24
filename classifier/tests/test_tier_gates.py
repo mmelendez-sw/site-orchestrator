@@ -27,14 +27,14 @@ from classifier.asset_classifier import (
     scout_result_wins,
     should_attempt_claude_escalation,
     skip_nearmap_after_naip_reason,
-    nearmap_point_coverage,
     rooftop_requires_nearmap_tiers,
     select_zoom_candidates,
     should_skip_claude_for_gemini_tower,
     tier_confident_stop,
     tower_cell_requires_nearmap_obliques,
-    trim_views_for_model,
 )
+from classifier.imagery import nearmap_point_coverage
+from classifier.views import trim_views_for_model
 
 
 class TierConfidentStopTests(unittest.TestCase):
@@ -1092,9 +1092,9 @@ class CostGateTests(unittest.TestCase):
         )
 
     def test_nearmap_coverage_skips_when_no_surveys(self):
-        import classifier.asset_classifier as ac
+        import classifier.imagery as imagery
 
-        ac._nearmap_coverage_cache.clear()
+        imagery._nearmap_coverage_cache.clear()
         class _Resp:
             status_code = 200
             ok = True
@@ -1102,8 +1102,8 @@ class CostGateTests(unittest.TestCase):
             def json(self):
                 return {"surveys": []}
 
-        with patch.object(ac, "NEARMAP_API_KEY", "x"), patch.object(
-            ac, "_nearmap_get", return_value=_Resp()
+        with patch.dict("os.environ", {"NEARMAP_API_KEY": "x"}), patch.object(
+            imagery, "_nearmap_get", return_value=_Resp()
         ):
             has, date = nearmap_point_coverage(43.0, -89.0)
         self.assertFalse(has)

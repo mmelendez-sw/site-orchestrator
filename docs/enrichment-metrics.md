@@ -1,46 +1,57 @@
 # Enrichment metrics (Azure SQL)
 
-Leadership KPIs for site-type enrichment live in **Symphony_dev**. They are written at the **end of each `python -m enrichment` run**, not as a separate ingest.
+Leadership KPIs for site-type enrichment live in **Symphony_dev**. They are written **during each live `python -m enrichment` run** (`APPLY=1`), not as a separate ingest.
 
-## Run completion (order)
+## When rows are written
 
-1. Salesforce queue pull (blank `Site_Type__c`).
-2. Per site: FCC / TowerSource proximity **reads** (tower ingest).
-3. Imagery classify (NAIP → OSM → Nearmap → Gemini/Claude) when the DB skip does not fire.
-4. Write run CSVs under `../site-orchestrator-data/runs/<run_id>/`.
-5. Optional Salesforce **apply**.
-6. **`record_run`**: append local JSONL, rewrite `kpis.json`, upsert SQL (fail-open).
+1. Run start: the `dbo.EnrichmentRun` header is upserted (so site rows can reference it).
+2. Each site, as soon as it finishes classify + Salesforce apply: one `dbo.EnrichmentSiteOutcome` row is upserted. A crash keeps every completed site.
+3. Run end: **`record_run`** appends the local JSONL ledger, rewrites `kpis.json`, and reconciles the whole run in SQL (header + all site rows).
 
-`DB_ONLY=1` run headers still record this-run hits and misses. Cumulative UniqueSites (`kpis.json`, `vEnrichmentKpis`) is **distinct Salesforce Ids with `sf_update_status=updated`** only (site type/coords actually accepted), including `CONFIRM_ROOFTOP=1` writes that Salesforce accepted. Holdouts, classified-only flags, dry-runs (`APPLY=0` / `pending`), failed applies, and Ids already counted do not increment UniqueSites. `APPLY=0` may write a local run header (`apply_enabled=0`) but does not append UniqueSites, rewrite `kpis.json`, or upsert SQL.
-
-If SQL is down, CSVs and Salesforce writes still stand. Set `METRICS_SQL=0` to skip SQL and keep JSONL only.
+All SQL writes are fail-open: if Azure SQL drops, the run and its Salesforce writes continue, and the end-of-run reconcile retries. Set `METRICS_SQL=0` to skip SQL and keep JSONL only. `APPLY=0` dry-runs write a local run header (`apply_enabled=0`) and nothing else.
 
 Local fallback (same grain as SQL):
 
-- `../site-orchestrator-data/metrics/runs.jsonl`
-- `../site-orchestrator-data/metrics/sites.jsonl`
-- `../site-orchestrator-data/metrics/kpis.json` (last Salesforce Id wins)
+- `../site-orchestrator-data/metrics/runs.jsonl` — one header per run
+- `../site-orchestrator-data/metrics/sites.jsonl` — one row per processed site per live run
+- `../site-orchestrator-data/metrics/kpis.json` — cumulative rollup
 
-## Objects (2 tables, 5 views)
+## Counting rules
+
+| KPI | Definition |
+|---|---|
+| **UniqueSites** | Distinct Salesforce Ids any live run processed — applied, held out, DB-only miss, failed apply, skipped, or error. |
+| **WrittenSites** | Distinct Ids with at least one Salesforce-accepted site-type/coords write (`sf_update_status=updated`, outcome `applied_*`). |
+| RooftopSfWrites / TowerSfWrites / AppliedDbSkip | WrittenSites split by how the write was decided: imagery rooftop, imagery tower, unique FCC/TowerSource hit. They sum to WrittenSites (plus the rare `applied_other`). |
+| TotalWriteRate | WrittenSites / UniqueSites. Rooftop / Tower rates use the same denominator. |
+| Outcome counts (holdouts, errors, misses) | Each Id's **latest** observation. A site held out in one run and written in a later run counts as written, once. |
+| NearmapSites / ClaudeSites | Ids where paid imagery / Claude **ever** ran (spend proxy, not applies). |
+| NaipEmptyToNearmap / …RooftopApply | Ids whose NAIP screen was empty but Nearmap ran / then wrote a rooftop. |
+
+Before this change UniqueSites counted only successful writes (that number is now **WrittenSites**), and TotalWriteRate left out DB-skip writes.
+
+## Objects (2 tables, 7 views)
 
 | Object | Kind | Grain |
 |---|---|---|
 | `dbo.EnrichmentRun` | table | one row per `run_id` (this-run ops header) |
-| `dbo.EnrichmentSiteOutcome` | table | `(RunId, SalesforceId)` — net-new successful writes |
-| `dbo.vEnrichmentSiteLatest` | view | last observation per Salesforce Id (includes holdouts) |
-| `dbo.vEnrichmentSiteLatestWrite` | view | last successful enrichment write per Salesforce Id |
-| `dbo.vEnrichmentKpis` | view | UniqueSites = distinct successful writes |
-| `dbo.vEnrichmentKpisByState` | view | same grain by `SiteState` |
-| `dbo.vEnrichmentKpisByMatchSource` | view | same grain by FCC / TowerSource / none |
+| `dbo.EnrichmentSiteOutcome` | table | `(RunId, SalesforceId)` — every processed site |
+| `dbo.vEnrichmentSiteLatest` | view | latest observation per Salesforce Id |
+| `dbo.vEnrichmentSiteLatestWrite` | view | latest successful write per Salesforce Id |
+| `dbo.vEnrichmentSiteFacts` | view | one row per Id: latest outcome + write flags + "ever ran" spend |
+| `dbo.vEnrichmentKpisByDimension` | view | KPI columns once, `GROUPING SETS` over all / SiteState / MatchSource |
+| `dbo.vEnrichmentKpis` | view | `Dimension = 'all'` |
+| `dbo.vEnrichmentKpisByState` | view | `Dimension = 'state'` |
+| `dbo.vEnrichmentKpisByMatchSource` | view | `Dimension = 'match_source'` |
 
-Do not store last-wins KPIs on `EnrichmentRun`. That header is **this run only**. UniqueSites must not double-count retries; use `vEnrichmentSiteLatestWrite`.
+Do not store last-wins KPIs on `EnrichmentRun`. That header is **this run only**.
 
 ## What belongs where
 
 **`EnrichmentRun` (ops header)**
 
-- This-run counts: sites, applied rooftop/tower/DB-skip, holdouts, errors
-- Spend proxies (sites where paid imagery/model **ran**, not applies): `NearmapSites`, `ClaudeSites`
+- This-run counts per outcome (see below), `Errors`
+- Spend proxies: `NearmapSites`, `ClaudeSites`
 - Funnel: NAIP-empty → Nearmap → rooftop apply + rate
 - Salesforce: `SfWrites`, `SfHoldoutsDequeued`, `SfWriteFailed`
 - Queue: `ApplyEnabled`, `QueueStates`, `QueueLimit`
@@ -48,27 +59,35 @@ Do not store last-wins KPIs on `EnrichmentRun`. That header is **this run only**
 **`EnrichmentSiteOutcome` (fact)**
 
 - Identity: `SalesforceId`, `Address`, `SiteState`, `SiteCity`, `Carrier`
-- Path: `MatchSource` (`FCC` / `TowerSource` / `none`), `ClassifyCoordSource`, `AssetOffsetM`
+- Path: `MatchSource` (`fcc` / `towersource` / `none`), `ClassifyCoordSource`, `AssetOffsetM`
 - Vision: `ScreenSiteType`, `FinalSiteType`, `FinalConfidence`
 - Spend: `NearmapRan`, `NearmapTier`, `ClaudeRan`, `EscalationReason`, `SecondNearmap`, `DualModelResolution`
 - Funnel bits: `EmptyToNearmap`, `EmptyToRooftop`, `EmptyToRooftopApply`
 - Decision: `Bucket`, `HoldoutReason`, `UpdateSiteType`, `Outcome`, `SfUpdateStatus`
 
-Do **not** store chips, prompts, raw model JSON, or dollar estimates (packs/tokens are not metered yet).
+Column lists live once in `enrichment/metrics_store.py` (`RUN_COLUMNS`, `SITE_COLUMNS`); the SQL statements are generated from them. Do **not** store chips, prompts, raw model JSON, or dollar estimates.
 
 ## Outcomes
 
 | `Outcome` | Meaning |
 |---|---|
-| `applied_rooftop` | Salesforce write, rooftop |
-| `applied_tower` | Salesforce write, tower (imagery path) |
+| `applied_rooftop` | Salesforce write, rooftop (imagery) |
+| `applied_tower` | Salesforce write, tower (imagery) |
 | `applied_db_skip` | Unique FCC/TowerSource ≤ 25 m, skipped imagery |
+| `applied_other` | Salesforce write, other picklist (rooftop confirm keeping a sales type) |
+| `apply_failed` | Eligible write Salesforce refused (dequeued by the holdout retry, or failed) |
 | `holdout_empty_confirmed` | Nearmap other/unclear locked at ≥ 0.90 |
 | `holdout_weak_rooftop` | Rooftop label below apply bar |
 | `holdout_weak_tower` | Tower label below apply bar |
 | `holdout_empty` | other/unclear, not locked |
 | `holdout_no_nearmap` | Nearmap `no_coverage` |
-| `error` | classify/SQL/missing coords |
+| `holdout_no_imagery` | No NAIP or Nearmap imagery at the pin |
+| `holdout_other` | Anything else held out |
+| `db_only_miss` | `DB_ONLY=1`, no unique FCC/TowerSource hit |
+| `skipped` | No saved chips to rerun / skip-classify without a DB hit |
+| `error` | classify / SQL / missing coords |
+
+`applied_*` is the decision; `SfUpdateStatus=updated` is what makes it a write.
 
 ## Queries
 
@@ -76,21 +95,23 @@ Do **not** store chips, prompts, raw model JSON, or dollar estimates (packs/toke
 SELECT * FROM dbo.vEnrichmentKpis;
 SELECT * FROM dbo.vEnrichmentKpisByState;
 SELECT * FROM dbo.vEnrichmentKpisByMatchSource;
+SELECT * FROM dbo.vEnrichmentSiteFacts;
 SELECT * FROM dbo.vEnrichmentSiteLatestWrite;
-SELECT * FROM dbo.vEnrichmentSiteLatest;
 SELECT * FROM dbo.EnrichmentRun ORDER BY RecordedAt DESC;
 ```
 
 ## Backfill / schema
 
-DDL is `sql/enrichment_metrics.sql` (SSMS or the Python loader). The pipeline runs the same file on each SQL upsert so new columns/views appear.
+DDL is `sql/enrichment_metrics.sql` (SSMS or the Python loader). The pipeline runs the same file when it opens its metrics connection, so new columns/views appear automatically.
 
 ```powershell
-python scripts/load_enrichment_metrics.py          # create/alter + load JSONL
-python scripts/load_enrichment_metrics.py --dry-run
+python scripts/load_enrichment_metrics.py --dry-run                        # counts only
+python scripts/load_enrichment_metrics.py                                  # upsert the JSONL ledger
+python scripts/load_enrichment_metrics.py --backfill-processed --dry-run   # preview history rebuild
+python scripts/load_enrichment_metrics.py --backfill-processed             # rebuild history
 ```
 
-Idempotent for run ids already in `metrics/runs.jsonl`. Historical rows are hydrated from `runs/<run_id>/enrichment_detail.csv` when present.
+`--backfill-processed` rebuilds `sites.jsonl` from each live run's `enrichment_detail.csv` (statuses filled from `sf_update_apply_log.csv` for old runs), so runs recorded when the ledger only kept successful writes also count their holdouts, misses, and errors. It then replaces every `EnrichmentSiteOutcome` row. Runs whose detail CSV is gone keep their existing ledger rows.
 
 ## AR_TMO_jan2025 cohort (seed)
 

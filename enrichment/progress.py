@@ -1,4 +1,9 @@
-"""Terminal stage banners for enrichment runs."""
+"""Terminal stage banners for enrichment runs.
+
+Thread-aware: parallel classify workers tag their lines with the site they
+are working on (``site_context``), stage timers are per thread, and every
+write holds one lock so lines never interleave mid-row.
+"""
 
 from __future__ import annotations
 
@@ -10,8 +15,8 @@ from pathlib import Path
 from typing import Any, Iterator
 
 _run_t0: float | None = None
-_stage_t0: float | None = None
-_stage_title: str = ""
+_local = threading.local()
+_print_lock = threading.RLock()
 _SPINNER_FRAMES = "|/-\\"
 _SPINNER_INTERVAL_S = 0.25
 
@@ -21,17 +26,44 @@ def _stdout_is_tty() -> bool:
     return bool(isatty and isatty())
 
 
+@contextmanager
+def site_context(label: str | None) -> Iterator[None]:
+    """Prefix this thread's output lines with ``[label]`` (parallel workers)."""
+    prior = getattr(_local, "label", None)
+    _local.label = label
+    try:
+        yield
+    finally:
+        _local.label = prior
+
+
+def _tag(text: str) -> str:
+    label = getattr(_local, "label", None)
+    if not label:
+        return text
+    return "\n".join(
+        f"[{label}] {line}" if line.strip() else line for line in text.split("\n")
+    )
+
+
 def _safe_print(*args: Any, **kwargs: Any) -> None:
     """Print without crashing on cp1252 consoles (checkmark, arrows, dashes)."""
-    try:
-        print(*args, **kwargs)
-    except UnicodeEncodeError:
-        encoding = getattr(kwargs.get("file") or sys.stdout, "encoding", None) or "ascii"
-        safe_args = [
-            str(arg).encode(encoding, errors="replace").decode(encoding, errors="replace")
-            for arg in args
-        ]
-        print(*safe_args, **kwargs)
+    args = tuple(_tag(str(arg)) for arg in args)
+    with _print_lock:
+        try:
+            print(*args, **kwargs)
+        except UnicodeEncodeError:
+            encoding = getattr(kwargs.get("file") or sys.stdout, "encoding", None) or "ascii"
+            safe_args = [
+                str(arg).encode(encoding, errors="replace").decode(encoding, errors="replace")
+                for arg in args
+            ]
+            print(*safe_args, **kwargs)
+
+
+def emit(message: str) -> None:
+    """Plain progress line (classifier step output)."""
+    _safe_print(message, flush=True)
 
 
 def _safe_text(text: str) -> str:
@@ -113,10 +145,9 @@ def format_duration(seconds: float) -> str:
 
 def reset_run_timer() -> None:
     """Start (or restart) the whole-run clock."""
-    global _run_t0, _stage_t0, _stage_title
+    global _run_t0
     _run_t0 = time.monotonic()
-    _stage_t0 = _run_t0
-    _stage_title = ""
+    _local.stage_t0 = _run_t0
 
 
 def run_elapsed() -> float:
@@ -126,19 +157,19 @@ def run_elapsed() -> float:
 
 
 def stage_elapsed() -> float:
-    if _stage_t0 is None:
+    started = getattr(_local, "stage_t0", None)
+    if started is None:
         return 0.0
-    return time.monotonic() - _stage_t0
+    return time.monotonic() - started
 
 
 def stage(title: str, detail: str | None = None) -> None:
     """Print a high-visibility stage line to stdout."""
-    global _run_t0, _stage_t0, _stage_title
+    global _run_t0
     now = time.monotonic()
     if _run_t0 is None:
         _run_t0 = now
-    _stage_t0 = now
-    _stage_title = title
+    _local.stage_t0 = now
 
     line = f"\n=== STAGE: {title} ===  [run {format_duration(now - _run_t0)}]"
     _safe_print(line, flush=True)

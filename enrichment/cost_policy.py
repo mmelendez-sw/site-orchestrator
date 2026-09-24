@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-import os
+import math
+import threading
 from typing import Any, Sequence
 
+from enrichment.coerce import to_float
 from enrichment.geo import haversine_meters
 from enrichment.constants import (
     AUTO_SKIP_ON_STRUCTURE_M,
@@ -13,12 +15,10 @@ from enrichment.constants import (
     PROXIMITY_CONFIDENT_M,
 )
 from enrichment.mssql import ProximityHit
+from envutil import env_flag, env_float
 
-PIN_CLUSTER_M = float(os.environ.get("PIN_CLUSTER_M", "25"))
-
-
-def _env_flag(name: str, default: str = "1") -> bool:
-    return os.environ.get(name, default).strip().lower() in ("1", "true", "yes")
+PIN_CLUSTER_M = env_float("PIN_CLUSTER_M", 25)
+_CLUSTER_LOCK = threading.Lock()
 
 
 def _hit_pin_distance_m(hit: ProximityHit) -> float:
@@ -43,7 +43,7 @@ def auto_skip_classify_reason(
     """
     if hit is None:
         return None
-    if not force and not _env_flag("AUTO_SKIP_CLASSIFY", default="1"):
+    if not force and not env_flag("AUTO_SKIP_CLASSIFY", True):
         return None
     dist = float(hit.distance_m)
     if dist > float(confident_m):
@@ -86,8 +86,10 @@ def find_cluster_match(
     *,
     max_m: float = PIN_CLUSTER_M,
 ) -> dict[str, Any] | None:
-    """Return a prior imagery result within max_m, if any."""
-    for entry in cache:
+    """Return a prior imagery result within max_m, if any (thread-safe)."""
+    with _CLUSTER_LOCK:
+        entries = list(cache)
+    for entry in entries:
         try:
             elat = float(entry["lat"])
             elon = float(entry["lon"])
@@ -100,11 +102,47 @@ def find_cluster_match(
     return None
 
 
-def _site_conf(value: Any) -> float | None:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
+def remember_cluster_result(
+    cache: list[dict[str, Any]], lat: float, lon: float, classified: dict[str, Any]
+) -> None:
+    """Record an imagery result so a later pin within PIN_CLUSTER_M can reuse it."""
+    with _CLUSTER_LOCK:
+        cache.append({"lat": float(lat), "lon": float(lon), "classified": classified})
+
+
+def cluster_groups(
+    points: Sequence[tuple[float, float]], *, max_m: float = PIN_CLUSTER_M
+) -> list[list[int]]:
+    """Single-linkage groups of point indexes within ``max_m`` of each other.
+
+    Parallel classify runs each group in one worker, in queue order, so the
+    nearby-pin reuse above still sees earlier results. Groups keep the order
+    of their first member; indexes inside a group stay ascending.
+    """
+    parent = list(range(len(points)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    cell_deg = max(float(max_m), 1.0) / 111_320.0
+    grid: dict[tuple[int, int], list[int]] = {}
+    for index, (lat, lon) in enumerate(points):
+        cos_lat = max(0.2, abs(math.cos(math.radians(lat))))
+        cell = (int(lat // cell_deg), int(lon * cos_lat // cell_deg))
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                for other in grid.get((cell[0] + dy, cell[1] + dx), ()):
+                    olat, olon = points[other]
+                    if haversine_meters(lat, lon, olat, olon) <= max_m:
+                        parent[find(index)] = find(other)
+        grid.setdefault(cell, []).append(index)
+    groups: dict[int, list[int]] = {}
+    for index in range(len(points)):
+        groups.setdefault(find(index), []).append(index)
+    return sorted(groups.values(), key=lambda members: members[0])
 
 
 def nearmap_empty_is_locked(
@@ -119,7 +157,7 @@ def nearmap_empty_is_locked(
         return False
     if str(site_type or "").strip().lower() not in {"other", "unclear"}:
         return False
-    conf = _site_conf(site_confidence)
+    conf = to_float(site_confidence)
     return conf is not None and conf >= float(lock_conf)
 
 

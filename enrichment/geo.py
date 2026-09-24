@@ -2,23 +2,28 @@
 
 from __future__ import annotations
 
+import csv
+import io
 import json
 import logging
 import math
-import os
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
 from typing import Any
 
 from enrichment.constants import PIN_ADDRESS_MISMATCH_M, ROOFTOP_HOST_OFFSET_M
+from envutil import env_flag, env_float, env_int
 
 logger = logging.getLogger(__name__)
 
 CENSUS_GEOCODER_URL = (
     "https://geocoding.geo.census.gov/geocoder/locations/onelineaddress"
 )
-GEOCODE_TIMEOUT_S = float(os.environ.get("GEOCODE_TIMEOUT_S", "5"))
+GEOCODE_TIMEOUT_S = env_float("GEOCODE_TIMEOUT_S", 5)
 
 
 def haversine_meters(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
@@ -34,11 +39,7 @@ def haversine_meters(lat1: float, lng1: float, lat2: float, lng2: float) -> floa
 
 
 def geocode_address_enabled() -> bool:
-    return os.environ.get("GEOCODE_ADDRESS", "1").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-    }
+    return env_flag("GEOCODE_ADDRESS", True)
 
 
 def build_site_address(site: dict[str, Any]) -> str | None:
@@ -78,11 +79,7 @@ def parse_census_geocode_payload(payload: dict[str, Any] | None) -> dict[str, An
     }
 
 
-def geocode_census(address: str) -> dict[str, Any] | None:
-    """Geocode a US address via Census. Fail-open (None) on any error."""
-    text = str(address or "").strip()
-    if not text or not geocode_address_enabled():
-        return None
+def _fetch_census_oneline(text: str) -> dict[str, Any] | None:
     params = urllib.parse.urlencode(
         {
             "address": text,
@@ -107,10 +104,192 @@ def geocode_census(address: str) -> dict[str, Any] | None:
         json.JSONDecodeError,
     ) as exc:
         logger.info("Census geocode skipped: %s", exc)
-        return None
+        raise _GeocodeUnavailable(str(exc)) from exc
     if not isinstance(payload, dict):
         return None
     return parse_census_geocode_payload(payload)
+
+
+def geocode_census(address: str) -> dict[str, Any] | None:
+    """Geocode a US address via Census. Fail-open (None) on any error.
+
+    Answers (including "no match") are cached across runs; transport
+    failures are not, so the next run retries.
+    """
+    text = str(address or "").strip()
+    if not text or not geocode_address_enabled():
+        return None
+    cache = _geocode_cache()
+    hit, value = cache.get(text)
+    if hit:
+        return value
+    try:
+        result = _fetch_census_oneline(text)
+    except _GeocodeUnavailable:
+        return None
+    cache.put(text, result)
+    return result
+
+
+# ------------------------------ geocode cache -------------------------------
+
+
+class _GeocodeUnavailable(Exception):
+    """Census could not be reached (do not cache as a no-match)."""
+
+
+GEOCODE_NEGATIVE_TTL_S = 30 * 24 * 3600
+
+
+class _GeocodeCache:
+    """Append-only JSONL cache keyed by the one-line address query."""
+
+    def __init__(self, path: Path | None) -> None:
+        self.path = path
+        self._lock = threading.Lock()
+        self._rows: dict[str, tuple[dict[str, Any] | None, float]] = {}
+        if path is not None and path.is_file():
+            for line in path.read_text(encoding="utf-8").splitlines():
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(rec, dict) and rec.get("q"):
+                    self._rows[str(rec["q"])] = (rec.get("r"), float(rec.get("t") or 0))
+
+    def get(self, query: str) -> tuple[bool, dict[str, Any] | None]:
+        with self._lock:
+            found = self._rows.get(query)
+        if found is None:
+            return False, None
+        result, stamp = found
+        if result is None and time.time() - stamp > GEOCODE_NEGATIVE_TTL_S:
+            return False, None
+        return True, result
+
+    def put(self, query: str, result: dict[str, Any] | None) -> None:
+        stamp = time.time()
+        with self._lock:
+            self._rows[query] = (result, stamp)
+            if self.path is None:
+                return
+            try:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                with self.path.open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps({"q": query, "r": result, "t": stamp}) + "\n")
+            except OSError as exc:
+                logger.info("geocode cache write skipped: %s", exc)
+
+
+_cache_singleton: _GeocodeCache | None = None
+_cache_singleton_lock = threading.Lock()
+
+
+def _geocode_cache() -> _GeocodeCache:
+    global _cache_singleton
+    with _cache_singleton_lock:
+        if _cache_singleton is None:
+            path = None
+            if env_flag("GEOCODE_CACHE", True):
+                from paths import data_root
+
+                path = data_root() / "cache" / "census_geocode.jsonl"
+            _cache_singleton = _GeocodeCache(path)
+        return _cache_singleton
+
+
+# ------------------------------ batch geocode -------------------------------
+
+CENSUS_BATCH_URL = "https://geocoding.geo.census.gov/geocoder/locations/addressbatch"
+GEOCODE_BATCH_SIZE = max(1, min(10_000, env_int("GEOCODE_BATCH_SIZE", 1000)))
+GEOCODE_BATCH_TIMEOUT_S = env_float("GEOCODE_BATCH_TIMEOUT_S", 300)
+
+
+def parse_census_batch_csv(text: str) -> dict[str, dict[str, Any] | None]:
+    """Census addressbatch CSV reply → {row id: geocode result or None}."""
+    out: dict[str, dict[str, Any] | None] = {}
+    for row in csv.reader(io.StringIO(text or "")):
+        if not row or not row[0].strip():
+            continue
+        key = row[0].strip()
+        status = row[2].strip().lower() if len(row) > 2 else ""
+        result = None
+        if status == "match" and len(row) > 5:
+            try:
+                lng_s, lat_s = row[5].split(",", 1)
+                result = {
+                    "lat": float(lat_s),
+                    "lng": float(lng_s),
+                    "matched": row[4].strip() if len(row) > 4 else "",
+                    "source": "census",
+                }
+            except (ValueError, IndexError):
+                result = None
+        out[key] = result
+    return out
+
+
+def _fetch_census_batch(rows: list[tuple[str, str, str, str, str]]) -> dict[str, dict | None]:
+    import requests
+
+    buf = io.StringIO()
+    csv.writer(buf).writerows(rows)
+    resp = requests.post(
+        CENSUS_BATCH_URL,
+        data={"benchmark": "Public_AR_Current"},
+        files={"addressFile": ("addresses.csv", buf.getvalue(), "text/csv")},
+        headers={"User-Agent": "site-orchestrator/enrichment"},
+        timeout=GEOCODE_BATCH_TIMEOUT_S,
+    )
+    resp.raise_for_status()
+    return parse_census_batch_csv(resp.text)
+
+
+def geocode_sites(sites: list[dict[str, Any]]) -> dict[str, dict[str, Any] | None]:
+    """Geocode many Salesforce sites; {address query: result or None}.
+
+    Cache first, then one Census batch request per GEOCODE_BATCH_SIZE
+    addresses, then single-line lookups for anything a failed batch left.
+    """
+    if not geocode_address_enabled():
+        return {}
+    cache = _geocode_cache()
+    results: dict[str, dict[str, Any] | None] = {}
+    pending: dict[str, dict[str, Any]] = {}
+    for site in sites:
+        query = build_site_address(site)
+        if not query or query in results or query in pending:
+            continue
+        hit, value = cache.get(query)
+        if hit:
+            results[query] = value
+        else:
+            pending[query] = site
+    queries = list(pending)
+    for start in range(0, len(queries), GEOCODE_BATCH_SIZE):
+        chunk = queries[start : start + GEOCODE_BATCH_SIZE]
+        rows = [
+            (
+                str(index),
+                str(pending[q].get("Site_Street__c") or "").strip(),
+                str(pending[q].get("Site_City__c") or "").strip(),
+                str(pending[q].get("Site_State__c") or "").strip(),
+                str(pending[q].get("Site_Zip_Code__c") or "").strip(),
+            )
+            for index, q in enumerate(chunk)
+        ]
+        try:
+            batch = _fetch_census_batch(rows)
+        except Exception as exc:  # noqa: BLE001 — fall back to one-line lookups
+            logger.warning("Census batch geocode failed (%s); using single lookups", exc)
+            for q in chunk:
+                results[q] = geocode_census(q)
+            continue
+        for index, q in enumerate(chunk):
+            value = batch.get(str(index))
+            results[q] = value
+            cache.put(q, value)
+    return results
 
 
 def pin_address_is_mismatch(offset_m: float | None) -> bool:

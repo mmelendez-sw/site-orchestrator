@@ -114,6 +114,21 @@ IF NOT EXISTS (
         ON dbo.EnrichmentSiteOutcome (MatchSource, Outcome);
 GO
 
+-- Outcome columns added when UniqueSites switched to "every processed site".
+IF COL_LENGTH(N'dbo.EnrichmentRun', N'AppliedOther') IS NULL
+    ALTER TABLE dbo.EnrichmentRun ADD AppliedOther int NOT NULL CONSTRAINT DF_EnrichmentRun_AppliedOther DEFAULT (0);
+IF COL_LENGTH(N'dbo.EnrichmentRun', N'ApplyFailed') IS NULL
+    ALTER TABLE dbo.EnrichmentRun ADD ApplyFailed int NOT NULL CONSTRAINT DF_EnrichmentRun_ApplyFailed DEFAULT (0);
+IF COL_LENGTH(N'dbo.EnrichmentRun', N'HoldoutNoImagery') IS NULL
+    ALTER TABLE dbo.EnrichmentRun ADD HoldoutNoImagery int NOT NULL CONSTRAINT DF_EnrichmentRun_HoldoutNoImagery DEFAULT (0);
+IF COL_LENGTH(N'dbo.EnrichmentRun', N'HoldoutOther') IS NULL
+    ALTER TABLE dbo.EnrichmentRun ADD HoldoutOther int NOT NULL CONSTRAINT DF_EnrichmentRun_HoldoutOther DEFAULT (0);
+IF COL_LENGTH(N'dbo.EnrichmentRun', N'DbOnlyMiss') IS NULL
+    ALTER TABLE dbo.EnrichmentRun ADD DbOnlyMiss int NOT NULL CONSTRAINT DF_EnrichmentRun_DbOnlyMiss DEFAULT (0);
+IF COL_LENGTH(N'dbo.EnrichmentRun', N'Skipped') IS NULL
+    ALTER TABLE dbo.EnrichmentRun ADD Skipped int NOT NULL CONSTRAINT DF_EnrichmentRun_Skipped DEFAULT (0);
+GO
+
 IF OBJECT_ID(N'dbo.vEnrichmentKpisByState', N'V') IS NOT NULL
     DROP VIEW dbo.vEnrichmentKpisByState;
 GO
@@ -123,6 +138,12 @@ GO
 IF OBJECT_ID(N'dbo.vEnrichmentKpis', N'V') IS NOT NULL
     DROP VIEW dbo.vEnrichmentKpis;
 GO
+IF OBJECT_ID(N'dbo.vEnrichmentKpisByDimension', N'V') IS NOT NULL
+    DROP VIEW dbo.vEnrichmentKpisByDimension;
+GO
+IF OBJECT_ID(N'dbo.vEnrichmentSiteFacts', N'V') IS NOT NULL
+    DROP VIEW dbo.vEnrichmentSiteFacts;
+GO
 IF OBJECT_ID(N'dbo.vEnrichmentSiteLatestWrite', N'V') IS NOT NULL
     DROP VIEW dbo.vEnrichmentSiteLatestWrite;
 GO
@@ -130,6 +151,7 @@ IF OBJECT_ID(N'dbo.vEnrichmentSiteLatest', N'V') IS NOT NULL
     DROP VIEW dbo.vEnrichmentSiteLatest;
 GO
 
+-- Latest observation per Salesforce Id across live runs (applied or not).
 CREATE VIEW dbo.vEnrichmentSiteLatest
 AS
 SELECT o.*
@@ -147,9 +169,10 @@ INNER JOIN (
 ) AS latest
     ON latest.SalesforceId = o.SalesforceId
    AND latest.RunId = o.RunId
-    AND latest.rn = 1
+   AND latest.rn = 1
 GO
 
+-- Latest Salesforce-accepted site-type/coords write per Id.
 CREATE VIEW dbo.vEnrichmentSiteLatestWrite
 AS
 SELECT o.*
@@ -175,135 +198,89 @@ INNER JOIN (
    AND latest.rn = 1
 GO
 
-CREATE VIEW dbo.vEnrichmentKpis
+-- One row per processed Id: latest outcome, write flags, "ever ran" spend.
+CREATE VIEW dbo.vEnrichmentSiteFacts
 AS
 SELECT
+    l.SalesforceId,
+    l.SiteState,
+    l.MatchSource,
+    l.Outcome,
+    CASE WHEN w.SalesforceId IS NULL THEN 0 ELSE 1 END AS IsWritten,
+    CASE WHEN w.Outcome = N'applied_rooftop' THEN 1 ELSE 0 END AS RooftopWrite,
+    CASE WHEN w.Outcome = N'applied_tower' THEN 1 ELSE 0 END AS TowerWrite,
+    CASE WHEN w.Outcome = N'applied_db_skip' THEN 1 ELSE 0 END AS DbSkipWrite,
+    CASE WHEN w.EmptyToRooftopApply = 1 THEN 1 ELSE 0 END AS EmptyToRooftopApply,
+    e.NearmapEver,
+    e.ClaudeEver,
+    e.EmptyToNearmapEver
+FROM dbo.vEnrichmentSiteLatest AS l
+LEFT JOIN dbo.vEnrichmentSiteLatestWrite AS w
+    ON w.SalesforceId = l.SalesforceId
+INNER JOIN (
+    SELECT
+        SalesforceId,
+        MAX(CAST(NearmapRan AS int)) AS NearmapEver,
+        MAX(CAST(ClaudeRan AS int)) AS ClaudeEver,
+        MAX(CAST(EmptyToNearmap AS int)) AS EmptyToNearmapEver
+    FROM dbo.EnrichmentSiteOutcome
+    GROUP BY SalesforceId
+) AS e
+    ON e.SalesforceId = l.SalesforceId
+GO
+
+-- KPI columns defined once; Dimension = all | state | match_source.
+-- UniqueSites = every processed Id; WrittenSites = Salesforce-accepted writes.
+CREATE VIEW dbo.vEnrichmentKpisByDimension
+AS
+SELECT
+    CASE
+        WHEN GROUPING(SiteState) = 0 THEN N'state'
+        WHEN GROUPING(MatchSource) = 0 THEN N'match_source'
+        ELSE N'all'
+    END AS Dimension,
+    SiteState,
+    MatchSource,
     COUNT(*) AS UniqueSites,
-    SUM(CASE WHEN Outcome = N'applied_rooftop' THEN 1 ELSE 0 END) AS RooftopSfWrites,
-    SUM(CASE WHEN Outcome = N'applied_tower' THEN 1 ELSE 0 END) AS TowerSfWrites,
-    SUM(CASE WHEN Outcome = N'applied_db_skip' THEN 1 ELSE 0 END) AS AppliedDbSkip,
+    SUM(IsWritten) AS WrittenSites,
+    SUM(RooftopWrite) AS RooftopSfWrites,
+    SUM(TowerWrite) AS TowerSfWrites,
+    SUM(DbSkipWrite) AS AppliedDbSkip,
+    SUM(CASE WHEN Outcome = N'apply_failed' THEN 1 ELSE 0 END) AS ApplyFailed,
     SUM(CASE WHEN Outcome = N'holdout_empty_confirmed' THEN 1 ELSE 0 END) AS HoldoutEmptyConfirmed,
     SUM(CASE WHEN Outcome = N'holdout_weak_rooftop' THEN 1 ELSE 0 END) AS HoldoutWeakRooftop,
     SUM(CASE WHEN Outcome = N'holdout_weak_tower' THEN 1 ELSE 0 END) AS HoldoutWeakTower,
     SUM(CASE WHEN Outcome = N'holdout_empty' THEN 1 ELSE 0 END) AS HoldoutEmpty,
     SUM(CASE WHEN Outcome = N'holdout_no_nearmap' THEN 1 ELSE 0 END) AS HoldoutNoNearmap,
+    SUM(CASE WHEN Outcome = N'holdout_no_imagery' THEN 1 ELSE 0 END) AS HoldoutNoImagery,
+    SUM(CASE WHEN Outcome = N'holdout_other' THEN 1 ELSE 0 END) AS HoldoutOther,
+    SUM(CASE WHEN Outcome = N'db_only_miss' THEN 1 ELSE 0 END) AS DbOnlyMiss,
+    SUM(CASE WHEN Outcome = N'skipped' THEN 1 ELSE 0 END) AS Skipped,
     SUM(CASE WHEN Outcome = N'error' THEN 1 ELSE 0 END) AS Errors,
-    SUM(CASE WHEN NearmapRan = 1 THEN 1 ELSE 0 END) AS NearmapSites,
-    SUM(CASE WHEN ClaudeRan = 1 THEN 1 ELSE 0 END) AS ClaudeSites,
-    SUM(CASE WHEN EmptyToNearmap = 1 THEN 1 ELSE 0 END) AS NaipEmptyToNearmap,
-    SUM(CASE WHEN EmptyToRooftopApply = 1 THEN 1 ELSE 0 END) AS NaipEmptyToRooftopApply,
-    CAST(
-        SUM(CASE WHEN EmptyToRooftopApply = 1 THEN 1 ELSE 0 END) * 1.0
-        / NULLIF(SUM(CASE WHEN EmptyToNearmap = 1 THEN 1 ELSE 0 END), 0)
-        AS decimal(6,3)
-    ) AS EmptyToRooftopApplyRate,
-    CAST(
-        SUM(CASE WHEN Outcome = N'applied_rooftop' THEN 1 ELSE 0 END) * 1.0
-        / NULLIF(COUNT(*), 0)
-        AS decimal(6,3)
-    ) AS RooftopWriteRate,
-    CAST(
-        SUM(CASE WHEN Outcome = N'applied_tower' THEN 1 ELSE 0 END) * 1.0
-        / NULLIF(COUNT(*), 0)
-        AS decimal(6,3)
-    ) AS TowerWriteRate,
-    CAST(
-        (
-            SUM(CASE WHEN Outcome = N'applied_rooftop' THEN 1 ELSE 0 END)
-            + SUM(CASE WHEN Outcome = N'applied_tower' THEN 1 ELSE 0 END)
-        ) * 1.0
-        / NULLIF(COUNT(*), 0)
-        AS decimal(6,3)
-    ) AS TotalWriteRate
-FROM dbo.vEnrichmentSiteLatestWrite
+    SUM(NearmapEver) AS NearmapSites,
+    SUM(ClaudeEver) AS ClaudeSites,
+    SUM(EmptyToNearmapEver) AS NaipEmptyToNearmap,
+    SUM(EmptyToRooftopApply) AS NaipEmptyToRooftopApply,
+    CAST(SUM(EmptyToRooftopApply) * 1.0 / NULLIF(SUM(EmptyToNearmapEver), 0) AS decimal(6,3))
+        AS EmptyToRooftopApplyRate,
+    CAST(SUM(RooftopWrite) * 1.0 / NULLIF(COUNT(*), 0) AS decimal(6,3)) AS RooftopWriteRate,
+    CAST(SUM(TowerWrite) * 1.0 / NULLIF(COUNT(*), 0) AS decimal(6,3)) AS TowerWriteRate,
+    CAST(SUM(IsWritten) * 1.0 / NULLIF(COUNT(*), 0) AS decimal(6,3)) AS TotalWriteRate
+FROM dbo.vEnrichmentSiteFacts
+GROUP BY GROUPING SETS ((), (SiteState), (MatchSource))
+GO
+
+CREATE VIEW dbo.vEnrichmentKpis
+AS
+SELECT * FROM dbo.vEnrichmentKpisByDimension WHERE Dimension = N'all'
 GO
 
 CREATE VIEW dbo.vEnrichmentKpisByState
 AS
-SELECT
-    SiteState,
-    COUNT(*) AS UniqueSites,
-    SUM(CASE WHEN Outcome = N'applied_rooftop' THEN 1 ELSE 0 END) AS RooftopSfWrites,
-    SUM(CASE WHEN Outcome = N'applied_tower' THEN 1 ELSE 0 END) AS TowerSfWrites,
-    SUM(CASE WHEN Outcome = N'applied_db_skip' THEN 1 ELSE 0 END) AS AppliedDbSkip,
-    SUM(CASE WHEN Outcome = N'holdout_empty_confirmed' THEN 1 ELSE 0 END) AS HoldoutEmptyConfirmed,
-    SUM(CASE WHEN Outcome = N'holdout_weak_rooftop' THEN 1 ELSE 0 END) AS HoldoutWeakRooftop,
-    SUM(CASE WHEN Outcome = N'holdout_weak_tower' THEN 1 ELSE 0 END) AS HoldoutWeakTower,
-    SUM(CASE WHEN Outcome = N'holdout_empty' THEN 1 ELSE 0 END) AS HoldoutEmpty,
-    SUM(CASE WHEN Outcome = N'holdout_no_nearmap' THEN 1 ELSE 0 END) AS HoldoutNoNearmap,
-    SUM(CASE WHEN Outcome = N'error' THEN 1 ELSE 0 END) AS Errors,
-    SUM(CASE WHEN NearmapRan = 1 THEN 1 ELSE 0 END) AS NearmapSites,
-    SUM(CASE WHEN ClaudeRan = 1 THEN 1 ELSE 0 END) AS ClaudeSites,
-    SUM(CASE WHEN EmptyToNearmap = 1 THEN 1 ELSE 0 END) AS NaipEmptyToNearmap,
-    SUM(CASE WHEN EmptyToRooftopApply = 1 THEN 1 ELSE 0 END) AS NaipEmptyToRooftopApply,
-    CAST(
-        SUM(CASE WHEN EmptyToRooftopApply = 1 THEN 1 ELSE 0 END) * 1.0
-        / NULLIF(SUM(CASE WHEN EmptyToNearmap = 1 THEN 1 ELSE 0 END), 0)
-        AS decimal(6,3)
-    ) AS EmptyToRooftopApplyRate,
-    CAST(
-        SUM(CASE WHEN Outcome = N'applied_rooftop' THEN 1 ELSE 0 END) * 1.0
-        / NULLIF(COUNT(*), 0)
-        AS decimal(6,3)
-    ) AS RooftopWriteRate,
-    CAST(
-        SUM(CASE WHEN Outcome = N'applied_tower' THEN 1 ELSE 0 END) * 1.0
-        / NULLIF(COUNT(*), 0)
-        AS decimal(6,3)
-    ) AS TowerWriteRate,
-    CAST(
-        (
-            SUM(CASE WHEN Outcome = N'applied_rooftop' THEN 1 ELSE 0 END)
-            + SUM(CASE WHEN Outcome = N'applied_tower' THEN 1 ELSE 0 END)
-        ) * 1.0
-        / NULLIF(COUNT(*), 0)
-        AS decimal(6,3)
-    ) AS TotalWriteRate
-FROM dbo.vEnrichmentSiteLatestWrite
-GROUP BY SiteState
+SELECT * FROM dbo.vEnrichmentKpisByDimension WHERE Dimension = N'state'
 GO
 
 CREATE VIEW dbo.vEnrichmentKpisByMatchSource
 AS
-SELECT
-    MatchSource,
-    COUNT(*) AS UniqueSites,
-    SUM(CASE WHEN Outcome = N'applied_rooftop' THEN 1 ELSE 0 END) AS RooftopSfWrites,
-    SUM(CASE WHEN Outcome = N'applied_tower' THEN 1 ELSE 0 END) AS TowerSfWrites,
-    SUM(CASE WHEN Outcome = N'applied_db_skip' THEN 1 ELSE 0 END) AS AppliedDbSkip,
-    SUM(CASE WHEN Outcome = N'holdout_empty_confirmed' THEN 1 ELSE 0 END) AS HoldoutEmptyConfirmed,
-    SUM(CASE WHEN Outcome = N'holdout_weak_rooftop' THEN 1 ELSE 0 END) AS HoldoutWeakRooftop,
-    SUM(CASE WHEN Outcome = N'holdout_weak_tower' THEN 1 ELSE 0 END) AS HoldoutWeakTower,
-    SUM(CASE WHEN Outcome = N'holdout_empty' THEN 1 ELSE 0 END) AS HoldoutEmpty,
-    SUM(CASE WHEN Outcome = N'holdout_no_nearmap' THEN 1 ELSE 0 END) AS HoldoutNoNearmap,
-    SUM(CASE WHEN Outcome = N'error' THEN 1 ELSE 0 END) AS Errors,
-    SUM(CASE WHEN NearmapRan = 1 THEN 1 ELSE 0 END) AS NearmapSites,
-    SUM(CASE WHEN ClaudeRan = 1 THEN 1 ELSE 0 END) AS ClaudeSites,
-    SUM(CASE WHEN EmptyToNearmap = 1 THEN 1 ELSE 0 END) AS NaipEmptyToNearmap,
-    SUM(CASE WHEN EmptyToRooftopApply = 1 THEN 1 ELSE 0 END) AS NaipEmptyToRooftopApply,
-    CAST(
-        SUM(CASE WHEN EmptyToRooftopApply = 1 THEN 1 ELSE 0 END) * 1.0
-        / NULLIF(SUM(CASE WHEN EmptyToNearmap = 1 THEN 1 ELSE 0 END), 0)
-        AS decimal(6,3)
-    ) AS EmptyToRooftopApplyRate,
-    CAST(
-        SUM(CASE WHEN Outcome = N'applied_rooftop' THEN 1 ELSE 0 END) * 1.0
-        / NULLIF(COUNT(*), 0)
-        AS decimal(6,3)
-    ) AS RooftopWriteRate,
-    CAST(
-        SUM(CASE WHEN Outcome = N'applied_tower' THEN 1 ELSE 0 END) * 1.0
-        / NULLIF(COUNT(*), 0)
-        AS decimal(6,3)
-    ) AS TowerWriteRate,
-    CAST(
-        (
-            SUM(CASE WHEN Outcome = N'applied_rooftop' THEN 1 ELSE 0 END)
-            + SUM(CASE WHEN Outcome = N'applied_tower' THEN 1 ELSE 0 END)
-        ) * 1.0
-        / NULLIF(COUNT(*), 0)
-        AS decimal(6,3)
-    ) AS TotalWriteRate
-FROM dbo.vEnrichmentSiteLatestWrite
-GROUP BY MatchSource
+SELECT * FROM dbo.vEnrichmentKpisByDimension WHERE Dimension = N'match_source'
 GO
