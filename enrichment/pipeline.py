@@ -26,7 +26,7 @@ import queue
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -67,7 +67,13 @@ from enrichment.geo import (
     pin_address_is_mismatch,
     should_compare_rooftop_hosts,
 )
-from enrichment.metrics import RUN_METRIC_KEYS, outcome_class, record_run, site_record
+from enrichment.metrics import (
+    RUN_METRIC_KEYS,
+    outcome_class,
+    record_run,
+    site_record,
+    stamp_statuses_from_apply_log,
+)
 from enrichment.metrics_store import SiteSink
 from enrichment.mssql import (
     ProximityQuery,
@@ -165,6 +171,9 @@ def apply_paused_run(
         raise FileNotFoundError(f"No {DETAIL_CSV} in {run_dir}")
     with path.open(newline="", encoding="utf-8-sig") as handle:
         detail_rows = list(csv.DictReader(handle))
+    # Sites whose batch already went out are 'updated' in the apply log even
+    # though the detail CSV (written before the batch) still says 'pending'.
+    stamp_statuses_from_apply_log(run_dir, detail_rows)
     if max_sites is not None:
         detail_rows = detail_rows[: max(0, int(max_sites))]
     if verbose:
@@ -1324,6 +1333,29 @@ def _classify_all(
         raise KeyboardInterrupt
 
 
+@contextmanager
+def _hold_interrupts():
+    """Ignore Ctrl+C while the final Salesforce batch and metrics are written.
+
+    A second or third Ctrl+C used to land mid-flush and exit before the
+    summary / metrics step. Close the terminal only if you must — the detail
+    CSV still lets ``APPLY_EXISTING=1`` finish the job.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    import signal
+
+    def notice(_signum, _frame):
+        progress.warn("still writing Salesforce + metrics — please wait")
+
+    prior = signal.signal(signal.SIGINT, notice)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGINT, prior)
+
+
 def run_enrichment(
     *,
     sf_client,
@@ -1546,21 +1578,21 @@ def run_enrichment(
                     f"classify stopped after {len(state.detail_rows)} site(s): {exc} — "
                     "flushing any remaining Salesforce updates"
                 )
-        state.close()
-        if sink is not None:
-            sink.close()
-
-        summary = _write_and_apply_run(
-            sf_client=sf_client,
-            run_dir=run_dir,
-            detail_rows=state.detail_rows,
-            apply=apply,
-            dequeue_holdouts=dequeue_holdouts,
-            db_only=db_only,
-            confirm_rooftop=confirm_rooftop,
-            confirm_existing=confirm_existing,
-            verbose=verbose,
-        )
+        with _hold_interrupts():
+            state.close()
+            if sink is not None:
+                sink.close()
+            summary = _write_and_apply_run(
+                sf_client=sf_client,
+                run_dir=run_dir,
+                detail_rows=state.detail_rows,
+                apply=apply,
+                dequeue_holdouts=dequeue_holdouts,
+                db_only=db_only,
+                confirm_rooftop=confirm_rooftop,
+                confirm_existing=confirm_existing,
+                verbose=verbose,
+            )
         if classify_error is not None:
             raise classify_error
         return summary

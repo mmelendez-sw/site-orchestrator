@@ -63,25 +63,25 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 
-def apply_dotenv_limit(
+def limit_source(
     file_vals: dict[str, str | None],
     environ: dict[str, str] | None = None,
-) -> None:
-    """Queue LIMIT comes from ``.env`` only.
+) -> str:
+    """Where the queue LIMIT comes from: ``terminal``, ``.env``, or ``none``.
 
-    Leftover PowerShell ``$env:LIMIT`` stays in the process after a slice run
-    and would otherwise cap later jobs even when ``.env`` has no LIMIT.
+    A terminal ``$env:LIMIT`` wins over ``.env`` (load_dotenv never
+    overrides). The start banner prints the source so a leftover shell
+    value from an earlier slice is visible — clear it with
+    ``Remove-Item Env:LIMIT``.
     """
     env = os.environ if environ is None else environ
-    raw = str(file_vals.get("LIMIT") or "").strip()
-    if raw:
-        env["LIMIT"] = raw
-    else:
-        env.pop("LIMIT", None)
+    if str(env.get("LIMIT") or "").strip():
+        return "terminal"
+    return ".env" if str(file_vals.get("LIMIT") or "").strip() else "none"
 
 
+LIMIT_SOURCE = limit_source(dotenv_values(ROOT / ".env"))
 load_dotenv(ROOT / ".env")
-apply_dotenv_limit(dotenv_values(ROOT / ".env"))
 
 from enrichment.pipeline import apply_paused_run, default_run_dir, run_enrichment  # noqa: E402
 from enrichment.outputs import (  # noqa: E402
@@ -149,6 +149,7 @@ def main() -> int:
         runs_dir()
     )
     limit_raw = (os.environ.get("LIMIT") or "").strip()
+    print(f"  queue LIMIT: {limit_raw or 'none'} (from {LIMIT_SOURCE})", flush=True)
     offset_raw = (os.environ.get("OFFSET") or os.environ.get("QUEUE_OFFSET") or "").strip()
     states = _csv_env("STATES")
     if states:

@@ -519,7 +519,7 @@ def _run_is_live(header: dict[str, Any], detail: list[dict[str, Any]]) -> bool:
     )
 
 
-def _stamp_statuses_from_apply_log(run_dir: Path, detail: list[dict[str, Any]]) -> None:
+def stamp_statuses_from_apply_log(run_dir: Path, detail: list[dict[str, Any]]) -> None:
     """Fill missing/pending sf_update_status from the run's apply log (old runs)."""
     from enrichment.constants import APPLY_LOG_CSV
 
@@ -583,7 +583,7 @@ def rebuild_site_ledger(
             stats["kept_ledger_rows"] += len(kept)
             stats["runs"] += 1 if kept else 0
             continue
-        _stamp_statuses_from_apply_log(run_dir, detail)
+        stamp_statuses_from_apply_log(run_dir, detail)
         if not _run_is_live(header, detail):
             stats["skipped_dry_runs"] += 1
             continue

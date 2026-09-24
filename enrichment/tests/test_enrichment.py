@@ -991,17 +991,12 @@ class SoqlTests(unittest.TestCase):
             soql,
         )
 
-    def test_dotenv_limit_ignores_leftover_shell_limit(self):
-        from enrichment.__main__ import apply_dotenv_limit
+    def test_terminal_limit_wins_over_dotenv(self):
+        from enrichment.__main__ import limit_source
 
-        leftover = {"LIMIT": "40", "APPLY": "1"}
-        apply_dotenv_limit({}, leftover)
-        self.assertNotIn("LIMIT", leftover)
-        apply_dotenv_limit({"LIMIT": ""}, leftover)
-        self.assertNotIn("LIMIT", leftover)
-        capped = {"LIMIT": "40"}
-        apply_dotenv_limit({"LIMIT": "200"}, capped)
-        self.assertEqual(capped["LIMIT"], "200")
+        self.assertEqual(limit_source({"LIMIT": "500"}, {"LIMIT": "50"}), "terminal")
+        self.assertEqual(limit_source({"LIMIT": "500"}, {}), ".env")
+        self.assertEqual(limit_source({}, {"LIMIT": " "}), "none")
 
     def test_db_only_default_stages_any_owner(self):
         from enrichment.constants import DB_ONLY_STAGE_FILTER
