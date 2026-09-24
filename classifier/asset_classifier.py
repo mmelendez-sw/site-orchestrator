@@ -160,6 +160,8 @@ CHIP_SIZE_M = env_float("CHIP_SIZE_M", 300)
 # Only runs when NAIP_WIDE_CHIP_M > CHIP_SIZE_M.
 NAIP_WIDE_CHIP_M = env_float("NAIP_WIDE_CHIP_M", 500)
 NEARMAP_API_KEY = imagery.nearmap_api_key()
+# Buy the first oblique, and the rest only when the call is not yet locked.
+NEARMAP_STAGGER_OBLIQUES = _env_flag("NEARMAP_STAGGER_OBLIQUES", default="1")
 INPUT_CONFIDENCE_LEVELS = ("high", "medium", "low")
 # Per-run chip folder (set by enrichment.naip_classify for each run).
 CHIP_DIR = Path("chips")
@@ -1679,6 +1681,31 @@ def _osm_features(lat: float, lon: float) -> dict:
         return empty
 
 
+def obliques_settled(res: dict) -> bool:
+    """True when Vert + one oblique already locks the call (skip the other obliques).
+
+    Locked tower (Gemini solo bar, cell true), locked empty lot (``other`` at
+    the empty lock), or rooftop gear localized on an oblique at the empty-lock
+    cell confidence. Everything else — HVAC-only roofs, weak or unclear
+    calls — buys the remaining obliques, since facade gear can face away
+    from the first camera.
+    """
+    site = str(res.get("site_type") or "").strip().lower()
+    conf = normalize_confidence(res.get("site_confidence")) or 0.0
+    if site == "tower":
+        return res.get("cell_equipment") is True and conf >= GEMINI_SOLO_CELL_CONF
+    if site == "other":
+        return res.get("cell_equipment") is not True and conf >= EMPTY_CHIP_LOCK_CONF
+    if site == "rooftop":
+        cell_conf = normalize_confidence(res.get("cell_equipment_confidence")) or 0.0
+        return (
+            res.get("cell_equipment") is True
+            and cell_conf >= EMPTY_CHIP_LOCK_CONF
+            and has_locked_oblique_asset_box(res)
+        )
+    return False
+
+
 def locked_gemini_tower_skip_nearmap_reason(
     res: dict, *, db_backed: bool = False, osm_tower: bool = False
 ) -> str | None:
@@ -1774,23 +1801,44 @@ def classify_with_tiers(lat: float, lon: float, img: Image.Image | None,
         return res, nearmap_views, nearmap_date, "no_coverage", views
     _step_done("Nearmap vert")
 
+    def classify_pack() -> tuple[dict, list]:
+        pack_views = build_views(nearmap_views)
+        out = _classify_pass(
+            provider, clients, pack_views, prompt, input_confidence, screen=False
+        )
+        out = gate_weak_rooftop_cell_claim(out)
+        out = gate_weak_stealth_tower_claim(out)
+        return out, pack_views
+
     missing = [v for v in OBLIQUE_VIEWS if v not in nearmap_views]
-    if missing:
-        oblique_views, ob_date = fetch_nearmap_views(lat, lon, views=missing)
+    # Staggered obliques: buy the first one, and the rest only when the
+    # Vert + first-oblique call is not already locked (saves ~1/3 of a pack).
+    staggered = NEARMAP_STAGGER_OBLIQUES and len(missing) > 1
+    first, rest = (missing[:1], missing[1:]) if staggered else (missing, [])
+    if first:
+        oblique_views, ob_date = fetch_nearmap_views(lat, lon, views=first)
         nearmap_views.update(oblique_views)
         nearmap_date = ob_date or nearmap_date
+    if rest and not any(v in nearmap_views for v in first):
+        # First oblique had no coverage: nothing to judge yet, buy the rest now.
+        oblique_views, ob_date = fetch_nearmap_views(lat, lon, views=rest)
+        nearmap_views.update(oblique_views)
+        nearmap_date = ob_date or nearmap_date
+        rest = []
+    res, views = classify_pack()
+    if rest:
+        if obliques_settled(res):
+            _step_done("Nearmap obliques", f"{first[0]} only — call locked, skip {', '.join(rest)}")
+        else:
+            oblique_views, ob_date = fetch_nearmap_views(
+                lat, lon, views=rest, purpose="oblique_extra"
+            )
+            if oblique_views:
+                nearmap_views.update(oblique_views)
+                nearmap_date = ob_date or nearmap_date
+                res, views = classify_pack()
     has_obliques = any(v in nearmap_views for v in OBLIQUE_VIEWS)
-    if has_obliques:
-        _step_done("Nearmap obliques")
-    else:
-        _step_done("Nearmap obliques", "no coverage")
-
-    views = build_views(nearmap_views)
-    res = _classify_pass(
-        provider, clients, views, prompt, input_confidence, screen=False
-    )
-    res = gate_weak_rooftop_cell_claim(res)
-    res = gate_weak_stealth_tower_claim(res)
+    _step_done("Nearmap obliques", None if has_obliques else "no coverage")
     _step_done("classify (Nearmap combined)", _brief_pass_result(res))
     return (
         res,

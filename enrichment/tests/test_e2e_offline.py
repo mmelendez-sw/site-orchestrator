@@ -160,7 +160,7 @@ def _fake_chip(lat, lon, chip_m):
     return _img("gray"), dict(NAIP_META, naip_chip_m=chip_m), dict(GEO, chip_m=chip_m)
 
 
-def _fake_nearmap(lat, lon, chip_m=100, views=None):
+def _fake_nearmap(lat, lon, chip_m=100, views=None, **_kwargs):
     names = views if views is not None else ["Vert", "North", "East"]
     return {name: _img("white" if name == "Vert" else "silver") for name in names}, "2026-05-01"
 

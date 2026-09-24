@@ -127,6 +127,21 @@ IF COL_LENGTH(N'dbo.EnrichmentRun', N'DbOnlyMiss') IS NULL
     ALTER TABLE dbo.EnrichmentRun ADD DbOnlyMiss int NOT NULL CONSTRAINT DF_EnrichmentRun_DbOnlyMiss DEFAULT (0);
 IF COL_LENGTH(N'dbo.EnrichmentRun', N'Skipped') IS NULL
     ALTER TABLE dbo.EnrichmentRun ADD Skipped int NOT NULL CONSTRAINT DF_EnrichmentRun_Skipped DEFAULT (0);
+-- Nearmap spend metering (billed bytes; cache hits are free).
+IF COL_LENGTH(N'dbo.EnrichmentRun', N'HoldoutNearmapBudget') IS NULL
+    ALTER TABLE dbo.EnrichmentRun ADD HoldoutNearmapBudget int NOT NULL CONSTRAINT DF_EnrichmentRun_HoldoutNearmapBudget DEFAULT (0);
+IF COL_LENGTH(N'dbo.EnrichmentRun', N'NearmapBytes') IS NULL
+    ALTER TABLE dbo.EnrichmentRun ADD NearmapBytes bigint NOT NULL CONSTRAINT DF_EnrichmentRun_NearmapBytes DEFAULT (0);
+IF COL_LENGTH(N'dbo.EnrichmentRun', N'NearmapTiles') IS NULL
+    ALTER TABLE dbo.EnrichmentRun ADD NearmapTiles int NOT NULL CONSTRAINT DF_EnrichmentRun_NearmapTiles DEFAULT (0);
+IF COL_LENGTH(N'dbo.EnrichmentRun', N'NearmapCacheHits') IS NULL
+    ALTER TABLE dbo.EnrichmentRun ADD NearmapCacheHits int NOT NULL CONSTRAINT DF_EnrichmentRun_NearmapCacheHits DEFAULT (0);
+IF COL_LENGTH(N'dbo.EnrichmentSiteOutcome', N'NearmapBytes') IS NULL
+    ALTER TABLE dbo.EnrichmentSiteOutcome ADD NearmapBytes bigint NOT NULL CONSTRAINT DF_EnrichmentSite_NearmapBytes DEFAULT (0);
+IF COL_LENGTH(N'dbo.EnrichmentSiteOutcome', N'NearmapTiles') IS NULL
+    ALTER TABLE dbo.EnrichmentSiteOutcome ADD NearmapTiles int NOT NULL CONSTRAINT DF_EnrichmentSite_NearmapTiles DEFAULT (0);
+IF COL_LENGTH(N'dbo.EnrichmentSiteOutcome', N'NearmapCacheHits') IS NULL
+    ALTER TABLE dbo.EnrichmentSiteOutcome ADD NearmapCacheHits int NOT NULL CONSTRAINT DF_EnrichmentSite_NearmapCacheHits DEFAULT (0);
 GO
 
 IF OBJECT_ID(N'dbo.vEnrichmentKpisByState', N'V') IS NOT NULL
@@ -217,7 +232,8 @@ SELECT
     CASE WHEN w.EmptyToRooftopApply = 1 THEN 1 ELSE 0 END AS EmptyToRooftopApply,
     e.NearmapEver,
     e.ClaudeEver,
-    e.EmptyToNearmapEver
+    e.EmptyToNearmapEver,
+    e.NearmapBytesTotal
 FROM dbo.vEnrichmentSiteLatest AS l
 LEFT JOIN dbo.vEnrichmentSiteLatestWrite AS w
     ON w.SalesforceId = l.SalesforceId
@@ -226,7 +242,8 @@ INNER JOIN (
         SalesforceId,
         MAX(CAST(NearmapRan AS int)) AS NearmapEver,
         MAX(CAST(ClaudeRan AS int)) AS ClaudeEver,
-        MAX(CAST(EmptyToNearmap AS int)) AS EmptyToNearmapEver
+        MAX(CAST(EmptyToNearmap AS int)) AS EmptyToNearmapEver,
+        SUM(CAST(NearmapBytes AS bigint)) AS NearmapBytesTotal
     FROM dbo.EnrichmentSiteOutcome
     GROUP BY SalesforceId
 ) AS e
@@ -258,11 +275,15 @@ SELECT
     SUM(CASE WHEN Outcome = N'holdout_no_nearmap' THEN 1 ELSE 0 END) AS HoldoutNoNearmap,
     SUM(CASE WHEN Outcome = N'holdout_no_imagery' THEN 1 ELSE 0 END) AS HoldoutNoImagery,
     SUM(CASE WHEN Outcome = N'holdout_other' THEN 1 ELSE 0 END) AS HoldoutOther,
+    SUM(CASE WHEN Outcome = N'holdout_nearmap_budget' THEN 1 ELSE 0 END) AS HoldoutNearmapBudget,
     SUM(CASE WHEN Outcome = N'db_only_miss' THEN 1 ELSE 0 END) AS DbOnlyMiss,
     SUM(CASE WHEN Outcome = N'skipped' THEN 1 ELSE 0 END) AS Skipped,
     SUM(CASE WHEN Outcome = N'error' THEN 1 ELSE 0 END) AS Errors,
     SUM(NearmapEver) AS NearmapSites,
     SUM(ClaudeEver) AS ClaudeSites,
+    CAST(SUM(NearmapBytesTotal) / 1048576.0 AS decimal(12,2)) AS NearmapMB,
+    CAST(SUM(NearmapBytesTotal) / 1048576.0 / NULLIF(SUM(IsWritten), 0) AS decimal(12,3))
+        AS NearmapMBPerEnriched,
     SUM(EmptyToNearmapEver) AS NaipEmptyToNearmap,
     SUM(EmptyToRooftopApply) AS NaipEmptyToRooftopApply,
     CAST(SUM(EmptyToRooftopApply) * 1.0 / NULLIF(SUM(EmptyToNearmapEver), 0) AS decimal(6,3))

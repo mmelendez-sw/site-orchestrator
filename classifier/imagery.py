@@ -23,9 +23,10 @@ import logging
 import math
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import date
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import numpy as np
 import planetary_computer
@@ -42,7 +43,7 @@ from classifier.views import (
     coerce_asset_box,
     parse_box_2d,
 )
-from envutil import env_flag, env_int, env_str
+from envutil import env_flag, env_float, env_int, env_str
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +65,8 @@ NEARMAP_VERT_ZOOM = env_int("NEARMAP_VERT_ZOOM", 20)
 NEARMAP_OBLIQUE_ZOOM = env_int("NEARMAP_OBLIQUE_ZOOM", 20)
 NEARMAP_MAX_PX = env_int("NEARMAP_MAX_PX", 1024)
 NEARMAP_TILE_WORKERS = max(1, env_int("NEARMAP_TILE_WORKERS", 4))
+# Wide rooftop-host scout: Vert only at this zoom (19 ≈ 1/4 the tiles of 20).
+NEARMAP_SCOUT_ZOOM = env_int("NEARMAP_SCOUT_ZOOM", 19)
 _TILE_PX = 256
 
 
@@ -435,17 +438,19 @@ def _tile_cache_path(capture_date: str | None, view: str, z: int, x: int, y: int
     return root / _safe_key(capture_date) / view / str(z) / f"{x}_{y}.jpg"
 
 
-def _fetch_tile(view: str, z: int, x: int, y: int, capture_date: str | None) -> bytes | None:
-    """Tile JPEG bytes, from the disk cache when possible. None on 404."""
+def _fetch_tile(
+    view: str, z: int, x: int, y: int, capture_date: str | None
+) -> tuple[bytes | None, bool]:
+    """(tile JPEG bytes or None on 404, served-from-cache)."""
     path = _tile_cache_path(capture_date, view, z, x, y)
     if path is not None and path.is_file():
         try:
-            return path.read_bytes()
+            return path.read_bytes(), True
         except OSError:
             pass
     resp = _nearmap_get(NEARMAP_TILE_URL.format(content=view, z=z, x=x, y=y))
     if resp.status_code == 404:   # no coverage for this tile/view
-        return None
+        return None, False
     resp.raise_for_status()
     data = resp.content
     if path is not None:
@@ -453,7 +458,7 @@ def _fetch_tile(view: str, z: int, x: int, y: int, capture_date: str | None) -> 
             _atomic_write(path, data)
         except OSError as exc:
             logger.info("Nearmap tile cache write skipped: %s", exc)
-    return data
+    return data, False
 
 
 def _tile_position(view: str, tx: int, ty: int, x0: int, x1: int, y0: int, y1: int):
@@ -467,9 +472,118 @@ def _tile_position(view: str, tx: int, ty: int, x0: int, x1: int, y0: int, y1: i
     return (y1 - ty) * _TILE_PX, (tx - x0) * _TILE_PX   # west-up
 
 
+# ------------------------------ spend metering ------------------------------
+
+# Purposes the budget guard drops first (at the soft limit); "pack" (the
+# primary Vert / first oblique) only stops at the hard limit.
+OPTIONAL_PURPOSES = frozenset({"wide", "second", "recenter", "oblique_extra"})
+
+
+class NearmapMeter:
+    """Per-site Nearmap spend: billed bytes/tiles, cache hits, by purpose."""
+
+    def __init__(self) -> None:
+        self.bytes = 0
+        self.tiles = 0
+        self.cache_hits = 0
+        self.by_purpose: dict[str, int] = {}
+        self.budget_blocked = False
+        self.budget_skipped: list[str] = []
+
+    def record(self, purpose: str, tiles: list[tuple[bytes | None, bool]]) -> int:
+        billed = sum(len(data) for data, cached in tiles if data and not cached)
+        self.bytes += billed
+        self.tiles += sum(1 for data, cached in tiles if data and not cached)
+        self.cache_hits += sum(1 for data, cached in tiles if data and cached)
+        self.by_purpose[purpose] = self.by_purpose.get(purpose, 0) + billed
+        return billed
+
+    def as_row(self) -> dict[str, Any]:
+        return {
+            "nearmap_bytes": self.bytes,
+            "nearmap_tiles": self.tiles,
+            "nearmap_cache_hits": self.cache_hits,
+            "nearmap_spend": json.dumps(self.by_purpose, sort_keys=True) if self.by_purpose else "",
+            "nearmap_budget_blocked": self.budget_blocked,
+        }
+
+
+_meter_local = threading.local()
+
+
+@contextmanager
+def nearmap_meter() -> Iterator[NearmapMeter]:
+    """Meter every Nearmap purchase made on this thread (one site)."""
+    prior = getattr(_meter_local, "meter", None)
+    meter = NearmapMeter()
+    _meter_local.meter = meter
+    try:
+        yield meter
+    finally:
+        _meter_local.meter = prior
+
+
+def _current_meter() -> NearmapMeter | None:
+    return getattr(_meter_local, "meter", None)
+
+
+class NearmapBudget:
+    """Month-to-date Nearmap bytes vs ``NEARMAP_MONTHLY_BUDGET_MB`` (0 = off).
+
+    The pipeline seeds ``spent`` from the usage ledger at run start; every
+    billed tile adds to it live, so all workers see the same total. Checks
+    happen per view, so concurrent workers can overshoot by at most a few
+    views (~0.5 MB each).
+    """
+
+    def __init__(self, limit_mb: float, soft_pct: float) -> None:
+        self.limit_bytes = int(limit_mb * 1024 * 1024) if limit_mb > 0 else 0
+        self.soft_bytes = int(self.limit_bytes * max(0.0, min(1.0, soft_pct / 100.0)))
+        self._spent = 0
+        self._lock = threading.Lock()
+
+    @classmethod
+    def from_env(cls) -> "NearmapBudget":
+        return cls(env_float("NEARMAP_MONTHLY_BUDGET_MB", 1500), env_float("NEARMAP_BUDGET_SOFT_PCT", 90))
+
+    @property
+    def spent(self) -> int:
+        with self._lock:
+            return self._spent
+
+    def seed(self, month_to_date_bytes: int) -> None:
+        with self._lock:
+            self._spent = max(0, int(month_to_date_bytes))
+
+    def add(self, nbytes: int) -> None:
+        with self._lock:
+            self._spent += max(0, int(nbytes))
+
+    def allows(self, purpose: str) -> bool:
+        if not self.limit_bytes:
+            return True
+        spent = self.spent
+        if spent >= self.limit_bytes:
+            return False
+        return not (purpose in OPTIONAL_PURPOSES and spent >= self.soft_bytes)
+
+    def describe(self) -> str:
+        if not self.limit_bytes:
+            return "Nearmap budget: off (NEARMAP_MONTHLY_BUDGET_MB=0)"
+        mb = 1024 * 1024
+        return (
+            f"Nearmap budget: {self.spent / mb:.0f} of {self.limit_bytes / mb:.0f} MB used this month "
+            f"(optional purchases stop at {self.soft_bytes / mb:.0f} MB)"
+        )
+
+
+BUDGET = NearmapBudget.from_env()
+
+
 def _stitch_view(lat: float, lon: float, chip_m: float, view: str,
-                 capture_date: str | None) -> Image.Image | None:
-    zoom = NEARMAP_VERT_ZOOM if view == "Vert" else NEARMAP_OBLIQUE_ZOOM
+                 capture_date: str | None, *, zoom: int | None = None,
+                 purpose: str = "pack") -> Image.Image | None:
+    zoom = zoom or (NEARMAP_VERT_ZOOM if view == "Vert" else NEARMAP_OBLIQUE_ZOOM)
     x0, x1, y0, y1 = _tile_range(lat, lon, chip_m / 2.0, zoom)
     cols, rows = x1 - x0 + 1, y1 - y0 + 1
     # East/West mosaics have the slippy x axis running vertically.
@@ -483,9 +597,14 @@ def _stitch_view(lat: float, lon: float, chip_m: float, view: str,
         tiles = list(pool.map(
             lambda xy: _fetch_tile(view, zoom, xy[0], xy[1], capture_date), coords
         ))
+    meter = _current_meter()
+    billed = meter.record(purpose, tiles) if meter is not None else sum(
+        len(data) for data, cached in tiles if data and not cached
+    )
+    BUDGET.add(billed)
 
     got_any = False
-    for (tx, ty), data in zip(coords, tiles):
+    for (tx, ty), (data, _cached) in zip(coords, tiles):
         if data is None:
             continue
         tile = Image.open(io.BytesIO(data)).convert("RGB")
@@ -501,15 +620,20 @@ def _stitch_view(lat: float, lon: float, chip_m: float, view: str,
 
 
 def fetch_nearmap_views(lat: float, lon: float, chip_m: float = NEARMAP_CHIP_M,
-                        views: list[str] | None = None):
+                        views: list[str] | None = None, *, zoom: int | None = None,
+                        purpose: str = "pack"):
     """Fetch Nearmap content for a point via the Tile API: high-res vertical
     plus 45-degree oblique panoramas (N/E/S/W), stitched from XYZ tiles.
 
     Returns ({view_name: PIL.Image}, capture_date). Empty dict when the key is
-    not set or the location has no Nearmap coverage.
+    not set, the location has no Nearmap coverage, or the monthly budget
+    refuses this ``purpose`` (see ``NearmapBudget``; the site meter records
+    that as ``budget_blocked`` / ``budget_skipped``).
 
     Optional `views` limits which orientations to fetch (e.g. ["Vert"] or
-    OBLIQUE_VIEWS). Defaults to all NEARMAP_VIEWS when omitted.
+    OBLIQUE_VIEWS). Defaults to all NEARMAP_VIEWS when omitted. ``zoom``
+    overrides the per-view zoom (cheap wide scouting). ``purpose`` labels the
+    spend: pack | oblique_extra | wide | second | recenter.
     """
     if not nearmap_api_key():
         return {}, None
@@ -520,7 +644,16 @@ def fetch_nearmap_views(lat: float, lon: float, chip_m: float = NEARMAP_CHIP_M,
 
     result: dict[str, Any] = {}
     for view in (views if views is not None else NEARMAP_VIEWS):
-        canvas = _stitch_view(lat, lon, chip_m, view, capture_date)
+        if not BUDGET.allows(purpose):
+            meter = _current_meter()
+            if meter is not None:
+                if purpose in OPTIONAL_PURPOSES and BUDGET.spent < BUDGET.limit_bytes:
+                    meter.budget_skipped.append(purpose)
+                else:
+                    meter.budget_blocked = True
+            logger.warning("Nearmap %s skipped: %s", purpose, BUDGET.describe())
+            break
+        canvas = _stitch_view(lat, lon, chip_m, view, capture_date, zoom=zoom, purpose=purpose)
         if canvas is not None:
             result[view] = canvas
     if not result:

@@ -178,6 +178,7 @@ def _refresh_classifier_flags(ac: Any) -> None:
         os.environ.get("GEMINI_THINKING_LEVEL"), "MEDIUM"
     )
     ac.NEARMAP_API_KEY = imagery.nearmap_api_key()
+    ac.NEARMAP_STAGGER_OBLIQUES = ac._env_flag("NEARMAP_STAGGER_OBLIQUES", default="1")
     ac.CHIP_SIZE_M = env_float("CHIP_SIZE_M", 300)
     ac.GEMINI_SOLO_CELL_CONF = env_float("GEMINI_SOLO_CELL_CONF", 0.85)
     ac.EMPTY_CHIP_LOCK_CONF = env_float("NEARMAP_EMPTY_LOCK_CONF", 0.90)
@@ -238,7 +239,30 @@ def _labeled_views(
     return views
 
 
-def classify_site_imagery(
+WIDE_SCOUT_MODE = (os.environ.get("NEARMAP_WIDE_SCOUT") or "vert").strip().lower()
+
+
+def _scout_found_candidate(ac: Any, res: dict) -> bool:
+    """Wide scout located a positive host worth a re-center pack."""
+    conf = ac.normalize_confidence(res.get("site_confidence")) or 0.0
+    return (
+        res.get("site_type") in ac._positive_site_types()
+        and conf >= ac.TIER_CONF_MEDIUM
+        and bool(res.get("asset_box_2d"))
+    )
+
+
+def classify_site_imagery(**kwargs) -> dict[str, Any]:
+    """Classify one site; stamps the Nearmap spend meter onto the result."""
+    from classifier import imagery
+
+    with imagery.nearmap_meter() as meter:
+        result = _classify_site_imagery(**kwargs)
+    result.update(meter.as_row())
+    return result
+
+
+def _classify_site_imagery(
     *,
     site_id: str,
     lat: float,
@@ -640,7 +664,9 @@ def classify_site_imagery(
         if verbose:
             progress.step("Nearmap at other rooftop-host point")
         try:
-            other_nm, other_date = imagery.fetch_nearmap_views(o_lat, o_lon)
+            other_nm, other_date = imagery.fetch_nearmap_views(
+                o_lat, o_lon, purpose="second"
+            )
         except Exception as exc:  # noqa: BLE001
             other_nm, other_date = {}, None
             if verbose:
@@ -782,6 +808,12 @@ def classify_site_imagery(
         )
 
     # Wide Nearmap AOI — rooftops only (not empty-field hunting).
+    # NEARMAP_WIDE_SCOUT=vert (default): a zoom-19 Vert-only scout (~1/10 the
+    # bytes of a full 250 m pack). A candidate is confirmed by the re-center
+    # pack below; otherwise the pin-centered pack stands. =full restores the
+    # 250 m Vert + obliques pack.
+    vert_scout = WIDE_SCOUT_MODE != "full"
+    pin_pack = (nearmap_views, nearmap_date, nearmap_aoi_m, views, nearmap_tier)
     if (
         pin_offset_scout
         and not skip_nearmap_fetch
@@ -790,32 +822,44 @@ def classify_site_imagery(
     ):
         try:
             if verbose:
-                progress.step(f"Nearmap wide AOI ({imagery.NEARMAP_FALLBACK_CHIP_M}m)")
+                progress.step(
+                    f"Nearmap wide {'Vert scout z' + str(imagery.NEARMAP_SCOUT_ZOOM) if vert_scout else 'AOI'}"
+                    f" ({imagery.NEARMAP_FALLBACK_CHIP_M}m)"
+                )
             wide_views, wide_date = imagery.fetch_nearmap_views(
-                lat, lon, imagery.NEARMAP_FALLBACK_CHIP_M
+                lat,
+                lon,
+                imagery.NEARMAP_FALLBACK_CHIP_M,
+                views=["Vert"] if vert_scout else None,
+                zoom=imagery.NEARMAP_SCOUT_ZOOM if vert_scout else None,
+                purpose="wide",
             )
         except Exception as exc:  # noqa: BLE001
             wide_views, wide_date = {}, None
             if verbose:
                 progress.warn(f"wide Nearmap failed: {exc}")
         if wide_views:
-            nearmap_views = wide_views
-            nearmap_date = wide_date or nearmap_date
-            nearmap_aoi_m = imagery.NEARMAP_FALLBACK_CHIP_M
-            views = build_views(wide_views)
-            res, _, _, _ = ac.classify_with_routing(
+            wide_res, _, _, _ = ac.classify_with_routing(
                 stage_provider,
                 clients,
-                views,
+                build_views(wide_views),
                 prompt,
                 input_conf,
                 escalate=False,
             )
-            classification_stage = "wide_aoi"
-            nearmap_tier = "wide_aoi"
+            adopt = not vert_scout or _scout_found_candidate(ac, wide_res)
+            if adopt:
+                res = wide_res
+                nearmap_views = wide_views
+                nearmap_date = wide_date or nearmap_date
+                nearmap_aoi_m = imagery.NEARMAP_FALLBACK_CHIP_M
+                views = build_views(wide_views)
+                classification_stage = "wide_aoi"
+                nearmap_tier = "wide_aoi"
             if verbose:
                 progress.result(
-                    f"wide → {res.get('site_type')} conf={res.get('site_confidence')}"
+                    f"wide → {wide_res.get('site_type')} conf={wide_res.get('site_confidence')}"
+                    + ("" if adopt else " (no candidate — keep pin pack)")
                 )
 
     # NAIP wide — only when Nearmap never ran (coverage miss). Rooftop pin-offset
@@ -914,12 +958,19 @@ def classify_site_imagery(
         and pre_scout_res.get("cell_equipment") is not True
         and not nearmap_blocks_rescue
     )
-    scout_found_cell = (
-        res.get("site_type") in ac._positive_site_types()
-        and res.get("cell_equipment") is True
-        and (
-            classification_stage in {"wide_aoi", "zoom"}
-            or nearmap_tier in {"wide_aoi", "naip_wide", "zoom"}
+    from_scout = classification_stage in {"wide_aoi", "zoom"} or nearmap_tier in {
+        "wide_aoi",
+        "naip_wide",
+        "zoom",
+    }
+    # A Vert-only scout cannot see facade gear, so a located candidate is
+    # enough to buy the re-center pack; that pack must still confirm cell.
+    scout_found_cell = from_scout and (
+        _scout_found_candidate(ac, res)
+        if vert_scout and nearmap_tier == "wide_aoi"
+        else (
+            res.get("site_type") in ac._positive_site_types()
+            and res.get("cell_equipment") is True
         )
     )
     if (
@@ -950,7 +1001,7 @@ def classify_site_imagery(
                     )
                 try:
                     recenter_views, recenter_date = imagery.fetch_nearmap_views(
-                        cand_lat, cand_lon
+                        cand_lat, cand_lon, purpose="recenter"
                     )
                 except Exception as exc:  # noqa: BLE001
                     recenter_views, recenter_date = {}, None
@@ -988,6 +1039,9 @@ def classify_site_imagery(
                         # forcing other when re-center rejects a wide scout hit.
                         res = dict(pre_scout_res)
                         classification_stage = "pin_recenter_rejected"
+                        if vert_scout and nearmap_tier == "wide_aoi":
+                            (nearmap_views, nearmap_date, nearmap_aoi_m, views,
+                             nearmap_tier) = pin_pack
                         if verbose:
                             progress.result(
                                 "re-center rejected — keep pin-centered result"

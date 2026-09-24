@@ -320,7 +320,7 @@ def _rooftop_ok():
     }
 
 
-class ParallelRunTests(unittest.TestCase):
+class _RunHarness(unittest.TestCase):
     def _run(self, sites, classify, *, workers, apply=True, env=None):
         from enrichment.pipeline import run_enrichment
         import enrichment.metrics as metrics_mod
@@ -356,6 +356,8 @@ class ParallelRunTests(unittest.TestCase):
         ] if (root / "sites.jsonl").is_file() else []
         return client, summary, detail, ledger
 
+
+class ParallelRunTests(_RunHarness):
     def test_parallel_workers_apply_every_site_once(self):
         threads: set[str] = set()
         lock = threading.Lock()
@@ -511,6 +513,54 @@ class WriteGroupingTests(unittest.TestCase):
         self.assertEqual(kpis["db_skip_sf_writes"], 2)
         self.assertEqual(kpis["tower_write_rate"], 0.5)
         self.assertEqual(kpis["db_match_rate"], 0.5)
+
+
+class NearmapBudgetPipelineTests(_RunHarness):
+    def test_budget_blocked_site_stays_queued(self):
+        def classify(**_kwargs):
+            return {"site_type": "unclear", "site_confidence": 0.3,
+                    "nearmap_tier": "no_coverage", "nearmap_budget_blocked": True,
+                    "nearmap_bytes": 0}
+
+        sites = [{"Id": "a0ZBUDGET0000001", "Site_Latitude__c": 43.0, "Site_Longitude__c": -89.0}]
+        client, summary, detail, _ledger = self._run(sites, classify, workers=1)
+        self.assertEqual(detail[0]["holdout_reason"], "nearmap_budget")
+        self.assertEqual(detail[0]["outcome_class"], "holdout_nearmap_budget")
+        self.assertEqual(client.sf.Site__c.calls, [])  # not dequeued
+        self.assertEqual(client.sf.collection_calls, [])
+
+    def test_site_spend_reaches_ledger_and_kpis(self):
+        def classify(**_kwargs):
+            return {**_rooftop_ok(), "nearmap_bytes": 3 * 1024 * 1024, "nearmap_tiles": 90,
+                    "nearmap_cache_hits": 4, "nearmap_spend": '{"pack": 3145728}'}
+
+        sites = [{"Id": "a0ZSPEND00000001", "Site_Latitude__c": 43.0, "Site_Longitude__c": -89.0}]
+        _client, summary, detail, ledger = self._run(sites, classify, workers=1)
+        self.assertEqual(detail[0]["nearmap_bytes"], str(3 * 1024 * 1024))
+        self.assertEqual(ledger[0]["nearmap_tiles"], 90)
+        self.assertEqual(summary["run"]["nearmap_mb"], 3.0)
+        self.assertEqual(summary["kpis"]["nearmap_mb_per_enriched"], 3.0)
+
+
+class NearmapUsageLedgerTests(unittest.TestCase):
+    def test_month_to_date_sums_only_this_month(self):
+        from datetime import datetime, timezone
+
+        from enrichment.metrics import (
+            NEARMAP_USAGE_JSONL,
+            _rewrite_jsonl,
+            month_to_date_nearmap_bytes,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _rewrite_jsonl(root / NEARMAP_USAGE_JSONL, [
+                {"at": "2026-08-31T23:59:00Z", "bytes": 5},
+                {"at": "2026-09-01T00:01:00Z", "bytes": 7},
+                {"at": "2026-09-24T12:00:00Z", "bytes": 11},
+            ])
+            now = datetime(2026, 9, 24, tzinfo=timezone.utc)
+            self.assertEqual(month_to_date_nearmap_bytes(now=now, root=root), 18)
 
 
 class MetricsSinkTests(unittest.TestCase):

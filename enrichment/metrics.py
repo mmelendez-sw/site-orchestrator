@@ -46,6 +46,7 @@ OUTCOMES: tuple[str, ...] = APPLIED_OUTCOMES + (
     "holdout_no_nearmap",
     "holdout_no_imagery",
     "holdout_other",
+    "holdout_nearmap_budget",
     "db_only_miss",
     "skipped",
     "error",
@@ -103,6 +104,8 @@ def outcome_class(row: dict[str, Any]) -> str:
         return "applied_other"
     if reason == "db_only_no_unique_hit":
         return "db_only_miss"
+    if reason == "nearmap_budget":
+        return "holdout_nearmap_budget"
     if reason in _SKIPPED_REASONS:
         return "skipped"
     if reason in _ERROR_REASONS:
@@ -172,6 +175,11 @@ def _queue_limit() -> int | None:
     return None if number is None else int(number)
 
 
+def _int_or_zero(value: Any) -> int:
+    number = to_float(value)
+    return 0 if number is None else int(number)
+
+
 def site_record(row: dict[str, Any], *, run_id: str) -> dict[str, Any]:
     """One processed site as stored in ``sites.jsonl`` / EnrichmentSiteOutcome."""
     screen = screen_site_type(row)
@@ -215,6 +223,9 @@ def site_record(row: dict[str, Any], *, run_id: str) -> dict[str, Any]:
         "update_site_type": str(row.get("update_site_type") or ""),
         "outcome": outcome_class(row),
         "sf_update_status": str(row.get("sf_update_status") or ""),
+        "nearmap_bytes": _int_or_zero(row.get("nearmap_bytes")),
+        "nearmap_tiles": _int_or_zero(row.get("nearmap_tiles")),
+        "nearmap_cache_hits": _int_or_zero(row.get("nearmap_cache_hits")),
     }
 
 
@@ -240,6 +251,10 @@ def written_site_type(rec: dict[str, Any]) -> str:
 
 def _outcome_counts(records: Iterable[dict[str, Any]]) -> Counter:
     return Counter(str(rec.get("outcome") or "holdout_other") for rec in records)
+
+
+def _mb(nbytes: float) -> float:
+    return round(float(nbytes) / (1024 * 1024), 2)
 
 
 def _rate(part: int, whole: int) -> float | None:
@@ -276,6 +291,10 @@ def snapshot_run(
             "errors": by_outcome.get("error", 0),
             "nearmap_sites": sum(1 for s in sites if s["nearmap_ran"]),
             "claude_sites": sum(1 for s in sites if s["claude_ran"]),
+            "nearmap_bytes": sum(s["nearmap_bytes"] for s in sites),
+            "nearmap_tiles": sum(s["nearmap_tiles"] for s in sites),
+            "nearmap_cache_hits": sum(s["nearmap_cache_hits"] for s in sites),
+            "nearmap_mb": _mb(sum(s["nearmap_bytes"] for s in sites)),
             "naip_empty_to_nearmap": empty_nm,
             "naip_empty_to_rooftop": sum(1 for s in sites if s["empty_to_rooftop"]),
             "naip_empty_to_rooftop_apply": empty_rt_apply,
@@ -317,6 +336,7 @@ def rollup_kpis(site_rows: list[dict[str, Any]]) -> dict[str, Any]:
             ever["empty_nm"].add(sid)
     n = len(latest)
     by_outcome = _outcome_counts(latest.values())
+    nearmap_bytes = sum(_int_or_zero(rec.get("nearmap_bytes")) for rec in site_rows)
     # Grouped by the Site_Type written (imagery or tower-database decided);
     # db_skip_sf_writes is the tower-database share of those, not a third kind.
     write_types = Counter(written_site_type(rec) for rec in written.values())
@@ -340,6 +360,9 @@ def rollup_kpis(site_rows: list[dict[str, Any]]) -> dict[str, Any]:
         "db_match_rate": _rate(db_skip, len(written)),
         "nearmap_sites": len(ever["nearmap"]),
         "claude_sites": len(ever["claude"]),
+        # Metered since the byte counter shipped; earlier runs count 0.
+        "nearmap_mb": _mb(nearmap_bytes),
+        "nearmap_mb_per_enriched": _mb(nearmap_bytes / len(written)) if written else None,
         "naip_empty_to_nearmap": empty_nm,
         "naip_empty_to_rooftop_apply": empty_rt_apply,
         "empty_to_rooftop_apply_rate": _rate(empty_rt_apply, empty_nm),
@@ -382,6 +405,9 @@ RUN_METRIC_KEYS: tuple[str, ...] = (
     "sf_writes",
     "sf_holdouts_dequeued",
     "sf_write_failed",
+    "nearmap_mb",
+    "nearmap_tiles",
+    "nearmap_cache_hits",
 )
 
 KPI_METRIC_KEYS: tuple[str, ...] = (
@@ -408,8 +434,11 @@ KPI_METRIC_KEYS: tuple[str, ...] = (
     "db_only_miss",
     "skipped",
     "errors",
+    "holdout_nearmap_budget",
     "nearmap_sites",
     "claude_sites",
+    "nearmap_mb",
+    "nearmap_mb_per_enriched",
 )
 
 
@@ -434,6 +463,8 @@ METRIC_DISPLAY_NAMES: dict[str, str] = {
     "rooftop_write_rate": "rooftop_share (of enriched)",
     "db_match_rate": "db_match_share (of enriched, no imagery/AI)",
     "db_skip_sf_writes": "db_matched_writes",
+    "nearmap_mb": "nearmap_mb_billed",
+    "nearmap_mb_per_enriched": "nearmap_mb_per_enriched_site",
     "nearmap_sites": "nearmap_imagery_ran",
     "claude_sites": "claude_ai_ran",
 }
@@ -520,6 +551,36 @@ def refresh_kpis_from_ledger(*, root: Path | None = None, write: bool = True) ->
     root = root or metrics_dir()
     sites = _read_jsonl(root / SITES_JSONL)
     return _write_kpis(root, sites) if write else rollup_kpis(sites)
+
+
+NEARMAP_USAGE_JSONL = "nearmap_usage.jsonl"
+
+
+def record_nearmap_usage(run_id: str, row: dict[str, Any]) -> None:
+    """Append one site's billed Nearmap bytes (every run, dry runs included)."""
+    nbytes = _int_or_zero(row.get("nearmap_bytes"))
+    if not nbytes:
+        return
+    _append_jsonl(
+        metrics_dir() / NEARMAP_USAGE_JSONL,
+        [{
+            "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "run_id": run_id,
+            "Id": str(row.get("Id") or ""),
+            "bytes": nbytes,
+            "tiles": _int_or_zero(row.get("nearmap_tiles")),
+        }],
+    )
+
+
+def month_to_date_nearmap_bytes(*, now: datetime | None = None, root: Path | None = None) -> int:
+    """Billed Nearmap bytes this calendar month (UTC), from the usage ledger."""
+    month = (now or datetime.now(timezone.utc)).strftime("%Y-%m")
+    return sum(
+        _int_or_zero(rec.get("bytes"))
+        for rec in _read_jsonl((root or metrics_dir()) / NEARMAP_USAGE_JSONL)
+        if str(rec.get("at") or "").startswith(month)
+    )
 
 
 _LIVE_STATUSES = frozenset({"updated", "dequeued", "classified_only", "failed"})

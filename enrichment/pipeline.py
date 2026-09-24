@@ -69,6 +69,8 @@ from enrichment.geo import (
 )
 from enrichment.metrics import (
     RUN_METRIC_KEYS,
+    month_to_date_nearmap_bytes,
+    record_nearmap_usage,
     outcome_class,
     record_run,
     site_record,
@@ -111,6 +113,9 @@ logger = logging.getLogger(__name__)
 
 _ALREADY_WRITTEN = frozenset({"updated", "classified_only", "dequeued"})
 _SQL_ERROR_HOLDOUT = "sql_error"
+_NEARMAP_BUDGET_HOLDOUT = "nearmap_budget"
+# Transient holdouts stay in the Salesforce queue for a later run.
+_KEEP_QUEUED_HOLDOUTS = frozenset({_SQL_ERROR_HOLDOUT, _NEARMAP_BUDGET_HOLDOUT})
 # Sentinel: "no prefetched proximity for this site — look it up inline".
 _NOT_PREFETCHED = object()
 
@@ -334,7 +339,7 @@ def _collect_apply_rows(
             for row in detail_rows
             if row.get("bucket") != BUCKET_POTENTIAL_UPDATE
             and _needs_sf_apply(row)
-            and str(row.get("holdout_reason") or "") != _SQL_ERROR_HOLDOUT
+            and str(row.get("holdout_reason") or "") not in _KEEP_QUEUED_HOLDOUTS
         )
     return apply_rows
 
@@ -893,6 +898,10 @@ _FRESH_CLASSIFIED_FIELDS = (
     "asset_lon",
     "asset_offset_m",
     "asset_coord_source",
+    "nearmap_bytes",
+    "nearmap_tiles",
+    "nearmap_cache_hits",
+    "nearmap_spend",
 )
 
 
@@ -1067,6 +1076,9 @@ def _classify_prepared(
         except (TypeError, ValueError):
             pass
     base.update(_bucket(prep, classified))
+    if classified.get("nearmap_budget_blocked") and base.get("bucket") != BUCKET_POTENTIAL_UPDATE:
+        # Needed Nearmap the monthly budget refused: keep it queued for next month.
+        base["holdout_reason"] = _NEARMAP_BUDGET_HOLDOUT
     if use_cluster and not classified.get("error"):
         remember_cluster_result(cluster_cache, classify_lat, classify_lng, classified)
     return base
@@ -1209,6 +1221,7 @@ class _RunState:
         )
         self.detail_rows.append(row)
         self.csv.append(row)
+        record_nearmap_usage(self.run_dir.name, row)
         if self.apply and self.eligible(row):
             self.batch.append(row)
             if self._batch_since is None:
@@ -1434,6 +1447,16 @@ def run_enrichment(
     chip_dir = run_dir / "chips"
     progress.reset_run_timer()
     workers = classify_workers() if workers is None else max(1, int(workers))
+    from classifier import imagery
+
+    # Ledger bytes this month, plus any use it cannot see (spend before
+    # metering shipped); ICEMAN is not metered, so size the budget to this
+    # pipeline's share.
+    imagery.BUDGET.seed(
+        month_to_date_nearmap_bytes() + int(env_float("NEARMAP_PRIOR_USE_MB", 0) * 1024 * 1024)
+    )
+    if verbose:
+        progress.step(imagery.BUDGET.describe())
 
     if verbose:
         progress.stage(

@@ -87,6 +87,7 @@ RUN_COLUMNS: tuple[tuple[str, str, Converter], ...] = (
     ("HoldoutNoNearmap", "holdout_no_nearmap", _count),
     ("HoldoutNoImagery", "holdout_no_imagery", _count),
     ("HoldoutOther", "holdout_other", _count),
+    ("HoldoutNearmapBudget", "holdout_nearmap_budget", _count),
     ("DbOnlyMiss", "db_only_miss", _count),
     ("Skipped", "skipped", _count),
     ("Errors", "errors", _count),
@@ -99,6 +100,9 @@ RUN_COLUMNS: tuple[tuple[str, str, Converter], ...] = (
     ("SfWrites", "sf_writes", _count),
     ("SfHoldoutsDequeued", "sf_holdouts_dequeued", _count),
     ("SfWriteFailed", "sf_write_failed", _count),
+    ("NearmapBytes", "nearmap_bytes", _count),
+    ("NearmapTiles", "nearmap_tiles", _count),
+    ("NearmapCacheHits", "nearmap_cache_hits", _count),
     ("ApplyEnabled", "apply_enabled", _count),
     ("QueueStates", "queue_states", _opt_text(80)),
     ("QueueLimit", "queue_limit", _opt_count),
@@ -132,6 +136,9 @@ SITE_COLUMNS: tuple[tuple[str, str, Converter], ...] = (
     ("UpdateSiteType", "update_site_type", _opt_text(32)),
     ("Outcome", "outcome", lambda v: str(v or "holdout_other")[:64]),
     ("SfUpdateStatus", "sf_update_status", _opt_text(32)),
+    ("NearmapBytes", "nearmap_bytes", _count),
+    ("NearmapTiles", "nearmap_tiles", _count),
+    ("NearmapCacheHits", "nearmap_cache_hits", _count),
     ("Notes", "notes", _opt_text(400)),
 )
 

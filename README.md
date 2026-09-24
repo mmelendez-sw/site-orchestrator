@@ -101,6 +101,22 @@ Salesforce writes, Azure SQL, and the detail CSV all stay on the main thread. Th
 
 Imagery is cached under `../site-orchestrator-data/cache/`: NAIP chips per STAC item + point, Nearmap tiles per survey capture date (a new survey refetches). Reruns, wide AOIs, re-centers, and neighbors reuse pixels instead of re-downloading. Set `IMAGERY_CACHE=0` to disable; check your Nearmap agreement on how long tiles may be retained. Do not run `load_enrichment_metrics.py` during a classify run. Set `METRICS_SQL=0` if Azure SQL is dropping; reload KPIs later.
 
+### Nearmap spend (4 GB/month shared with ICEMAN)
+
+Every Nearmap tile is metered: billed bytes, tiles, cache hits, and the stage that bought it (`pack`, `oblique_extra`, `wide`, `second`, `recenter`). Per site it lands in `enrichment_detail.csv` (`nearmap_bytes`, `nearmap_spend`) and Azure SQL (`NearmapBytes`); per run and cumulatively as `nearmap_mb` / `nearmap_mb_per_enriched` (`NearmapMB`, `NearmapMBPerEnriched` in `vEnrichmentKpis`).
+
+Purchase rules that keep bytes down:
+
+| Purchase | Tiles | When |
+|---|---|---|
+| Vert + first oblique (100 m, z20) | ~40 | Sites that need Nearmap |
+| Remaining obliques | ~20 each | Only when Vert + first oblique did not lock the call (`NEARMAP_STAGGER_OBLIQUES=1`) |
+| Wide host scout (250 m, **z19 Vert only**) | ~25 | Rooftop with cell unconfirmed (was ~270 for the full 250 m pack; `NEARMAP_WIDE_SCOUT=full` restores it) |
+| Re-center pack (100 m) | ~60 | Scout found a candidate off the pin |
+| Second pack at the Census point | ~60 | Pin and address disagree |
+
+The monthly guard (`NEARMAP_MONTHLY_BUDGET_MB`, default 1500) sums this month's bytes from `metrics/nearmap_usage.jsonl` (dry runs included) plus `NEARMAP_PRIOR_USE_MB`. At `NEARMAP_BUDGET_SOFT_PCT` (90%) the optional buys stop; at 100% all Nearmap stops and sites that needed it hold out as `nearmap_budget` — never dequeued, so the next month's run picks them up. The start banner prints `Nearmap budget: N of M MB used this month`. ICEMAN usage is not visible here: size the budget to this pipeline's share.
+
 ### Checking a rule change
 
 Before shipping a threshold or gate change, replay recent classifications through the new rules (no imagery, models, or Salesforce):

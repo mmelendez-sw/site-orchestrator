@@ -34,6 +34,7 @@ Supporting counts:
 |---|---|
 | Outcome counts (holdouts, errors, misses) | Each Id's **latest** observation. A site held out in one run and written in a later run counts as written, once. |
 | NearmapSites / ClaudeSites | Ids where paid imagery / Claude **ever** ran (spend proxy, not applies). |
+| NearmapMB / NearmapMBPerEnriched | Billed Nearmap megabytes (cache hits are free) across all live runs, and per site enriched. Metered from 2026-09-24; earlier runs count 0. Site rows carry `NearmapBytes` / `NearmapTiles` / `NearmapCacheHits`; `enrichment_detail.csv` also has `nearmap_spend` by stage. |
 | NaipEmptyToNearmap / …RooftopApply | Ids whose NAIP screen was empty but Nearmap ran / then wrote a rooftop. |
 
 `TowerSfWrites + RooftopSfWrites = WrittenSites` (plus the rare `applied_other`). Imagery-decided writes = `WrittenSites − AppliedDbSkip`. Yield swings with the queue: DB-only runs over wide stages evaluate many sites with no tower match, which lowers yield without anything being wrong — slice by `MatchSource` or run type to compare like with like.
@@ -91,6 +92,7 @@ Column lists live once in `enrichment/metrics_store.py` (`RUN_COLUMNS`, `SITE_CO
 | `holdout_no_nearmap` | Nearmap `no_coverage` |
 | `holdout_no_imagery` | No NAIP or Nearmap imagery at the pin |
 | `holdout_other` | Anything else held out |
+| `holdout_nearmap_budget` | Needed Nearmap after the monthly budget ran out; stays in the Salesforce queue |
 | `db_only_miss` | `DB_ONLY=1`, no unique FCC/TowerSource hit |
 | `skipped` | No saved chips to rerun / skip-classify without a DB hit |
 | `error` | classify / SQL / missing coords |
