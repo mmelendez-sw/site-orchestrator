@@ -8,8 +8,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     env:
-      # Keep imagery / geocode caches out of the checkout; never call paid APIs.
-      SITE_ORCHESTRATOR_DATA: ${{ runner.temp }}/site-orchestrator-data
+      # Never call paid APIs or write metrics to Azure SQL from CI.
       METRICS_SQL: "0"
     steps:
       - uses: actions/checkout@v4
@@ -25,4 +24,8 @@ jobs:
       - name: Lint
         run: python -m pyflakes envutil.py paths.py classifier enrichment salesforce scripts
       - name: Unit tests (offline)
+        env:
+          # Keep imagery / geocode caches out of the checkout. The runner
+          # context is only available at step level, not in job-level env.
+          SITE_ORCHESTRATOR_DATA: ${{ runner.temp }}/site-orchestrator-data
         run: python -m pytest -q
