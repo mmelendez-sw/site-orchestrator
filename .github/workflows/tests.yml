@@ -3,10 +3,21 @@ name: tests
 on:
   push:
   pull_request:
+  workflow_dispatch:
+
+# CI only reads the repo; do not hand the job a write-scoped token.
+permissions:
+  contents: read
+
+# A newer push to the same branch / PR supersedes an in-flight run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     env:
       # Never call paid APIs or write metrics to Azure SQL from CI.
       METRICS_SQL: "0"
@@ -19,7 +30,7 @@ jobs:
           cache-dependency-path: requirements*.txt
       - name: Install
         run: |
-          sudo apt-get update && sudo apt-get install -y unixodbc
+          sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends unixodbc
           pip install -r requirements-dev.txt
       - name: Lint
         run: python -m pyflakes envutil.py paths.py classifier enrichment salesforce scripts
