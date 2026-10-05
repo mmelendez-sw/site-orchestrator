@@ -1044,6 +1044,15 @@ class SoqlTests(unittest.TestCase):
         self.assertNotIn("LLM_Classified__c = false", soql)
         self.assertIn("Carrier_Leasing_Source__c LIKE '%PermittingSites%'", soql)
 
+    def test_blank_site_type_query_metro_comma_list_uses_in(self):
+        soql = build_blank_site_type_query(
+            metro_classification="Major NFL Metro, Tier 2 Target Metro"
+        )
+        self.assertIn(
+            "Metro_Classification__c IN ('Major NFL Metro', 'Tier 2 Target Metro')", soql
+        )
+        self.assertNotIn("Metro_Classification__c =", soql)
+
     def test_blank_site_type_query_can_omit_carrier(self):
         soql = build_blank_site_type_query(carrier_like=None)
         self.assertNotIn("Carrier_Leasing_Source__c LIKE", soql)

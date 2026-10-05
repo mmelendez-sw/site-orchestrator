@@ -133,7 +133,7 @@ def build_blank_site_type_query(
     `carrier_like` filters Carrier_Leasing_Source__c with LIKE '%value%'.
     Pass None/"" to skip the carrier filter (the default).
     `metro_classification` filters Metro_Classification__c with an exact
-    match (default Major NFL Metro). Pass None/"" to skip.
+    match, or IN (...) for a comma list. Pass None/"" to skip.
     `owners` None/empty omits the Owner__c IN-list (any owner).
     `exclude_owners` adds Owner__c NOT IN (...) and still includes blank owner.
     `states` filters Site_State__c IN (...); pass None/empty for all states.
@@ -181,9 +181,11 @@ def build_blank_site_type_query(
     if carrier:
         escaped = carrier.replace("\\", "\\\\").replace("'", "\\'")
         clauses.insert(1, f"Carrier_Leasing_Source__c LIKE '%{escaped}%'")
-    metro = (metro_classification or "").strip()
-    if metro:
-        clauses.insert(1, f"Metro_Classification__c = {_soql_quote(metro)}")
+    metros = [m.strip() for m in (metro_classification or "").split(",") if m.strip()]
+    if len(metros) == 1:
+        clauses.insert(1, f"Metro_Classification__c = {_soql_quote(metros[0])}")
+    elif metros:
+        clauses.insert(1, f"Metro_Classification__c IN ({_soql_in(metros)})")
     clean_states = [
         str(s).strip().upper() for s in (states or []) if str(s).strip()
     ]

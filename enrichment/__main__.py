@@ -23,10 +23,11 @@ stay classified true until you flip them back (blank Site_Type +
 LLM_Classified=true). Default DB-only stages: New/Unreviewed,
 Enhanced/Unreviewed, Outreach, Outreach - Verified, Marketing (any owner).
 Override stages with STAGES or LEAD_STAGES (comma-separated).
-Set OWNERS=none to drop the Owner__c IN-list (honored on Nearmap runs too).
+Owner__c and Metro_Classification__c are not filtered by default. Set
+OWNERS (comma list, e.g. Site Acquisition Team,Marketing Campaign) or
+METRO_CLASSIFICATION (e.g. Major NFL Metro) to scope a run.
 Set OWNERS_EXCLUDE to a comma list for Owner__c NOT IN (...).
 Set SITE_TYPE=any (or none) to drop the Site_Type filter (blank and typed).
-METRO_CLASSIFICATION=none includes every metro.
 LIMIT takes the first N remaining sites (stable ORDER BY Id). Processed
 rows leave the default queue via LLM_Classified=true; SKIP_FROM still
 skips prior-run Ids if you re-pull. Salesforce apply errors retry once
@@ -98,7 +99,6 @@ from enrichment.sf_ops import (  # noqa: E402
 from enrichment.constants import (  # noqa: E402
     CONFIRM_ROOFTOP_STAGE_FILTER,
     DB_ONLY_STAGE_FILTER,
-    DEFAULT_OWNER_FILTER,
     DEFAULT_STAGE_FILTER,
 )
 from paths import ensure_data_layout, runs_dir  # noqa: E402
@@ -253,14 +253,9 @@ def main() -> int:
     dequeue_default = (
         "0" if db_only or confirm_rooftop or confirm_existing else "1"
     )
-    owners = parse_owners(
-        os.environ.get("OWNERS"),
-        default=(
-            None
-            if db_only or confirm_rooftop or confirm_existing
-            else DEFAULT_OWNER_FILTER
-        ),
-    )
+    # Owner and metro filters are off by default; set OWNERS /
+    # METRO_CLASSIFICATION to scope a run.
+    owners = parse_owners(os.environ.get("OWNERS"), default=None)
     exclude_owners = parse_owners(
         os.environ.get("OWNERS_EXCLUDE"),
         default=None,
@@ -270,9 +265,7 @@ def main() -> int:
         default="any" if confirm_rooftop or confirm_existing else None,
     )
     metro_raw = os.environ.get("METRO_CLASSIFICATION")
-    metro_default = (
-        "none" if confirm_rooftop or confirm_existing else "Major NFL Metro"
-    )
+    metro_default = "none"
 
     if _flag("APPLY_EXISTING"):
         if not os.environ.get("RUN_DIR"):
