@@ -11,7 +11,13 @@ from classifier.evidence import (
     evidence_text,
     has_any,
 )
-from classifier.views import is_oblique_label, parse_box_2d
+from classifier.views import (
+    is_oblique_label,
+    is_state_ortho_label,
+    is_street_level_label,
+    parse_box_2d,
+)
+from envutil import env_flag
 from salesforce.site_type_mapping import (
     cell_equipment_confirmed,
     map_site_type_for_upload,
@@ -120,8 +126,39 @@ def _cell_gear_kind_ok(classified: dict[str, Any]) -> bool:
 
 
 def _rooftop_oblique_imagery_ok(classified: dict[str, Any]) -> bool:
-    """Rooftop SF writes require Nearmap oblique views (not NAIP/Vert-only)."""
-    return imagery_bucket(classified) == "nearmap_oblique"
+    """Rooftop SF writes require Nearmap oblique views (not NAIP/Vert-only).
+
+    With SUPPLEMENTAL_CAN_CONFIRM=1 a boxed street-level photo also counts
+    (``_street_confirm_source``).
+    """
+    if imagery_bucket(classified) == "nearmap_oblique":
+        return True
+    return _street_confirm_source(classified) is not None
+
+
+# Verified_Site_Source__c picklist value per street-level source. Mapillary has
+# no picklist value yet: those confirms hold out until an admin adds one.
+STREET_VERIFIED_SOURCES = {"streetview": "Google Map"}
+
+
+def _street_confirm_source(classified: dict[str, Any]) -> str | None:
+    """``streetview`` / ``mapillary`` when a street photo may confirm a rooftop.
+
+    Opt-in (SUPPLEMENTAL_CAN_CONFIRM=1, default off): the asset box must sit
+    on a street-level view. Dual-model agreement is still enforced by the
+    rooftop gates in ``bucket_classification``.
+    """
+    if not env_flag("SUPPLEMENTAL_CAN_CONFIRM", False):
+        return None
+    view = str(classified.get("asset_view") or "")
+    if not is_street_level_label(view) or not _compact_asset_box(classified):
+        return None
+    lower = view.lower()
+    if "street view" in lower or "google" in lower:
+        return "streetview"
+    if "mapillary" in lower:
+        return "mapillary"
+    return "street"
 
 
 def _has_asset_box(classified: dict[str, Any]) -> bool:
@@ -272,6 +309,8 @@ def _asset_view_is_nearmap_vert(classified: dict[str, Any]) -> bool:
     view = str(classified.get("asset_view") or "").strip().lower()
     if not view or "naip" in view:
         return False
+    if is_street_level_label(view) or is_state_ortho_label(view):
+        return False
     if "oblique" in view:
         return False
     if any(d in view for d in ("north", "east", "south", "west")):
@@ -331,8 +370,13 @@ def _rooftop_localization_box_ok(
     *,
     require_localized: bool = False,
 ) -> bool:
-    """Rooftop SF writes need a compact localization box on Nearmap imagery."""
+    """Rooftop SF writes need a compact localization box on Nearmap imagery.
+
+    Or, opt-in, on a street-level photo (SUPPLEMENTAL_CAN_CONFIRM=1).
+    """
     if _rooftop_oblique_box_ok(classified):
+        return True
+    if _street_confirm_source(classified) is not None:
         return True
     return _rooftop_vert_box_dual_agree_ok(
         classified, require_localized=require_localized
@@ -457,7 +501,10 @@ def bucket_classification(
     # at GEMINI_TOWER_SKIP_CLAUDE_CONF may write.
     if img_bucket == "naip":
         if site_type_raw == "rooftop":
-            if not _rooftop_cell_certain(classified):
+            # Opt-in street-level confirm takes the full rooftop gates below.
+            if _street_confirm_source(classified) is None and not _rooftop_cell_certain(
+                classified
+            ):
                 return _holdout(
                     BUCKET_ROOFTOP, "rooftop_not_certain_on_naip", classified
                 )
@@ -573,6 +620,18 @@ def bucket_classification(
     verified_source = verified_source_for_match(
         match_source, classified=classified
     )
+    street_source = _street_confirm_source(classified)
+    if (
+        site_type_raw == "rooftop"
+        and match_source == MATCH_SOURCE_NONE
+        and street_source is not None
+    ):
+        picklist = STREET_VERIFIED_SOURCES.get(street_source)
+        if not picklist:
+            return _holdout(
+                BUCKET_ROOFTOP, f"street_confirm_{street_source}_needs_picklist", classified
+            )
+        verified_source = picklist
     # Uncertain rooftops must never stamp Verified_Site_Source__c = NAIP.
     if (
         site_type_raw == "rooftop"
@@ -626,9 +685,12 @@ def _resolve_update_coords(
         pass
 
     # Nearmap (or other) box without geocode: pin is acceptable when the model
-    # drew an asset box on the pin-centered chip.
+    # drew an asset box on the pin-centered chip. Street photos are perspective
+    # views (no geocode), so their boxes keep the pin too.
     if require_asset_box and _parse_asset_box_2d(classified):
         if sf_lat is not None and sf_lng is not None:
+            if is_street_level_label(classified.get("asset_view")):
+                return sf_lat, sf_lng, "street_view_box_pin"
             return sf_lat, sf_lng, "nearmap_asset_box_pin"
         return None, None, "none"
 

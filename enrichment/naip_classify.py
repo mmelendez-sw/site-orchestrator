@@ -253,13 +253,43 @@ def _scout_found_candidate(ac: Any, res: dict) -> bool:
 
 
 def classify_site_imagery(**kwargs) -> dict[str, Any]:
-    """Classify one site; stamps the Nearmap spend meter onto the result."""
+    """Classify one site; stamps the Nearmap and supplemental meters onto the result."""
     from classifier import imagery
+    from classifier.sources import source_meter
 
-    with imagery.nearmap_meter() as meter:
+    with imagery.nearmap_meter(site_id=kwargs.get("site_id")) as meter, source_meter() as supplemental:
         result = _classify_site_imagery(**kwargs)
     result.update(meter.as_row())
+    result.update(supplemental.as_row())
     return result
+
+
+def _supplemental_for_site(
+    lat: float,
+    lon: float,
+    *,
+    site_id: str,
+    chip_dir: Path | None,
+    state: str | None,
+    verbose: bool,
+) -> list:
+    """Street-level / state-ortho views for this site (SUPPLEMENTAL_IMAGERY)."""
+    from classifier.sources import enabled_sources, fetch_supplemental_views
+
+    sources = enabled_sources()
+    if not sources:
+        return []
+    found = fetch_supplemental_views(
+        lat, lon, sources=sources, site_id=site_id, chip_dir=chip_dir, state=state
+    )
+    if verbose:
+        from enrichment import progress
+
+        progress.result(
+            f"supplemental imagery: {len(found)} view(s)"
+            + (f" ({', '.join(sorted({v.source for v in found}))})" if found else "")
+        )
+    return [(view.label, view.image) for view in found]
 
 
 def _classify_site_imagery(
@@ -279,6 +309,7 @@ def _classify_site_imagery(
     db_backed: bool = False,
     reuse_chips_dirs: list[Path] | None = None,
     presence_only: bool = False,
+    site_state: str | None = None,
 ) -> dict[str, Any]:
     """Classify one coordinate with the full Nearmap + bifurcated AI stack.
 
@@ -447,6 +478,16 @@ def _classify_site_imagery(
         img_date = (naip_meta or {}).get("image_date")
         naip_chip_m = (naip_meta or {}).get("naip_chip_m") or ac.CHIP_SIZE_M
 
+    # Supplemental views (state ortho, street-level) for the chosen anchor.
+    # Without SUPPLEMENTAL_CAN_CONFIRM they only join calls that already carry
+    # Nearmap views, so the buy-Nearmap decision is unchanged (evidence only).
+    supplemental_views: list = []
+    if not presence_only and not reuse_saved:
+        supplemental_views = _supplemental_for_site(
+            lat, lon, site_id=site_id, chip_dir=chip_dir, state=site_state, verbose=verbose
+        )
+    supplemental_can_confirm = ac._env_flag("SUPPLEMENTAL_CAN_CONFIRM", default="0")
+
     nearmap_views: dict = {}
     nearmap_date = None
     if reuse_saved and saved_pack is not None:
@@ -471,7 +512,7 @@ def _classify_site_imagery(
         }
 
     def build_views(nm_views, naip_img=None, chip_m=None):
-        return _labeled_views(
+        views_out = _labeled_views(
             ac,
             img if naip_img is None else naip_img,
             naip_chip_m if chip_m is None else chip_m,
@@ -479,6 +520,9 @@ def _classify_site_imagery(
             chip_dir=chip_dir,
             site_id=site_id,
         )
+        if supplemental_views and (nm_views or supplemental_can_confirm):
+            views_out = views_out + supplemental_views
+        return views_out
 
     chip_path = None
     if img is not None and chip_dir is not None:
@@ -1189,5 +1233,6 @@ def _classify_site_imagery(
         "image_date": img_date,
         "naip_year": (naip_meta or {}).get("naip_year"),
         "chip_path": str(chip_path) if chip_path else None,
+        "supplemental_views": " | ".join(label for label, _img in supplemental_views),
         "error": None,
     }

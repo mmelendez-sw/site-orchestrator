@@ -1,0 +1,37 @@
+[
+  {
+    "_comment": "Example STATE_ORTHO_SOURCES config. Point the env var at a copy of this file. The URLs below are FAKE placeholders (.invalid) - replace them with the real ArcGIS ImageServer / MapServer or WMS endpoint published by the state or county GIS office, after checking its terms of use. Objects without a 'url' (like this one) are ignored. The first entry matching the site's 2-letter state and/or whose bbox contains the point is used, so list specific entries (a county bbox) before state-wide ones. Fields: name (shown in logs/meta), states (2-letter codes), bbox ([minlon, minlat, maxlon, maxlat], optional; when set, only points inside match), type ('arcgis_image' -> {url}/exportImage, 'arcgis_map' -> {url}/export, 'wms' -> WMS 1.3.0 GetMap at {url}), url (service root, no trailing /exportImage or /export), layer (WMS LAYERS, or the ArcGIS MapServer layer id sent as layers=show:<id>; optional for ArcGIS), year (capture year, used in the model label), resolution_cm (nominal ground resolution), chip_m (ground width of the square chip in metres, default 120), px (output width/height in pixels, default 1024), token_env (optional name of an env var holding an ArcGIS token; the entry is skipped when that env var is empty)."
+  },
+  {
+    "name": "Example County 2023 WMS",
+    "states": [
+      "ZZ"
+    ],
+    "bbox": [
+      -100.5,
+      40.0,
+      -100.0,
+      40.5
+    ],
+    "type": "wms",
+    "url": "https://example-county-gis.invalid/geoserver/ows",
+    "layer": "imagery:ortho_2023",
+    "year": 2023,
+    "resolution_cm": 7.5,
+    "chip_m": 100,
+    "px": 1024,
+    "token_env": "EXAMPLE_COUNTY_GIS_TOKEN"
+  },
+  {
+    "name": "Example State 2024 leaf-off",
+    "states": [
+      "ZZ"
+    ],
+    "type": "arcgis_image",
+    "url": "https://example-state-gis.invalid/arcgis/rest/services/Ortho_2024/ImageServer",
+    "year": 2024,
+    "resolution_cm": 15,
+    "chip_m": 120,
+    "px": 1024
+  }
+]
