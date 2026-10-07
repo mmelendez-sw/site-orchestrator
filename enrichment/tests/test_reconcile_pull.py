@@ -164,3 +164,34 @@ class FillFromLedgerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BridgeStockTests(unittest.TestCase):
+    def test_audit_stock_is_preferred_over_bridge(self):
+        losses = [Loss("J1", JEREMY, "Jeremy Scott", "NY", "pull"),
+                  Loss("J2", JEREMY, "Jeremy Scott", "NY", "pull")]
+        stock = [Stock("A_TX", "TX"), Stock("B_NY", "NY", "bridge"), Stock("A_NY", "NY")]
+        plan = plan_swaps(losses, stock)
+        self.assertEqual(
+            [(r["replacement_id"], r["stock_source"]) for r in plan],
+            [("A_NY", "audit"), ("B_NY", "bridge")],
+        )
+
+    def test_bridge_stock_allows_its_stages_only(self):
+        class SF:
+            def query_all(self, soql):
+                if "FROM User" in soql:
+                    return {"records": []}
+                return {"records": [
+                    {"Id": "B_OV", "OwnerId": POOL, "Stage__c": "Outreach - Verified",
+                     "Site_Type__c": "Rooftop"},
+                    {"Id": "B_MKT", "OwnerId": POOL, "Stage__c": "Marketing",
+                     "Site_Type__c": "Rooftop"},
+                    {"Id": "A_OV", "OwnerId": POOL, "Stage__c": "Outreach - Verified",
+                     "Site_Type__c": "Rooftop"},
+                ]}
+
+        stock = [Stock("B_OV", "NY", "bridge"), Stock("B_MKT", "NY", "bridge"),
+                 Stock("A_OV", "NY")]
+        _losses, kept, _notes = filter_live(SF(), [], stock, POOL)
+        self.assertEqual([s.site_id for s in kept], ["B_OV"])

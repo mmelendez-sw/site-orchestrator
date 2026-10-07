@@ -24,6 +24,9 @@ site if confirmed, else the same Site_State__c, else any state. A fill sets
 ``swaps/<stamp>_swap_plan.csv`` and prints owed / filled / planned / open per
 rep; applied fills append to ``swaps/swap_ledger.csv`` so no slot or stock
 site is used twice. Optional: ``SWAP_LIMIT`` (max fills), ``SWAP_REPS``.
+``SWAP_BRIDGE=1`` adds bridge stock: pool-owned, LLM_Classified non-ConnectX
+Rooftops in New/Unreviewed, Enhanced/Unreviewed, Outreach, or Outreach -
+Verified (stage kept). ConnectX audit stock is still preferred.
 """
 
 from __future__ import annotations
@@ -63,6 +66,7 @@ LEDGER_COLUMNS = (
     "lost_state",
     "replacement_id",
     "replacement_state",
+    "stock_source",
     "match",
     "status",
     "error",
@@ -83,6 +87,12 @@ class Loss:
 class Stock:
     site_id: str
     state: str
+    source: str = "audit"  # audit (ConnectX confirmed) | bridge (non-ConnectX rooftop)
+
+
+# Bridge stock (SWAP_BRIDGE=1): pool-owned, LLM_Classified non-ConnectX rooftops
+# in these stages, unworked first. Already verified by earlier enrichment runs.
+BRIDGE_STAGES = ("New/Unreviewed", "Enhanced/Unreviewed", "Outreach", "Outreach - Verified")
 
 
 def swaps_dir() -> Path:
@@ -196,7 +206,11 @@ def plan_swaps(
     same state, else any remaining stock. Sites that are themselves owed are
     reserved for their own rep.
     """
-    available = [s for s in stock if s.site_id not in used_stock]
+    # ConnectX-confirmed (audit) stock before bridge stock; stable otherwise.
+    available = sorted(
+        (s for s in stock if s.site_id not in used_stock),
+        key=lambda s: s.source == "bridge",
+    )
     open_losses = [l for l in losses if l.lost_id not in used_losses]
     owed_ids = {l.lost_id[:15] for l in open_losses}
     plan: list[dict[str, str]] = []
@@ -229,6 +243,7 @@ def _plan_row(loss: Loss, pick: Stock | None, match: str) -> dict[str, str]:
         "source": loss.source,
         "replacement_id": pick.site_id if pick else "",
         "replacement_state": pick.state if pick else "",
+        "stock_source": pick.source if pick else "",
         "match": match,
         "status": "planned" if pick else "waiting",
         "error": "",
@@ -270,6 +285,25 @@ def _query_by_ids(sf, soql_head: str, ids: Sequence[str]) -> dict[str, dict]:
         for rec in sf.query_all(f"{soql_head} WHERE Id IN ({quoted})")["records"]:
             out[rec["Id"][:15]] = rec
     return out
+
+
+def query_bridge_stock(sf, pool_owner_id: str) -> list[Stock]:
+    """Pool-owned, LLM_Classified non-ConnectX Rooftops in BRIDGE_STAGES."""
+    stages = ",".join(f"'{s}'" for s in BRIDGE_STAGES)
+    recs = sf.query_all(
+        "SELECT Id, Site_State__c, Stage__c FROM Site__c "
+        f"WHERE OwnerId = '{pool_owner_id}' AND LLM_Classified__c = true "
+        "AND Site_Type__c = 'Rooftop' "
+        "AND (Carrier_Leasing_Source__c = null OR (NOT Carrier_Leasing_Source__c LIKE '%ConnectX%')) "
+        f"AND Stage__c IN ({stages}) ORDER BY Id"
+    )["records"]
+    rank = {stage: i for i, stage in enumerate(BRIDGE_STAGES)}
+    recs.sort(key=lambda r: rank.get(r.get("Stage__c"), len(rank)))
+    return [
+        Stock(site_id=r["Id"], state=str(r.get("Site_State__c") or "").strip().upper(),
+              source="bridge")
+        for r in recs
+    ]
 
 
 def filter_live(
@@ -314,15 +348,16 @@ def filter_live(
     kept_stock = []
     for item in stock:
         rec = live_stock.get(item.site_id[:15])
+        stages = BRIDGE_STAGES if item.source == "bridge" else (REPLACEMENT_STAGE,)
         if (
             rec is not None
             and str(rec.get("OwnerId") or "")[:15] == pool_owner_id[:15]
-            and rec.get("Stage__c") == REPLACEMENT_STAGE
+            and rec.get("Stage__c") in stages
             and rec.get("Site_Type__c") == "Rooftop"
         ):
             kept_stock.append(item)
         else:
-            notes.append(f"stock {item.site_id}: no longer a pool New/Unreviewed Rooftop")
+            notes.append(f"stock {item.site_id}: no longer an eligible pool Rooftop")
     return kept_losses, kept_stock, notes
 
 
@@ -385,6 +420,7 @@ def main() -> int:
         losses = [l for l in losses if l.rep_name.lower() in reps]
     stock = collect_stock(rows, pool_owner_id)
     ledger_path = swaps_dir() / LEDGER_CSV
+    bridge = (os.environ.get("SWAP_BRIDGE") or "").strip().lower() in {"1", "true", "yes"}
     ledger = [r for r in read_ledger(ledger_path) if r.get("status") == "applied"]
     used_losses = {r["lost_id"] for r in ledger}
     used_stock = {r["replacement_id"] for r in ledger}
@@ -395,6 +431,11 @@ def main() -> int:
     )
 
     sf = SalesforceClient().sf
+    if bridge:
+        audit_ids = {s.site_id[:15] for s in stock}
+        extra = [b for b in query_bridge_stock(sf, pool_owner_id) if b.site_id[:15] not in audit_ids]
+        print(f"bridge stock (non-ConnectX rooftops): {len(extra)}", flush=True)
+        stock = stock + extra  # audit stock first: matching prefers it
     losses_all = list(losses)
     losses = [l for l in losses if l.lost_id not in used_losses]
     stock = [s for s in stock if s.site_id not in used_stock]
