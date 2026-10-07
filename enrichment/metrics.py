@@ -16,7 +16,10 @@ from __future__ import annotations
 
 import json
 import os
+import threading
+import time
 from collections import Counter
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -562,30 +565,248 @@ def refresh_kpis_from_ledger(*, root: Path | None = None, write: bool = True) ->
 NEARMAP_USAGE_JSONL = "nearmap_usage.jsonl"
 
 
+NEARMAP_PURCHASES_JSONL = "nearmap_purchases.jsonl"
+# Usage rows written by code that also logs every purchase to the purchases
+# ledger carry this flag; the shared budget counts only UNflagged usage rows
+# (legacy / old-version lanes) on top of the purchases ledger, so no byte is
+# counted twice and lanes still on old code keep being counted.
+USAGE_IN_PURCHASES_KEY = "in_purchases_ledger"
+
+
+def _utc_stamp(now: datetime | None = None) -> str:
+    return (now or datetime.now(timezone.utc)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _month_of(rec: dict[str, Any]) -> str:
+    return str(rec.get("at") or "")[:7]
+
+
 def record_nearmap_usage(run_id: str, row: dict[str, Any]) -> None:
-    """Append one site's billed Nearmap bytes (every run, dry runs included)."""
+    """Append one site's billed Nearmap bytes (every run, dry runs included).
+
+    The same bytes were already logged purchase by purchase in
+    ``nearmap_purchases.jsonl`` (see ``classifier.imagery.NearmapBudget``),
+    so the row is flagged ``in_purchases_ledger``.
+    """
     nbytes = _int_or_zero(row.get("nearmap_bytes"))
     if not nbytes:
         return
-    _append_jsonl(
+    append_jsonl_line(
         metrics_dir() / NEARMAP_USAGE_JSONL,
-        [{
-            "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        {
+            "at": _utc_stamp(),
             "run_id": run_id,
             "Id": str(row.get("Id") or ""),
             "bytes": nbytes,
             "tiles": _int_or_zero(row.get("nearmap_tiles")),
-        }],
+            USAGE_IN_PURCHASES_KEY: True,
+        },
     )
 
 
 def month_to_date_nearmap_bytes(*, now: datetime | None = None, root: Path | None = None) -> int:
-    """Billed Nearmap bytes this calendar month (UTC), from the usage ledger."""
+    """Billed Nearmap bytes this calendar month (UTC), from the usage ledger.
+
+    Per-site reporting figure (written when a site finishes). The budget uses
+    ``shared_month_to_date_nearmap_bytes`` (per-purchase, all lanes).
+    """
     month = (now or datetime.now(timezone.utc)).strftime("%Y-%m")
     return sum(
         _int_or_zero(rec.get("bytes"))
         for rec in _read_jsonl((root or metrics_dir()) / NEARMAP_USAGE_JSONL)
         if str(rec.get("at") or "").startswith(month)
+    )
+
+
+# --------------------- shared Nearmap purchases ledger ----------------------
+
+_O_BINARY = getattr(os, "O_BINARY", 0)
+_APPEND_LOCK = threading.Lock()   # threads of this process; the file lock covers processes
+_FILE_LOCK_TIMEOUT_S = 30.0
+
+
+@contextmanager
+def _interprocess_lock(lock_path: Path, timeout_s: float = _FILE_LOCK_TIMEOUT_S):
+    """Exclusive lock on a sidecar file (msvcrt on Windows, flock elsewhere).
+
+    The OS drops the lock if the holder dies. Raises OSError after
+    ``timeout_s``.
+    """
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT | _O_BINARY, 0o666)
+    try:
+        deadline = time.monotonic() + timeout_s
+        if os.name == "nt":
+            import msvcrt
+
+            while True:
+                os.lseek(fd, 0, os.SEEK_SET)
+                try:
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.01)
+            try:
+                yield
+            finally:
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.01)
+            try:
+                yield
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def append_jsonl_line(path: Path, rec: dict[str, Any]) -> None:
+    """Append one JSON line, safe across threads AND processes.
+
+    O_APPEND + one ``os.write`` of the whole line, under a sidecar lock file
+    (Windows' O_APPEND is a seek-then-write emulation, so the lock is what
+    keeps parallel lanes from interleaving). Raises OSError on failure.
+    """
+    line = (json.dumps(rec, ensure_ascii=True, separators=(",", ":")) + "\n").encode("ascii")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _APPEND_LOCK, _interprocess_lock(path.with_name(path.name + ".lock")):
+        fd = os.open(str(path), os.O_WRONLY | os.O_APPEND | os.O_CREAT | _O_BINARY, 0o666)
+        try:
+            view = memoryview(line)
+            while view:
+                written = os.write(fd, view)
+                if written <= 0:
+                    raise OSError(f"short write to {path}")
+                view = view[written:]
+        finally:
+            os.close(fd)
+
+
+def record_nearmap_purchase(
+    nbytes: int,
+    *,
+    purpose: str,
+    proc: str,
+    run_id: str | None = None,
+    site_id: str | None = None,
+    tiles: int | None = None,
+    at: str | None = None,
+    root: Path | None = None,
+) -> dict[str, Any]:
+    """Append one billed Nearmap purchase (dry runs included: they are billed)."""
+    rec: dict[str, Any] = {
+        "at": at or _utc_stamp(),
+        "pid": os.getpid(),
+        "proc": proc,
+        "run_id": run_id or None,
+        "site_id": site_id or None,
+        "purpose": purpose,
+        "bytes": max(0, int(nbytes)),
+    }
+    if tiles is not None:
+        rec["tiles"] = int(tiles)
+    append_jsonl_line((root or metrics_dir()) / NEARMAP_PURCHASES_JSONL, rec)
+    return rec
+
+
+class JsonlTail:
+    """Incremental reader: each ``read_new`` returns only rows appended since.
+
+    Only complete lines are consumed (a writer mid-append is picked up next
+    time). If the file shrinks (rewritten / rotated) it restarts from 0 and
+    ``read_new`` reports ``reset=True`` so callers drop their totals.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.offset = 0
+
+    def read_new(self) -> tuple[list[dict[str, Any]], bool]:
+        reset = False
+        try:
+            size = self.path.stat().st_size
+        except OSError:
+            size = 0
+        if size < self.offset:
+            self.offset, reset = 0, True
+        if size == self.offset:
+            return [], reset
+        try:
+            with self.path.open("rb") as handle:
+                handle.seek(self.offset)
+                chunk = handle.read(size - self.offset)
+        except OSError:
+            return [], reset
+        end = chunk.rfind(b"\n")
+        if end < 0:
+            return [], reset
+        self.offset += end + 1
+        rows: list[dict[str, Any]] = []
+        for raw in chunk[: end + 1].splitlines():
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                rec = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if isinstance(rec, dict):
+                rows.append(rec)
+        return rows, reset
+
+
+def is_legacy_usage_row(rec: dict[str, Any]) -> bool:
+    """Usage row whose bytes are NOT in the purchases ledger (pre-ledger code)."""
+    return not rec.get(USAGE_IN_PURCHASES_KEY)
+
+
+def read_nearmap_purchases(*, root: Path | None = None) -> list[dict[str, Any]]:
+    return _read_jsonl((root or metrics_dir()) / NEARMAP_PURCHASES_JSONL)
+
+
+def month_to_date_nearmap_purchase_bytes(
+    *, now: datetime | None = None, root: Path | None = None
+) -> int:
+    """Billed Nearmap bytes this month (UTC) from the per-purchase ledger."""
+    month = (now or datetime.now(timezone.utc)).strftime("%Y-%m")
+    return sum(
+        _int_or_zero(rec.get("bytes"))
+        for rec in read_nearmap_purchases(root=root)
+        if _month_of(rec) == month
+    )
+
+
+def legacy_month_to_date_nearmap_bytes(
+    *, now: datetime | None = None, root: Path | None = None
+) -> int:
+    """This month's usage-ledger bytes the purchases ledger does not cover."""
+    month = (now or datetime.now(timezone.utc)).strftime("%Y-%m")
+    return sum(
+        _int_or_zero(rec.get("bytes"))
+        for rec in _read_jsonl((root or metrics_dir()) / NEARMAP_USAGE_JSONL)
+        if _month_of(rec) == month and is_legacy_usage_row(rec)
+    )
+
+
+def shared_month_to_date_nearmap_bytes(
+    *, now: datetime | None = None, root: Path | None = None
+) -> int:
+    """Fleet-wide month-to-date Nearmap bytes: legacy usage + purchases."""
+    return (
+        legacy_month_to_date_nearmap_bytes(now=now, root=root)
+        + month_to_date_nearmap_purchase_bytes(now=now, root=root)
     )
 
 

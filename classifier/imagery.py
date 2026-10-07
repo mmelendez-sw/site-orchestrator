@@ -21,10 +21,13 @@ import io
 import json
 import logging
 import math
+import os
 import threading
+import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -482,7 +485,8 @@ OPTIONAL_PURPOSES = frozenset({"wide", "second", "recenter", "oblique_extra"})
 class NearmapMeter:
     """Per-site Nearmap spend: billed bytes/tiles, cache hits, by purpose."""
 
-    def __init__(self) -> None:
+    def __init__(self, site_id: str | None = None) -> None:
+        self.site_id = site_id
         self.bytes = 0
         self.tiles = 0
         self.cache_hits = 0
@@ -512,10 +516,13 @@ _meter_local = threading.local()
 
 
 @contextmanager
-def nearmap_meter() -> Iterator[NearmapMeter]:
-    """Meter every Nearmap purchase made on this thread (one site)."""
+def nearmap_meter(site_id: str | None = None) -> Iterator[NearmapMeter]:
+    """Meter every Nearmap purchase made on this thread (one site).
+
+    ``site_id`` (optional) tags this site's rows in the purchases ledger.
+    """
     prior = getattr(_meter_local, "meter", None)
-    meter = NearmapMeter()
+    meter = NearmapMeter(site_id=site_id)
     _meter_local.meter = meter
     try:
         yield meter
@@ -530,34 +537,193 @@ def _current_meter() -> NearmapMeter | None:
 class NearmapBudget:
     """Month-to-date Nearmap bytes vs ``NEARMAP_MONTHLY_BUDGET_MB`` (0 = off).
 
-    The pipeline seeds ``spent`` from the usage ledger at run start; every
-    billed tile adds to it live, so all workers see the same total. Checks
-    happen per view, so concurrent workers can overshoot by at most a few
-    views (~0.5 MB each).
+    Checks happen per view, so concurrent workers can overshoot by at most a
+    few views (~0.5 MB each) plus what other lanes bought within one refresh
+    interval.
+
+    Local mode (``shared=False``, plain constructor): ``seed`` sets the total
+    and ``add`` grows it; nothing touches disk.
+
+    Shared mode (``BUDGET``, built by ``from_env``): every ``add`` appends a
+    row to ``metrics/nearmap_purchases.jsonl`` (inter-process-safe), and
+    ``spent`` is the fleet-wide figure re-read from disk at most every
+    ``NEARMAP_BUDGET_REFRESH_S`` (incremental tail, so a refresh only parses
+    new rows)::
+
+        spent = usage-ledger bytes this month NOT flagged in_purchases_ledger
+                (legacy rows / lanes still on old code)
+              + purchases-ledger bytes this month (every lane, dry runs too)
+              + this process's purchases not yet read back from disk
+              + off-ledger prior use (``seed`` / ``set_prior_bytes``, this month)
+
+    ``seed(x)`` keeps its old contract (``x`` = usage-ledger month-to-date +
+    NEARMAP_PRIOR_USE_MB): the part of ``x`` above the usage ledger becomes
+    the prior-use offset; the ledger part is already counted from disk.
     """
 
-    def __init__(self, limit_mb: float, soft_pct: float) -> None:
+    def __init__(self, limit_mb: float, soft_pct: float, *, shared: bool = False,
+                 root: Path | str | None = None, refresh_s: float | None = None,
+                 clock=None, now=None) -> None:
         self.limit_bytes = int(limit_mb * 1024 * 1024) if limit_mb > 0 else 0
         self.soft_bytes = int(self.limit_bytes * max(0.0, min(1.0, soft_pct / 100.0)))
+        self.shared = bool(shared)
+        self.refresh_s = max(0.0, float(
+            env_float("NEARMAP_BUDGET_REFRESH_S", 5) if refresh_s is None else refresh_s
+        ))
+        # Tags this process's purchase rows (pid alone can be recycled).
+        self.proc = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
+        self.run_id: str | None = None
+        self.write_failures = 0
+        self._root = Path(root) if root is not None else None
+        self._clock = clock or time.monotonic
+        self._now = now or (lambda: datetime.now(timezone.utc))
         self._spent = 0
         self._lock = threading.Lock()
+        # Shared-mode state (per "YYYY-MM").
+        self._tails: tuple[Any, Any] | None = None
+        self._tails_root: Path | None = None
+        self._purchased: dict[str, int] = {}
+        self._legacy: dict[str, int] = {}
+        self._usage_all: dict[str, int] = {}
+        self._own_unread: dict[str, int] = {}
+        self._prior: tuple[str, int] = ("", 0)
+        self._last_refresh: float | None = None
 
     @classmethod
     def from_env(cls) -> "NearmapBudget":
-        return cls(env_float("NEARMAP_MONTHLY_BUDGET_MB", 1500), env_float("NEARMAP_BUDGET_SOFT_PCT", 90))
+        return cls(
+            env_float("NEARMAP_MONTHLY_BUDGET_MB", 1500),
+            env_float("NEARMAP_BUDGET_SOFT_PCT", 90),
+            shared=True,
+        )
+
+    # ---- shared ledger plumbing ----
+
+    def ledger_root(self) -> Path:
+        if self._root is not None:
+            return self._root
+        from enrichment import metrics
+
+        return metrics.metrics_dir()
+
+    def _month(self) -> str:
+        return self._now().strftime("%Y-%m")
+
+    def _refresh_locked(self, *, force: bool = False) -> None:
+        tick = self._clock()
+        if (not force and self._last_refresh is not None
+                and tick - self._last_refresh < self.refresh_s):
+            return
+        from enrichment import metrics
+
+        root = self.ledger_root()
+        if self._tails is None or self._tails_root != root:
+            self._tails_root = root
+            self._tails = (
+                metrics.JsonlTail(root / metrics.NEARMAP_PURCHASES_JSONL),
+                metrics.JsonlTail(root / metrics.NEARMAP_USAGE_JSONL),
+            )
+            self._purchased.clear()
+            self._legacy.clear()
+            self._usage_all.clear()
+        purchases, usage = self._tails
+        rows, reset = purchases.read_new()
+        if reset:
+            self._purchased.clear()
+        for rec in rows:
+            month, nbytes = str(rec.get("at") or "")[:7], _ledger_int(rec.get("bytes"))
+            self._purchased[month] = self._purchased.get(month, 0) + nbytes
+            if rec.get("proc") == self.proc:
+                self._own_unread[month] = max(0, self._own_unread.get(month, 0) - nbytes)
+        rows, reset = usage.read_new()
+        if reset:
+            self._legacy.clear()
+            self._usage_all.clear()
+        for rec in rows:
+            month, nbytes = str(rec.get("at") or "")[:7], _ledger_int(rec.get("bytes"))
+            self._usage_all[month] = self._usage_all.get(month, 0) + nbytes
+            if metrics.is_legacy_usage_row(rec):
+                self._legacy[month] = self._legacy.get(month, 0) + nbytes
+        self._last_refresh = tick
+
+    def _shared_total_locked(self) -> int:
+        month = self._month()
+        total = (
+            self._legacy.get(month, 0)
+            + self._purchased.get(month, 0)
+            + self._own_unread.get(month, 0)
+        )
+        if self._prior[0] == month:
+            total += self._prior[1]
+        return total
+
+    def refresh(self) -> int:
+        """Force a re-read of the shared ledgers now; returns ``spent``."""
+        with self._lock:
+            if self.shared:
+                self._refresh_locked(force=True)
+                return self._shared_total_locked()
+            return self._spent
+
+    # ---- public API ----
 
     @property
     def spent(self) -> int:
         with self._lock:
-            return self._spent
+            if not self.shared:
+                return self._spent
+            self._refresh_locked()
+            return self._shared_total_locked()
 
     def seed(self, month_to_date_bytes: int) -> None:
+        """Local: set the total. Shared: keep the excess over the usage ledger
+        (e.g. NEARMAP_PRIOR_USE_MB) as this month's off-ledger prior use."""
         with self._lock:
-            self._spent = max(0, int(month_to_date_bytes))
+            if not self.shared:
+                self._spent = max(0, int(month_to_date_bytes))
+                return
+            self._refresh_locked(force=True)
+            month = self._month()
+            excess = int(month_to_date_bytes) - self._usage_all.get(month, 0)
+            self._prior = (month, max(0, excess))
 
-    def add(self, nbytes: int) -> None:
+    def set_prior_bytes(self, nbytes: int) -> None:
+        """Off-ledger Nearmap use this month (shared mode's NEARMAP_PRIOR_USE_MB)."""
         with self._lock:
-            self._spent += max(0, int(nbytes))
+            if not self.shared:
+                self._spent = max(0, int(nbytes))
+                return
+            self._prior = (self._month(), max(0, int(nbytes)))
+
+    def add(self, nbytes: int, *, purpose: str = "pack", site_id: str | None = None,
+            tiles: int | None = None) -> None:
+        nbytes = max(0, int(nbytes))
+        if not self.shared:
+            with self._lock:
+                self._spent += nbytes
+            return
+        if not nbytes:
+            return
+        at = self._now().strftime("%Y-%m-%dT%H:%M:%SZ")
+        month = at[:7]
+        with self._lock:
+            # Counted locally first; the refresh that reads the row back
+            # moves it from _own_unread to _purchased (never double counted).
+            self._own_unread[month] = self._own_unread.get(month, 0) + nbytes
+        try:
+            from enrichment import metrics
+
+            metrics.record_nearmap_purchase(
+                nbytes, purpose=purpose, proc=self.proc, run_id=self.run_id,
+                site_id=site_id, tiles=tiles, at=at, root=self.ledger_root(),
+            )
+        except OSError as exc:
+            with self._lock:
+                self.write_failures += 1
+            logger.warning(
+                "Nearmap purchase (%s bytes) not written to the shared ledger "
+                "(%s); counted by this process only", nbytes, exc,
+            )
 
     def allows(self, purpose: str) -> bool:
         if not self.limit_bytes:
@@ -568,13 +734,22 @@ class NearmapBudget:
         return not (purpose in OPTIONAL_PURPOSES and spent >= self.soft_bytes)
 
     def describe(self) -> str:
-        if not self.limit_bytes:
-            return "Nearmap budget: off (NEARMAP_MONTHLY_BUDGET_MB=0)"
         mb = 1024 * 1024
+        scope = " across all lanes" if self.shared else ""
+        if not self.limit_bytes:
+            used = f" ({self.spent / mb:.0f} MB used this month{scope})" if self.shared else ""
+            return f"Nearmap budget: off (NEARMAP_MONTHLY_BUDGET_MB=0){used}"
         return (
-            f"Nearmap budget: {self.spent / mb:.0f} of {self.limit_bytes / mb:.0f} MB used this month "
-            f"(optional purchases stop at {self.soft_bytes / mb:.0f} MB)"
+            f"Nearmap budget: {self.spent / mb:.0f} of {self.limit_bytes / mb:.0f} MB used this month"
+            f"{scope} (optional purchases stop at {self.soft_bytes / mb:.0f} MB)"
         )
+
+
+def _ledger_int(value: Any) -> int:
+    try:
+        return max(0, int(float(value)))
+    except (TypeError, ValueError):
+        return 0
 
 
 BUDGET = NearmapBudget.from_env()
@@ -601,7 +776,12 @@ def _stitch_view(lat: float, lon: float, chip_m: float, view: str,
     billed = meter.record(purpose, tiles) if meter is not None else sum(
         len(data) for data, cached in tiles if data and not cached
     )
-    BUDGET.add(billed)
+    BUDGET.add(
+        billed,
+        purpose=purpose,
+        site_id=meter.site_id if meter is not None else None,
+        tiles=sum(1 for data, cached in tiles if data and not cached),
+    )
 
     got_any = False
     for (tx, ty), (data, _cached) in zip(coords, tiles):

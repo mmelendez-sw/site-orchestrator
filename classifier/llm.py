@@ -17,6 +17,7 @@ import io
 import json
 import logging
 import random
+import re
 import threading
 import time
 from typing import Any
@@ -135,11 +136,106 @@ def _gemini_http_status(exc: Exception) -> int | None:
         if isinstance(value, int):
             return value
     message = str(exc)
-    if " 429 " in message or "429" in message[:8]:
+    match = _STATUS_IN_MESSAGE.search(message)
+    if match:
+        return int(match.group(1))
+    if "429" in message[:8] or "RESOURCE_EXHAUSTED" in message:
         return 429
-    if " 503 " in message:
+    if _UNAVAILABLE_IN_MESSAGE.search(message):
         return 503
     return None
+
+
+# "503 UNAVAILABLE. {...}", "Error 429: ...", "(503)": a bare 429/503 token at
+# the start of the message or after a space / bracket / colon / quote.
+_STATUS_IN_MESSAGE = re.compile(r"(?:^|[\s(\[:'\"])(429|503)(?=$|[\s.,;:)\]'\"])")
+# Google RPC status name (upper case only, so prose like "temporarily
+# unavailable" in an unrelated error does not match).
+_UNAVAILABLE_IN_MESSAGE = re.compile(r"\bUNAVAILABLE\b")
+
+
+def is_gemini_overload(exc: BaseException) -> bool:
+    """True for a Gemini rate limit (429) or "high demand" outage (503)."""
+    return isinstance(exc, Exception) and _gemini_http_status(exc) in (429, 503)
+
+
+class GeminiFallbackBreaker:
+    """Process-wide circuit breaker: primary Gemini model -> fallback model.
+
+    Kept per primary model. After ``after`` consecutive final 429/503
+    failures (each one already exhausted ``GEMINI_RETRIES``) the circuit
+    opens and calls go straight to the fallback for ``cooldown_s``. When the
+    cooldown ends ONE caller probes the primary (half-open) while the rest
+    keep using the fallback; a probe success closes the circuit, a probe
+    overload re-opens it for another cooldown. Thread-safe.
+    """
+
+    PRIMARY = "primary"
+    PROBE = "probe"
+    FALLBACK = "fallback"
+
+    def __init__(self, clock=None) -> None:
+        self._clock = clock or time.monotonic
+        self._lock = threading.Lock()
+        self._failures: dict[str, int] = {}
+        self._open_until: dict[str, float] = {}
+        self._probing: set[str] = set()
+
+    def route(self, primary: str) -> str:
+        """PRIMARY (closed), PROBE (this caller tests the primary) or FALLBACK."""
+        with self._lock:
+            until = self._open_until.get(primary)
+            if until is None:
+                return self.PRIMARY
+            if self._clock() < until or primary in self._probing:
+                return self.FALLBACK
+            self._probing.add(primary)
+            return self.PROBE
+
+    def is_open(self, primary: str) -> bool:
+        with self._lock:
+            return primary in self._open_until
+
+    def record_success(self, primary: str) -> None:
+        with self._lock:
+            was_open = primary in self._open_until
+            self._failures.pop(primary, None)
+            self._open_until.pop(primary, None)
+            self._probing.discard(primary)
+        if was_open:
+            logger.warning("Gemini %s answered again — fallback circuit closed", primary)
+
+    def record_overload(self, primary: str, *, after: int, cooldown_s: float,
+                        fallback: str) -> bool:
+        """Count one final primary overload. True when the circuit (re)opens."""
+        with self._lock:
+            probe = primary in self._probing
+            self._probing.discard(primary)
+            failures = self._failures.get(primary, 0) + 1
+            self._failures[primary] = failures
+            if not probe and failures < max(1, after):
+                return False
+            self._open_until[primary] = self._clock() + max(0.0, cooldown_s)
+        logger.warning(
+            "Gemini %s still overloaded after %s consecutive final failure(s) — "
+            "routing every call to %s for %.0fs, then probing %s again",
+            primary, failures, fallback, cooldown_s, primary,
+        )
+        return True
+
+    def release_probe(self, primary: str) -> None:
+        """A probe ended in a non-overload error: let the next caller probe."""
+        with self._lock:
+            self._probing.discard(primary)
+
+    def reset(self) -> None:
+        with self._lock:
+            self._failures.clear()
+            self._open_until.clear()
+            self._probing.clear()
+
+
+GEMINI_FALLBACK_BREAKER = GeminiFallbackBreaker()
 
 
 def _gemini_retry_after_s(exc: Exception) -> float | None:

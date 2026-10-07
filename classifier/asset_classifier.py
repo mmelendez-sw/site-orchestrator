@@ -1260,20 +1260,80 @@ def _gemini_generate_config(
     return genai_types.GenerateContentConfig(**kwargs)
 
 
+def _gemini_fallback_settings() -> tuple[str, int, int, float]:
+    """(GEMINI_FALLBACK_MODEL, _RETRIES, _AFTER, _COOLDOWN_S), read per call."""
+    return (
+        env_str("GEMINI_FALLBACK_MODEL", ""),
+        max(0, int(env_float("GEMINI_FALLBACK_RETRIES", 3))),
+        max(1, int(env_float("GEMINI_FALLBACK_AFTER", 2))),
+        max(0.0, env_float("GEMINI_FALLBACK_COOLDOWN_S", 300)),
+    )
+
+
+def _gemini_call_model(client: genai.Client, contents: list, schema: dict,
+                       model: str, retries: int | None) -> dict:
+    """One model's call; the config is rebuilt for that model's family."""
+    return llm.call_gemini_json(
+        client,
+        contents,
+        model=model,
+        config=_gemini_generate_config(schema, model=model),
+        retries=retries,
+    )
+
+
 def _call_gemini_json(client: genai.Client, contents: list, schema: dict,
                       retries: int | None = None,
                       model: str | None = None) -> dict:
-    """Gemini vision call with structured JSON output (single model)."""
+    """Gemini vision call with structured JSON output.
+
+    With ``GEMINI_FALLBACK_MODEL`` set (and different from the primary), a
+    primary call that still fails with 429/503 after ``GEMINI_RETRIES`` is
+    re-sent to the fallback (``GEMINI_FALLBACK_RETRIES``); the reply carries
+    ``model`` = fallback and ``model_fallback`` = True. After
+    ``GEMINI_FALLBACK_AFTER`` consecutive final primary failures the
+    process-wide breaker sends calls straight to the fallback for
+    ``GEMINI_FALLBACK_COOLDOWN_S`` before one call probes the primary again.
+    Other errors (and fallback failures) raise as before.
+    """
     use_model = model or GEMINI_MODEL
-    res = llm.call_gemini_json(
-        client,
-        contents,
-        model=use_model,
-        config=_gemini_generate_config(schema, model=use_model),
-        retries=retries,
-    )
+    fallback, fb_retries, fb_after, fb_cooldown = _gemini_fallback_settings()
+    if not fallback or fallback == use_model:
+        res = _gemini_call_model(client, contents, schema, use_model, retries)
+        normalize_model_result(res)
+        res["model"] = use_model
+        return res
+
+    breaker = llm.GEMINI_FALLBACK_BREAKER
+    route = breaker.route(use_model)
+    if route == breaker.FALLBACK:
+        res = _gemini_call_model(client, contents, schema, fallback, fb_retries)
+    else:
+        try:
+            res = _gemini_call_model(client, contents, schema, use_model, retries)
+        except Exception as exc:
+            if not llm.is_gemini_overload(exc):
+                if route == breaker.PROBE:
+                    breaker.release_probe(use_model)
+                raise
+            opened = breaker.record_overload(
+                use_model, after=fb_after, cooldown_s=fb_cooldown, fallback=fallback
+            )
+            if not opened:
+                llm.logger.warning(
+                    "Gemini %s failed after retries (%s) — retrying this call on "
+                    "fallback %s", use_model, llm._gemini_http_status(exc), fallback,
+                )
+            res = _gemini_call_model(client, contents, schema, fallback, fb_retries)
+        else:
+            breaker.record_success(use_model)
+            normalize_model_result(res)
+            res["model"] = use_model
+            return res
     normalize_model_result(res)
-    res["model"] = use_model
+    res["model"] = fallback
+    res["model_fallback"] = True
+    res["model_requested"] = use_model
     return res
 
 
@@ -1991,7 +2051,8 @@ def cheap_second_opinion_disagrees(
         return False
     if "gemini" not in clients or clients.get("gemini") is None:
         return False
-    last_model = str(res.get("model") or "").strip()
+    # A fallback answer was requested as GEMINI_MODEL: do not pay a second call.
+    last_model = str(res.get("model_requested") or res.get("model") or "").strip()
     if last_model == GEMINI_MODEL:
         return False
     second = classify_site(
