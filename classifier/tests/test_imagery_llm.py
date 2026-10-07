@@ -70,6 +70,38 @@ class RateLimiterTests(unittest.TestCase):
         self.assertEqual(out["site_type"], "tower")
         self.assertEqual(Models.calls, 2)
 
+    def test_classify_site_uses_gemini_retries_from_env(self):
+        """classify_site must not cap Gemini 503 retries below GEMINI_RETRIES."""
+        from classifier import asset_classifier as ac
+        from classifier import llm
+
+        class Resp:
+            text = '{"site_type": "other", "site_confidence": 0.9}'
+
+        class Unavailable(Exception):
+            code = 503  # google.genai errors carry the HTTP status as .code
+
+        class Models:
+            calls = 0
+
+            def generate_content(self, **_kwargs):
+                Models.calls += 1
+                if Models.calls <= 5:
+                    raise Unavailable("503 UNAVAILABLE. high demand")
+                return Resp()
+
+        class Client:
+            models = Models()
+
+        with patch.object(llm, "_gemini_retry_wait_s", return_value=0.0), patch.object(
+            llm, "GEMINI_LIMITER", llm.RateLimiter(0)
+        ), patch.object(llm, "GEMINI_RETRIES", 6):
+            out = ac.classify_site(
+                "gemini", {"gemini": Client()}, [("NAIP", Image.new("RGB", (64, 64)))]
+            )
+        self.assertEqual(out["site_type"], "other")
+        self.assertEqual(Models.calls, 6)
+
 
 def _jpeg(color: str) -> bytes:
     buf = io.BytesIO()

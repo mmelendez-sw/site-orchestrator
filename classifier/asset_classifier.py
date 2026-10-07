@@ -1291,12 +1291,15 @@ def _call_claude_json(client: Anthropic, content: list, schema: dict,
 
 def classify_site(provider: str, clients: dict,
                   views: list[tuple[str, Image.Image]],
-                  prompt: str = CLASSIFICATION_PROMPT, retries: int = 3,
+                  prompt: str = CLASSIFICATION_PROMPT, retries: int | None = None,
                   scan: bool = False, claude_model: str | None = None,
                   gemini_model: str | None = None,
                   trim_views: bool = True,
                   image_max_px: int | None = None) -> dict:
-    """Classify one asset via Gemini or Claude using the same prompt."""
+    """Classify one asset via Gemini or Claude using the same prompt.
+
+    ``retries`` None: Gemini uses GEMINI_RETRIES (env), Claude its default 3.
+    """
     send_views = (
         trim_views_for_model(views, max_px=image_max_px)
         if trim_views
@@ -1318,8 +1321,8 @@ def classify_site(provider: str, clients: dict,
         )
     content = _views_to_claude_content(send_views, classify_prompt)
     return _call_claude_json(
-        clients["claude"], content, claude_schema, tool_name, retries,
-        model=claude_model)
+        clients["claude"], content, claude_schema, tool_name,
+        3 if retries is None else retries, model=claude_model)
 
 
 def site_confidence_band(res: dict) -> str:
