@@ -73,6 +73,22 @@ python -m enrichment
 
 To push a reviewed dry run without re-buying imagery, set `APPLY=1`, `APPLY_EXISTING=1`, `CONNECTX_AUDIT=1` and `RUN_DIR` to the `_connectx_audit_dryrun` folder.
 
+### ConnectX reconciliation (pool audit → rep audit → hot swap)
+
+1. **Verify the pool.** `CONNECTX_AUDIT=1 AUDIT_POOL=1` audits ConnectX rooftops owned by the Site Acquisition Team. Confirmed rooftops get the NearMap verification and stay in the pool. No-asset sites are set to Unqualified and stay in the pool.
+2. **Verify rep books (not worked only).** `CONNECTX_AUDIT=1 STAGES=New/Unreviewed AUDIT_UNQUALIFY_OWNER=0056O00000EpUOgQAN` audits rep-owned New/Unreviewed rooftops. No-asset sites are set to Unqualified and reassigned to Matt Melendez. Confirmed sites stay with the rep.
+3. **Hot swap.** `python -m enrichment.reconcile_swaps` gives each rep one verified pool rooftop for every site step 2 took away, preferring the same state and falling back to any state. It re-checks the live Salesforce state first. Without `SWAP_APPLY=1` it only writes a plan. A swap sets `OwnerId` to the rep and `Site_Assignment_Date__c` to today, and `swaps/swap_ledger.csv` keeps any site from being used twice. Optional: `SWAP_LIMIT`, `SWAP_REPS`.
+
+```powershell
+# 1. pool
+$env:CONNECTX_AUDIT="1"; $env:AUDIT_POOL="1"; $env:LIMIT="200"; python -m enrichment
+# 2. reps (new terminal, or clear AUDIT_POOL first)
+$env:CONNECTX_AUDIT="1"; $env:STAGES="New/Unreviewed"; $env:AUDIT_UNQUALIFY_OWNER="0056O00000EpUOgQAN"; $env:LIMIT="200"; python -m enrichment
+# 3. swaps: review the plan, then apply
+python -m enrichment.reconcile_swaps
+$env:SWAP_APPLY="1"; python -m enrichment.reconcile_swaps
+```
+
 ## Layout
 
 ```

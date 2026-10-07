@@ -167,6 +167,11 @@ class AuditPayloadTests(unittest.TestCase):
                                    assign_confirmed_to="005REP")
         self.assertNotIn("update_owner_id", weak)
 
+    def test_unqualify_owner_from_env(self):
+        with patch.dict(os.environ, {"AUDIT_UNQUALIFY_OWNER": "0056O00000EpUOgQAN"}):
+            row = stamp_audit_verdict(_nearmap_row(), run_id="r")
+        self.assertEqual(build_row_payload(row)["OwnerId"], "0056O00000EpUOgQAN")
+
     def test_owner_override_from_env(self):
         with patch.dict(os.environ, {"SITE_ACQ_OWNER_ID": "005OVERRIDE"}):
             row = stamp_audit_verdict(_nearmap_row(), run_id="r")

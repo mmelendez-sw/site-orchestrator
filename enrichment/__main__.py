@@ -24,7 +24,8 @@ gear → OwnerId=Site Acquisition Team, Stage=Unqualified, Unqualified_Reason=
 No Site/Decommissioned. Inconclusive → no write. Ids an earlier live audit
 decided are skipped (AUDIT_RETRY_INCONCLUSIVE=1 retries inconclusive ones).
 AUDIT_POOL=1 audits the Site Acquisition Team's own sites instead;
-AUDIT_ASSIGN_TO=<User Id> reassigns every confirmed site to that user.
+AUDIT_ASSIGN_TO=<User Id> reassigns every confirmed Rooftop to that user.
+AUDIT_UNQUALIFY_OWNER=<User Id> owns no-asset sites (default: the pool).
 LLM_CLASSIFIED=1/0 filters the audit queue (unset = either).
 Set DB_ONLY=1 to skip all imagery. Every processed site is marked
 LLM_Classified=true (no LLM_Holdout on success). Unique FCC/TowerSource hits ≤25 m
@@ -117,6 +118,7 @@ from enrichment.connectx_audit import (  # noqa: E402
     AUDIT_RUN_SUFFIX,
     prior_audit_ids,
     site_acq_owner_id,
+    unqualify_owner_id,
 )
 from paths import ensure_data_layout, runs_dir  # noqa: E402
 from salesforce.sf_client import SalesforceClient  # noqa: E402
@@ -261,7 +263,7 @@ def main() -> int:
         print(
             "  CONNECTX_AUDIT=1 — rep-owned ConnectX rooftops: full FCC/NAIP/"
             "Nearmap/Claude; no gear on obliques → unqualify + reassign to "
-            f"Site Acquisition Team ({site_acq_owner_id()})",
+            f"{unqualify_owner_id()} (pool {site_acq_owner_id()})",
             flush=True,
         )
         if not stages:

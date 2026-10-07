@@ -52,6 +52,7 @@ SF_QUERY_FIELDS = (
     "Metro_Classification__c",
     "Stage__c",
     "Owner__c",
+    "OwnerId",
     "Verified_Site__c",
     "Verified_Site_Source__c",
     "LLM_Classified__c",

@@ -113,8 +113,13 @@ _CELL_FIELDS = (
 
 
 def site_acq_owner_id() -> str:
-    """Owner for unqualified audit sites (``SITE_ACQ_OWNER_ID`` overrides)."""
+    """The Site Acquisition Team pool user (``SITE_ACQ_OWNER_ID`` overrides)."""
     return (os.environ.get("SITE_ACQ_OWNER_ID") or "").strip() or SITE_ACQ_TEAM_OWNER_ID
+
+
+def unqualify_owner_id() -> str:
+    """Owner for ``no_asset`` sites: ``AUDIT_UNQUALIFY_OWNER``, else the pool."""
+    return (os.environ.get("AUDIT_UNQUALIFY_OWNER") or "").strip() or site_acq_owner_id()
 
 
 def _soql_quote(value: str) -> str:
@@ -258,7 +263,7 @@ def stamp_audit_verdict(
         row["update_owner_id"] = assign_confirmed_to
     if verdict == VERDICT_NO_ASSET:
         row["bucket"] = BUCKET_AUDIT_UNQUALIFY
-        row["update_owner_id"] = owner_id or site_acq_owner_id()
+        row["update_owner_id"] = owner_id or unqualify_owner_id()
         row["update_stage"] = AUDIT_UNQUALIFIED_STAGE
         row["update_unqualified_reason"] = AUDIT_UNQUALIFIED_REASON
         row["update_unqualified_note"] = unqualify_note(reason, run_id)
@@ -302,19 +307,16 @@ def _audit_run_was_live(run: Path) -> bool:
     return (summary.get("apply") or {}).get("apply") is True
 
 
-def prior_audit_ids(runs_root: Path, *, retry_inconclusive: bool = False) -> list[str]:
-    """Ids an earlier live audit already decided (skip them next time).
+def iter_audit_rows(runs_root: Path):
+    """Yield (run_dir, live, row) for every row of every audit run folder.
 
-    Written confirms / unqualifies always count (statuses are refreshed from
-    the apply log, so a crashed run still counts). Inconclusive rows count
-    when the run was live, unless ``retry_inconclusive`` or the reason was
-    transient (budget stop, SQL drop, classify error). Failed writes retry.
+    Statuses are refreshed from each run's apply log, so a crashed run's
+    pending rows show what actually reached Salesforce.
     """
     from enrichment.metrics import stamp_statuses_from_apply_log
 
-    ids: list[str] = []
     if not runs_root.is_dir():
-        return ids
+        return
     for run in sorted(runs_root.iterdir()):
         if not (
             run.is_dir()
@@ -329,15 +331,28 @@ def prior_audit_ids(runs_root: Path, *, retry_inconclusive: bool = False) -> lis
         stamp_statuses_from_apply_log(run, rows)
         live = _audit_run_was_live(run)
         for row in rows:
-            sf_id = str(row.get("Id") or "").strip()
-            verdict = lower_text(row.get("audit_verdict"))
-            status = lower_text(row.get("sf_update_status"))
-            if not sf_id or status == "failed":
-                continue
-            if verdict in {VERDICT_CONFIRMED, VERDICT_NO_ASSET}:
-                if status in {"updated", "unqualified"}:
-                    ids.append(sf_id)
-            elif verdict == VERDICT_INCONCLUSIVE and live and not retry_inconclusive:
-                if lower_text(row.get("audit_reason")) not in _RETRY_REASONS:
-                    ids.append(sf_id)
+            yield run, live, row
+
+
+def prior_audit_ids(runs_root: Path, *, retry_inconclusive: bool = False) -> list[str]:
+    """Ids an earlier live audit already decided (skip them next time).
+
+    Written confirms / unqualifies always count (statuses are refreshed from
+    the apply log, so a crashed run still counts). Inconclusive rows count
+    when the run was live, unless ``retry_inconclusive`` or the reason was
+    transient (budget stop, SQL drop, classify error). Failed writes retry.
+    """
+    ids: list[str] = []
+    for _run, live, row in iter_audit_rows(runs_root):
+        sf_id = str(row.get("Id") or "").strip()
+        verdict = lower_text(row.get("audit_verdict"))
+        status = lower_text(row.get("sf_update_status"))
+        if not sf_id or status == "failed":
+            continue
+        if verdict in {VERDICT_CONFIRMED, VERDICT_NO_ASSET}:
+            if status in {"updated", "unqualified"}:
+                ids.append(sf_id)
+        elif verdict == VERDICT_INCONCLUSIVE and live and not retry_inconclusive:
+            if lower_text(row.get("audit_reason")) not in _RETRY_REASONS:
+                ids.append(sf_id)
     return list(dict.fromkeys(ids))

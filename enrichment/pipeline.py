@@ -734,6 +734,7 @@ _SF_COPY_FIELDS = (
     "Site_Zip_Code__c",
     "Stage__c",
     "Owner__c",
+    "OwnerId",
     "Carrier_Leasing_Source__c",
     "Metro_Classification__c",
 )
