@@ -209,6 +209,9 @@ def audit_verdict(row: dict[str, Any]) -> tuple[str, str]:
         and (match_m is None or match_m <= AUDIT_DB_VETO_M)
     ):
         return VERDICT_INCONCLUSIVE, "db_record_nearby"
+    if lower_text(row.get("signal_strength")) == "strong":
+        # Licensed microwave dish / tagged telecom antenna within ~30 m.
+        return VERDICT_INCONCLUSIVE, "signal_nearby"
     if lower_text(row.get("cell_gear_kind")) in DISCERNIBLE_CELL_GEAR_KINDS:
         return VERDICT_INCONCLUSIVE, "gear_kind_named"
     text = evidence_text(row)

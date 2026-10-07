@@ -99,6 +99,7 @@ class AuditVerdictTests(unittest.TestCase):
             "weak_nearmap_call": _nearmap_row(cell_equipment_confidence=0.6),
             "error": _nearmap_row(error="nearmap timeout"),
             "gear_claim_disputed": _nearmap_row(dual_model_resolution="claude_veto"),
+            "signal_nearby": _nearmap_row(signal_strength="strong"),
         }
         for reason, row in cases.items():
             with self.subTest(reason=reason):

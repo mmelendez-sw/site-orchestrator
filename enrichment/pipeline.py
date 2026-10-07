@@ -706,6 +706,34 @@ def _prefetch_proximity(
     return {}
 
 
+def _prefetch_signals(
+    sites: list[dict[str, Any]], sql_state: dict[str, Any], *, verbose: bool
+) -> dict[str, dict[str, Any]]:
+    """Tier-0 evidence (FCC ULS, OpenCelliD, OSM antenna tags) when SIGNALS=1."""
+    from enrichment.signals import collect_signals_bulk, signals_enabled
+
+    if not sites or not signals_enabled():
+        return {}
+    points = {}
+    for site in sites:
+        coords = parse_sf_lat_lng(site)
+        sf_id = str(site.get("Id") or "")
+        if coords is not None and sf_id:
+            points[sf_id] = coords
+    try:
+        with progress.busy(f"evidence signals ({len(points)})") if not verbose else nullcontext():
+            out = collect_signals_bulk(points, cursor=sql_state.get("cursor"))
+    except Exception as exc:  # noqa: BLE001 — signals are optional evidence
+        logger.warning("signals unavailable: %s", exc)
+        if verbose:
+            progress.warn(f"evidence signals unavailable ({exc})")
+        return {}
+    if verbose:
+        strong = sum(1 for v in out.values() if v.get("signal_strength") == "strong")
+        progress.result(f"evidence signals: {strong}/{len(out)} strong")
+    return out
+
+
 # ------------------------------- per site -----------------------------------
 
 
@@ -807,6 +835,7 @@ def _prepare_site(
     verbose: bool,
     geocodes: dict[str, Any] | None = None,
     proximity: Any = _NOT_PREFETCHED,
+    signals: dict[str, Any] | None = None,
 ) -> PreparedSite:
     """Address + FCC/TowerSource for one site; settle it if no imagery is needed.
 
@@ -832,6 +861,8 @@ def _prepare_site(
 
     sf_lat, sf_lng = coords
     prep.sf_lat, prep.sf_lng = sf_lat, sf_lng
+    if signals:
+        base.update(signals)
     base.update(
         {
             "sf_lat": sf_lat,
@@ -952,6 +983,11 @@ _FRESH_CLASSIFIED_FIELDS = (
     "nearmap_tiles",
     "nearmap_cache_hits",
     "nearmap_spend",
+    "supplemental_views",
+    "supplemental_sources",
+    "supplemental_requests",
+    "supplemental_billable",
+    "supplemental_cache_hits",
 )
 
 
@@ -1094,6 +1130,7 @@ def _classify_prepared(
             else "medium"
         ),
         "reuse_chips_dirs": reuse_chips_dirs or None,
+        "site_state": str(prep.site.get("Site_State__c") or "").strip().upper() or None,
     }
     if prep.rooftop_confirm:
         kwargs["presence_only"] = True
@@ -1528,6 +1565,8 @@ def run_enrichment(
     imagery.BUDGET.seed(
         month_to_date_nearmap_bytes() + int(env_float("NEARMAP_PRIOR_USE_MB", 0) * 1024 * 1024)
     )
+    # Tag shared-ledger purchase rows with this run (budget CLI groups by run).
+    imagery.BUDGET.run_id = run_dir.name
     if verbose:
         progress.step(imagery.BUDGET.describe())
 
@@ -1651,6 +1690,7 @@ def run_enrichment(
         proximity = _prefetch_proximity(
             prefetch_sites, geocodes, sql_state, max_m=max_m, verbose=verbose
         )
+        signals = _prefetch_signals(prefetch_sites, sql_state, verbose=verbose)
 
         pending: list[tuple[int, PreparedSite]] = []
         classify_error: BaseException | None = None
@@ -1675,6 +1715,7 @@ def run_enrichment(
                     verbose=verbose,
                     geocodes=geocodes,
                     proximity=proximity.get(sf_id, _NOT_PREFETCHED),
+                    signals=signals.get(sf_id),
                 )
                 if prep.done:
                     state.finish(prep.base, elapsed_s=time.monotonic() - t0)
