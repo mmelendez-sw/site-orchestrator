@@ -401,6 +401,22 @@ class MapillaryTests(SourcesTestCase):
         self.assertEqual([c["id"] for c in mapillary.select(same_side, 2)], ["best_s", "older_s"])
         self.assertEqual(mapillary.select(ranked, 0), [])
 
+    def test_empty_search_is_not_cached(self):
+        """The bbox endpoint can return [] then real data; [] must not stick."""
+        thumb = jpeg_bytes(textured_image(128))
+        replies = [{"data": []}, {"data": MLY_IMAGES}]
+
+        def handler(url, params, headers):
+            if url == mapillary.SEARCH_URL:
+                return FakeResp(ctype="application/json", payload=replies.pop(0))
+            return FakeResp(content=thumb)
+
+        self.fake(handler)
+        with self.env(MAPILLARY_ACCESS_TOKEN=MAPILLARY_TOKEN):
+            self.assertEqual(mapillary.fetch(SITE_LAT, SITE_LON), [])
+            views = mapillary.fetch(SITE_LAT, SITE_LON)
+        self.assertEqual([v.meta["image_id"] for v in views], ["best_s", "east"])
+
     def test_fetch_labels_meter_and_cache(self):
         thumb = jpeg_bytes(textured_image(128))
 

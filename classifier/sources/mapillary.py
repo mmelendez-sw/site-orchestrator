@@ -96,7 +96,11 @@ def _search(lat: float, lon: float, radius: float, *,
         return [], False
     payload = resp.json()
     data = list(payload.get("data") or []) if isinstance(payload, dict) else []
-    base.cache_write(path, json.dumps({"data": data}).encode("utf-8"))
+    # Never cache an empty search: the bbox endpoint is inconsistent (the
+    # same box can return 0 then 60 images), and a cached [] would hide real
+    # coverage for MAPILLARY_SEARCH_CACHE_DAYS.
+    if data:
+        base.cache_write(path, json.dumps({"data": data}).encode("utf-8"))
     return data, False
 
 

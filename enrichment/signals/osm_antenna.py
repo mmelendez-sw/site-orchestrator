@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import json
 import logging
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -37,7 +39,7 @@ from enrichment.signals import (
     cache_write,
     round_m,
 )
-from envutil import env_float
+from envutil import env_float, env_str
 from paths import data_root
 
 logger = logging.getLogger(__name__)
@@ -46,6 +48,23 @@ OSM_ANTENNA_RADIUS_M = env_float("OSM_ANTENNA_RADIUS_M", 60)
 OSM_ANTENNA_CACHE_DAYS = env_float("OSM_ANTENNA_CACHE_DAYS", 30)
 
 _limiter = RateLimiter(env_float("OSM_ANTENNA_RPM", 60))
+
+# The main public Overpass server often times out under parallel lanes. Try
+# the configured URL first, then well-known public mirrors.
+OSM_ANTENNA_TIMEOUT_S = env_float("OSM_ANTENNA_TIMEOUT_S", max(25.0, float(OSM_TIMEOUT_S)))
+_DEFAULT_MIRRORS = (
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass.private.coffee/api/interpreter",
+)
+
+
+def overpass_urls() -> list[str]:
+    """OVERPASS_URL then OVERPASS_MIRRORS (comma list; "none" disables mirrors)."""
+    raw = env_str("OVERPASS_MIRRORS", ",".join(_DEFAULT_MIRRORS)).strip()
+    mirrors = [] if raw.lower() in {"", "none", "off"} else [
+        u.strip() for u in raw.split(",") if u.strip()
+    ]
+    return list(dict.fromkeys([OVERPASS_URL, *mirrors]))
 
 _STRUCTURE_VALUES = frozenset({"antenna", "mast", "tower", "communications_tower"})
 _COMM_TOWER_TYPES = frozenset(
@@ -73,7 +92,7 @@ def overpass_query(lat: float, lon: float, radius_m: float) -> str:
             f'{kind}["telecom"]{around};',
         ])
     return (
-        f"[out:json][timeout:{max(1, int(OSM_TIMEOUT_S))}];"
+        f"[out:json][timeout:{max(1, int(OSM_ANTENNA_TIMEOUT_S))}];"
         f"({''.join(parts)});out tags center;"
     )
 
@@ -149,15 +168,30 @@ def summarize(
 
 
 def _post_overpass(query: str) -> Any:
+    """POST to the first Overpass server that answers; raise the last error."""
     data = urllib.parse.urlencode({"data": query}).encode("utf-8")
-    req = urllib.request.Request(
-        OVERPASS_URL,
-        data=data,
-        headers={"User-Agent": "site-orchestrator/signals-osm-antenna"},
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=OSM_TIMEOUT_S) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    last: Exception | None = None
+    # Two tries per server: public mirrors return sporadic HTTP 500s.
+    for url in overpass_urls():
+        for attempt in (1, 2):
+            req = urllib.request.Request(
+                url,
+                data=data,
+                headers={"User-Agent": "site-orchestrator/signals-osm-antenna"},
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=OSM_ANTENNA_TIMEOUT_S) as resp:
+                    return json.loads(resp.read().decode("utf-8"))
+            except (OSError, ValueError) as exc:  # URLError/timeout/HTTP 5xx, bad JSON
+                last = exc
+                logger.info("Overpass %s attempt %s failed (%s)", url, attempt, exc)
+                if isinstance(exc, urllib.error.URLError) and not isinstance(
+                    exc, urllib.error.HTTPError
+                ):
+                    break  # unreachable host: no point retrying it
+                time.sleep(1.0)
+    raise last if last is not None else RuntimeError("no Overpass server configured")
 
 
 def fetch_elements(lat: float, lon: float, *, radius_m: float | None = None) -> list[dict[str, Any]]:

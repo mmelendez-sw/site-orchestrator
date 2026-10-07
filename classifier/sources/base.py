@@ -348,9 +348,18 @@ def http_get(
     headers: dict | None = None,
     billable: bool = False,
 ) -> requests.Response:
-    """GET through the thread's session; counts the request on the meter."""
+    """GET through the thread's session; counts the request on the meter.
+
+    One retry on a connection error (DNS blips on CDN hosts are common);
+    the retry is metered too.
+    """
     record_request(billable=billable)
-    return session().get(url, params=params, headers=headers, timeout=timeout_s())
+    try:
+        return session().get(url, params=params, headers=headers, timeout=timeout_s())
+    except requests.ConnectionError:
+        time.sleep(1.0)
+        record_request(billable=billable)
+        return session().get(url, params=params, headers=headers, timeout=timeout_s())
 
 
 # ---------------------------------- images ----------------------------------
