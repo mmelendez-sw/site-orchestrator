@@ -387,6 +387,14 @@ def update_site(
 
 def build_row_payload(row: dict[str, Any], *, write_holdout: bool = True) -> dict[str, Any]:
     """Salesforce payload for one detail row (site fields + queue flags)."""
+    from enrichment.connectx_audit import (
+        confirmed_owner_id,
+        is_unqualify_row,
+        unqualify_payload,
+    )
+
+    if is_unqualify_row(row):
+        return unqualify_payload(row)
     payload = row.get("payload")
     if not isinstance(payload, dict):
         site_fields = build_update_payload(
@@ -397,7 +405,11 @@ def build_row_payload(row: dict[str, Any], *, write_holdout: bool = True) -> dic
             verified_site_source=(row.get("update_verified_site_source") or None)
             or None,
         )
-        return apply_queue_flags(site_fields, write_holdout=write_holdout)
+        payload = apply_queue_flags(site_fields, write_holdout=write_holdout)
+        owner_id = confirmed_owner_id(row)
+        if owner_id:
+            payload["OwnerId"] = owner_id
+        return payload
     # Preserve explicit queue flags on prebuilt payloads; fill any gaps.
     payload = dict(payload)
     is_enrich = is_enrichment_payload(payload)
@@ -542,6 +554,8 @@ def status_from_entry(entry: dict[str, Any]) -> str:
         return "failed"
     payload = entry.get("payload")
     payload = payload if isinstance(payload, dict) else {}
+    if payload.get("Stage__c") == "Unqualified":
+        return "unqualified"
     if is_enrichment_payload(payload):
         return "updated"
     if payload.get("LLM_Holdout__c") is True:
@@ -563,6 +577,11 @@ def _format_apply_result(
         return (
             f"{prefix} | apply error fallback | "
             "dequeued (LLM_Classified=false, LLM_Holdout=true)"
+        )
+    if payload.get("Stage__c") == "Unqualified":
+        return (
+            f"{prefix} | Unqualified ({payload.get('Unqualified_Reason__c') or '—'}) | "
+            f"owner={payload.get('OwnerId') or 'unchanged'}"
         )
     if not is_enrichment_payload(payload):
         if payload.get("LLM_Classified__c") and payload.get("LLM_Holdout__c") is not True:

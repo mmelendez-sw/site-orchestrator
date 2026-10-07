@@ -23,6 +23,7 @@ from typing import Any, Iterable
 
 from enrichment.coerce import is_true, lower_text, text_or_none, to_float
 from enrichment.constants import (
+    BUCKET_AUDIT_UNQUALIFY,
     BUCKET_POTENTIAL_UPDATE,
     BUCKET_ROOFTOP,
     NEARMAP_EMPTY_LOCK_CONF,
@@ -92,6 +93,11 @@ def outcome_class(row: dict[str, Any]) -> str:
     update_type = lower_text(row.get("update_site_type"))
     status = lower_text(row.get("sf_update_status"))
     db_skip = reason == "skip_classify_db_hit"
+    if bucket == BUCKET_AUDIT_UNQUALIFY:
+        # ConnectX audit: Nearmap obliques showed no gear → unqualified.
+        if status in _APPLY_FAILED_STATUSES:
+            return "apply_failed"
+        return "holdout_empty_confirmed"
     if db_skip or bucket == BUCKET_POTENTIAL_UPDATE:
         if status in _APPLY_FAILED_STATUSES:
             return "apply_failed"
@@ -583,7 +589,9 @@ def month_to_date_nearmap_bytes(*, now: datetime | None = None, root: Path | Non
     )
 
 
-_LIVE_STATUSES = frozenset({"updated", "dequeued", "classified_only", "failed"})
+_LIVE_STATUSES = frozenset(
+    {"updated", "dequeued", "classified_only", "unqualified", "failed"}
+)
 
 
 def _read_csv(path: Path) -> list[dict[str, Any]]:

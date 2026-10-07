@@ -6,7 +6,7 @@ in the Salesforce queue either way. Optional env: STATES, STAGES,
 LIMIT, OFFSET, SKIP_FROM, IDS, CARRIER_LIKE, METRO_CLASSIFICATION,
 OWNERS, OWNERS_EXCLUDE, SITE_TYPE, LLM_CLASSIFIED, APPLY, DEQUEUE_HOLDOUTS, RUN_DIR, VERBOSE,
 RERUN_SITES_FROM, RERUN_HOLDOUTS_FROM, REUSE_CHIPS_FROM, DB_ONLY,
-CONFIRM_ROOFTOP, CONFIRM_EXISTING, APPLY_EXISTING.
+CONFIRM_ROOFTOP, CONFIRM_EXISTING, CONNECTX_AUDIT, APPLY_EXISTING.
 Set APPLY=0 to classify without Salesforce writes.
 Set CONFIRM_ROOFTOP=1 to audit rooftops with a building-roof check (no
 cell-gear bar, no Claude). NAIP first; Nearmap only if that fails.
@@ -16,6 +16,16 @@ Set CONFIRM_EXISTING=1 for Outreach - Verified sales-typed sites: rooftop
 picklist rows use that NAIP-then-Nearmap confirm; tower picklist rows use
 FCC/NAIP/Nearmap. Failures are left unchanged. Defaults: any owner, no
 metro, any Site_Type.
+Set CONNECTX_AUDIT=1 to re-verify ConnectX rooftops still owned by a rep
+(OwnerId is not the Site Acquisition Team; stages New/Unreviewed,
+Enhanced/Unreviewed, Outreach, Outreach - Verified). Full FCC/NAIP/Nearmap/
+Claude path. Confirmed → normal Site_Type write. Nearmap obliques with no
+gear → OwnerId=Site Acquisition Team, Stage=Unqualified, Unqualified_Reason=
+No Site/Decommissioned. Inconclusive → no write. Ids an earlier live audit
+decided are skipped (AUDIT_RETRY_INCONCLUSIVE=1 retries inconclusive ones).
+AUDIT_POOL=1 audits the Site Acquisition Team's own sites instead;
+AUDIT_ASSIGN_TO=<User Id> reassigns every confirmed site to that user.
+LLM_CLASSIFIED=1/0 filters the audit queue (unset = either).
 Set DB_ONLY=1 to skip all imagery. Every processed site is marked
 LLM_Classified=true (no LLM_Holdout on success). Unique FCC/TowerSource hits ≤25 m
 (or on-structure ≤5 m) also write Site_Type and coords. Remaining blanks
@@ -98,8 +108,15 @@ from enrichment.sf_ops import (  # noqa: E402
 )
 from enrichment.constants import (  # noqa: E402
     CONFIRM_ROOFTOP_STAGE_FILTER,
+    CONNECTX_AUDIT_STAGE_FILTER,
     DB_ONLY_STAGE_FILTER,
     DEFAULT_STAGE_FILTER,
+)
+from enrichment.connectx_audit import (  # noqa: E402
+    AUDIT_DRY_RUN_SUFFIX,
+    AUDIT_RUN_SUFFIX,
+    prior_audit_ids,
+    site_acq_owner_id,
 )
 from paths import ensure_data_layout, runs_dir  # noqa: E402
 from salesforce.sf_client import SalesforceClient  # noqa: E402
@@ -145,8 +162,10 @@ def main() -> int:
         logging.getLogger(name).setLevel(logging.WARNING)
 
     ensure_data_layout()
+    connectx_audit = _flag("CONNECTX_AUDIT")
+    audit_suffix = AUDIT_RUN_SUFFIX if _flag("APPLY", "1") else AUDIT_DRY_RUN_SUFFIX
     run_dir = Path(os.environ["RUN_DIR"]) if os.environ.get("RUN_DIR") else default_run_dir(
-        runs_dir()
+        runs_dir(), **({"suffix": audit_suffix} if connectx_audit else {})
     )
     limit_raw = (os.environ.get("LIMIT") or "").strip()
     print(f"  queue LIMIT: {limit_raw or 'none'} (from {LIMIT_SOURCE})", flush=True)
@@ -210,6 +229,15 @@ def main() -> int:
             f"{len(skip_ids)} id(s)",
             flush=True,
         )
+    if connectx_audit and not _flag("APPLY_EXISTING"):
+        audited = prior_audit_ids(
+            runs_dir(), retry_inconclusive=_flag("AUDIT_RETRY_INCONCLUSIVE")
+        )
+        print(
+            f"  skip Ids decided by earlier live ConnectX audits: {len(audited)}",
+            flush=True,
+        )
+        skip_ids = list(dict.fromkeys([*skip_ids, *audited]))
 
     print("=== AUTHENTICATE SALESFORCE ===", flush=True)
     sf_client = SalesforceClient()
@@ -223,6 +251,32 @@ def main() -> int:
     if confirm_existing and (confirm_rooftop or db_only):
         raise SystemExit(
             "CONFIRM_EXISTING=1 cannot be combined with CONFIRM_ROOFTOP=1 or DB_ONLY=1"
+        )
+    if connectx_audit and (confirm_rooftop or confirm_existing or db_only):
+        raise SystemExit(
+            "CONNECTX_AUDIT=1 cannot be combined with CONFIRM_ROOFTOP, "
+            "CONFIRM_EXISTING, or DB_ONLY"
+        )
+    if connectx_audit:
+        print(
+            "  CONNECTX_AUDIT=1 — rep-owned ConnectX rooftops: full FCC/NAIP/"
+            "Nearmap/Claude; no gear on obliques → unqualify + reassign to "
+            f"Site Acquisition Team ({site_acq_owner_id()})",
+            flush=True,
+        )
+        if not stages:
+            stages = list(CONNECTX_AUDIT_STAGE_FILTER)
+        print(f"  lead stages: {', '.join(stages)}", flush=True)
+    audit_pool = connectx_audit and _flag("AUDIT_POOL")
+    audit_assign_to = (os.environ.get("AUDIT_ASSIGN_TO") or "").strip() or None
+    audit_llm_raw = (os.environ.get("LLM_CLASSIFIED") or "").strip()
+    audit_llm_classified = _flag("LLM_CLASSIFIED") if audit_llm_raw else None
+    if connectx_audit:
+        print(
+            f"  audit owners: {'Site Acquisition Team (pool)' if audit_pool else 'reps'}"
+            f" | confirmed → {audit_assign_to or 'owner unchanged'}"
+            f" | llm_classified={audit_llm_classified if audit_llm_raw else 'any'}",
+            flush=True,
         )
     if confirm_rooftop:
         print(
@@ -251,7 +305,7 @@ def main() -> int:
             stages = list(DB_ONLY_STAGE_FILTER)
         print(f"  lead stages: {', '.join(stages)}", flush=True)
     dequeue_default = (
-        "0" if db_only or confirm_rooftop or confirm_existing else "1"
+        "0" if db_only or confirm_rooftop or confirm_existing or connectx_audit else "1"
     )
     # Owner and metro filters are off by default; set OWNERS /
     # METRO_CLASSIFICATION to scope a run.
@@ -280,6 +334,7 @@ def main() -> int:
             confirm_rooftop=confirm_rooftop,
             confirm_existing=confirm_existing,
             db_only=db_only,
+            connectx_audit=connectx_audit,
             dequeue_holdouts=_flag("DEQUEUE_HOLDOUTS", dequeue_default),
             verbose=_flag("VERBOSE"),
             max_sites=int(limit_raw) if limit_raw else None,
@@ -299,7 +354,10 @@ def main() -> int:
         owners=owners,
         exclude_owners=exclude_owners,
         site_type=site_type,
-        carrier_like=parse_carrier_like(os.environ.get("CARRIER_LIKE")),
+        carrier_like=parse_carrier_like(
+            os.environ.get("CARRIER_LIKE"),
+            default="ConnectX" if connectx_audit else None,
+        ),
         metro_classification=parse_metro_classification(
             metro_raw, default=metro_default
         ),
@@ -311,6 +369,10 @@ def main() -> int:
         db_only=db_only,
         confirm_rooftop=confirm_rooftop,
         confirm_existing=confirm_existing,
+        connectx_audit=connectx_audit,
+        audit_pool=audit_pool,
+        audit_llm_classified=audit_llm_classified,
+        audit_assign_to=audit_assign_to,
     )
     failed = (summary.get("apply") or {}).get("failed", 0)
     return 0 if not failed else 2

@@ -83,6 +83,14 @@ CONFIRM_ROOFTOP_STAGE_FILTER = (
     "Working - Connected",
 )
 
+# CONNECTX_AUDIT: open ConnectX rooftops still on a rep. Override with STAGES.
+CONNECTX_AUDIT_STAGE_FILTER = (
+    "New/Unreviewed",
+    "Enhanced/Unreviewed",
+    "Outreach",
+    "Outreach - Verified",
+)
+
 # Hard exclusion unless the caller explicitly lists the stage in STAGES.
 EXCLUDED_STAGE_FILTER = (
     "Working-Connected",
@@ -117,6 +125,13 @@ BUCKET_POTENTIAL_UPDATE = "potential_update"
 BUCKET_ROOFTOP = "potential_rooftop"
 BUCKET_OTHER = "other_or_else"
 BUCKET_SKIP = "skip"
+# CONNECTX_AUDIT: Nearmap obliques show no telecom gear → unqualify + reassign.
+BUCKET_AUDIT_UNQUALIFY = "audit_unqualify"
+
+# General-pool owner for unqualified ConnectX audit sites (User, not a queue).
+SITE_ACQ_TEAM_OWNER_ID = "0053l00000G05h9AAB"
+AUDIT_UNQUALIFIED_STAGE = "Unqualified"
+AUDIT_UNQUALIFIED_REASON = "No Site/Decommissioned"
 
 CANDIDATE_CSV = "potential_sf_updates.csv"
 HOLDOUT_CSV = "holdout_rooftop_other.csv"

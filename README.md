@@ -52,6 +52,27 @@ $env:VERBOSE="1"
 python -m enrichment
 ```
 
+**ConnectX rooftop audit:** `CONNECTX_AUDIT=1` re-checks ConnectX rooftops that are still owned by an individual rep. These are `Site_Type=Rooftop` rows whose `OwnerId` is not the Site Acquisition Team (`0053l00000G05h9AAB`) and whose stage is New/Unreviewed, Enhanced/Unreviewed, Outreach or Outreach - Verified. The `LLM_Classified` flag is ignored. These sites run the full FCC/TowerSource → NAIP → Nearmap Vert + obliques → Claude path, and each finished site gets one verdict:
+
+| Verdict | When | Salesforce write |
+|---|---|---|
+| `confirmed` | Normal write gates passed (unique FCC/TowerSource hit, or Nearmap obliques + dual-model cell) | Usual Site_Type / coords / Verified_Site_Source. Owner and stage stay the same. |
+| `no_asset` | Nearmap obliques reviewed, no model saw gear, confident and unhedged call, no stealth host (steeple, chimney, screen wall…), no FCC/TowerSource record within `AUDIT_DB_VETO_M` (100 m) | `OwnerId` = Site Acquisition Team, `Stage__c` = Unqualified, `Unqualified_Reason__c` = No Site/Decommissioned, `Other_Unqualified_Reason__c` = audit note, `Unqualified_Date__c` = today |
+| `inconclusive` | Anything else: NAIP only, no Nearmap coverage, budget stop, gear claimed but disputed, weak call | None. The site stays with its rep. |
+
+The detail CSV columns `audit_verdict` and `audit_reason` record each call. Live runs write to `runs/<stamp>_connectx_audit`, and `APPLY=0` runs write to `_connectx_audit_dryrun`. Each new audit skips Ids an earlier live audit already decided. Set `AUDIT_RETRY_INCONCLUSIVE=1` to retry inconclusive sites; budget stops and errors are always retried. Scope a night with `OWNERS` (rep names), `STATES` or `LIMIT`. Owner override: `SITE_ACQ_OWNER_ID`. The audit uses roughly 1.1 MB of Nearmap per site, so check `NEARMAP_MONTHLY_BUDGET_MB` before a large slice.
+
+```powershell
+$env:CONNECTX_AUDIT="1"
+$env:OWNERS="Jeremy Scott"   # optional: one rep per night
+$env:LIMIT="200"
+$env:APPLY="0"               # dry run first; review audit_verdict in the detail CSV
+$env:VERBOSE="1"
+python -m enrichment
+```
+
+To push a reviewed dry run without re-buying imagery, set `APPLY=1`, `APPLY_EXISTING=1`, `CONNECTX_AUDIT=1` and `RUN_DIR` to the `_connectx_audit_dryrun` folder.
+
 ## Layout
 
 ```

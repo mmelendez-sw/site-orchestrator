@@ -42,6 +42,7 @@ from enrichment.bucketing import (
 from enrichment.coerce import to_float
 from enrichment.constants import (
     APPLY_LOG_CSV,
+    BUCKET_AUDIT_UNQUALIFY,
     BUCKET_OTHER,
     BUCKET_POTENTIAL_UPDATE,
     BUCKET_ROOFTOP,
@@ -52,6 +53,11 @@ from enrichment.constants import (
     HOLDOUT_CSV,
     MATCH_SOURCE_NONE,
     PROXIMITY_MAX_M,
+)
+from enrichment.connectx_audit import (
+    query_connectx_audit_sites,
+    site_acq_owner_id,
+    stamp_audit_verdict,
 )
 from enrichment.cost_policy import (
     auto_skip_classify_reason,
@@ -111,7 +117,7 @@ from salesforce.site_type_mapping import (
 
 logger = logging.getLogger(__name__)
 
-_ALREADY_WRITTEN = frozenset({"updated", "classified_only", "dequeued"})
+_ALREADY_WRITTEN = frozenset({"updated", "classified_only", "dequeued", "unqualified"})
 _SQL_ERROR_HOLDOUT = "sql_error"
 _NEARMAP_BUDGET_HOLDOUT = "nearmap_budget"
 # Transient holdouts stay in the Salesforce queue for a later run.
@@ -150,13 +156,13 @@ def apply_flush_s() -> float:
     return max(1.0, env_float("APPLY_FLUSH_S", 60))
 
 
-def default_run_dir(root: Path | None = None) -> Path:
+def default_run_dir(root: Path | None = None, *, suffix: str = "_sf_enrichment") -> Path:
     from paths import ensure_data_layout
 
     ensure_data_layout()
     base = root or runs_dir()
     stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
-    return base / f"{stamp}_sf_enrichment"
+    return base / f"{stamp}{suffix}"
 
 
 def apply_paused_run(
@@ -167,6 +173,7 @@ def apply_paused_run(
     confirm_rooftop: bool = False,
     confirm_existing: bool = False,
     db_only: bool = False,
+    connectx_audit: bool = False,
     dequeue_holdouts: bool = False,
     verbose: bool = True,
     max_sites: int | None = None,
@@ -177,7 +184,7 @@ def apply_paused_run(
     also Salesforce-apply after each site; use this when a job died before
     that write. Does not re-query Salesforce or re-classify. Confirm path
     writes Site_Type + LLM_Classified only for ``potential_update`` rows
-    still pending.
+    still pending. ``connectx_audit`` also pushes pending unqualify rows.
     """
     path = run_dir / DETAIL_CSV
     if not path.is_file():
@@ -202,6 +209,7 @@ def apply_paused_run(
         db_only=db_only,
         confirm_rooftop=confirm_rooftop,
         confirm_existing=confirm_existing,
+        connectx_audit=connectx_audit,
         verbose=verbose,
     )
 
@@ -261,12 +269,40 @@ def _query_queue(
     llm_classified,
     site_type,
     verbose,
+    connectx_audit=False,
+    audit_pool=False,
+    audit_llm_classified=None,
 ) -> list[dict[str, Any]]:
     if site_ids:
         if verbose:
             progress.stage("2/4 QUERY SALESFORCE", f"{len(site_ids)} explicit Id(s)")
         with progress.busy("querying Salesforce") if not verbose else nullcontext():
             return query_sites_by_ids(sf_client, site_ids)
+    if connectx_audit:
+        owner_id = site_acq_owner_id()
+        if verbose:
+            progress.stage(
+                "2/4 QUERY SALESFORCE",
+                f"ConnectX audit | Site_Type=Rooftop | "
+                f"OwnerId{'=' if audit_pool else '!='}{owner_id} | "
+                f"llm_classified={audit_llm_classified if audit_llm_classified is not None else 'any'} | "
+                f"stages={','.join(stages) if stages else 'default'} | "
+                f"carrier_like={carrier_like!r} | "
+                f"owners={','.join(owners) if owners else 'any rep'} | "
+                f"states={','.join(states) if states else 'all'}",
+            )
+        with progress.busy("querying Salesforce") if not verbose else nullcontext():
+            return query_connectx_audit_sites(
+                sf_client,
+                stages=stages,
+                carrier_like=carrier_like,
+                states=states,
+                owners=owners,
+                exclude_owners=exclude_owners,
+                exclude_owner_id=owner_id,
+                pool=audit_pool,
+                llm_classified=audit_llm_classified,
+            )
     stage_filter = stages or list(DEFAULT_STAGE_FILTER)
     wanted_type = (site_type or "").strip()
     if wanted_type.lower() in {"any", "all", "*", "none"}:
@@ -326,13 +362,15 @@ def _collect_apply_rows(
     db_only: bool,
     confirm_rooftop: bool,
     confirm_existing: bool,
+    connectx_audit: bool = False,
 ) -> list[dict[str, Any]]:
     apply_rows = [
         row
         for row in detail_rows
-        if row.get("bucket") == BUCKET_POTENTIAL_UPDATE and _needs_sf_apply(row)
+        if row.get("bucket") in {BUCKET_POTENTIAL_UPDATE, BUCKET_AUDIT_UNQUALIFY}
+        and _needs_sf_apply(row)
     ]
-    leave_failures = confirm_rooftop or confirm_existing
+    leave_failures = confirm_rooftop or confirm_existing or connectx_audit
     if not leave_failures and (dequeue_holdouts or db_only):
         apply_rows.extend(
             row
@@ -351,6 +389,7 @@ def _row_eligible_for_apply(
     db_only: bool,
     confirm_rooftop: bool,
     confirm_existing: bool,
+    connectx_audit: bool = False,
 ) -> bool:
     return bool(
         _collect_apply_rows(
@@ -359,12 +398,19 @@ def _row_eligible_for_apply(
             db_only=db_only,
             confirm_rooftop=confirm_rooftop,
             confirm_existing=confirm_existing,
+            connectx_audit=connectx_audit,
         )
     )
 
 
 def _status_counts(detail_rows: Iterable[dict[str, Any]]) -> dict[str, int]:
-    counts = {"updated": 0, "dequeued": 0, "classified_only": 0, "failed": 0}
+    counts = {
+        "updated": 0,
+        "dequeued": 0,
+        "classified_only": 0,
+        "unqualified": 0,
+        "failed": 0,
+    }
     for row in detail_rows:
         status = str(row.get("sf_update_status") or "").strip().lower()
         if status in counts:
@@ -384,6 +430,7 @@ def _apply_info_from_detail(
         "success": counts["updated"],
         "dequeued_holdouts": counts["dequeued"],
         "classified_only": counts["classified_only"],
+        "unqualified": counts["unqualified"],
         "failed": counts["failed"],
         "apply": apply,
         "log": log,
@@ -489,12 +536,13 @@ def _write_and_apply_run(
     db_only: bool,
     confirm_rooftop: bool,
     confirm_existing: bool = False,
+    connectx_audit: bool = False,
     verbose: bool,
 ) -> dict[str, Any]:
     """End-of-run sweep: apply anything pending, write CSVs, record metrics."""
     if verbose:
         progress.stage("4/4 WRITE CSVs", str(run_dir.name))
-    leave_failures = confirm_rooftop or confirm_existing
+    leave_failures = confirm_rooftop or confirm_existing or connectx_audit
     apply_info: dict[str, Any] | None = None
     if apply:
         apply_rows = _collect_apply_rows(
@@ -503,6 +551,7 @@ def _write_and_apply_run(
             db_only=db_only,
             confirm_rooftop=confirm_rooftop,
             confirm_existing=confirm_existing,
+            connectx_audit=connectx_audit,
         )
         if apply_rows:
             if verbose:
@@ -1163,6 +1212,7 @@ class _RunState:
         error_holdout: bool,
         sink: SiteSink | None,
         compact: bool,
+        decorate: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
     ) -> None:
         self.sf_client = sf_client
         self.run_dir = run_dir
@@ -1174,6 +1224,8 @@ class _RunState:
         self.error_holdout = error_holdout
         self.sink = sink
         self.compact = compact
+        # Per-mode verdict stamped before bucketing is final (ConnectX audit).
+        self.decorate = decorate
         self.detail_rows: list[dict[str, Any]] = []
         self.batch: list[dict[str, Any]] = []
         self.batch_size = apply_batch_size()
@@ -1214,10 +1266,14 @@ class _RunState:
             self.flush()
 
     def finish(self, row: dict[str, Any], *, elapsed_s: float) -> None:
+        if self.decorate is not None:
+            row = self.decorate(row)
         row["outcome_class"] = outcome_class(row)
         row.setdefault("sf_update_error", "")
         row["sf_update_status"] = (
-            "pending" if row.get("bucket") == BUCKET_POTENTIAL_UPDATE else "skipped"
+            "pending"
+            if row.get("bucket") in {BUCKET_POTENTIAL_UPDATE, BUCKET_AUDIT_UNQUALIFY}
+            else "skipped"
         )
         self.detail_rows.append(row)
         self.csv.append(row)
@@ -1235,8 +1291,13 @@ class _RunState:
     def _report(self, row: dict[str, Any], elapsed_s: float) -> None:
         if self.verbose:
             who = f"{row.get('Id')} | " if self.compact else ""
+            audit = (
+                f"audit={row.get('audit_verdict')}:{row.get('audit_reason')} | "
+                if row.get("audit_verdict")
+                else ""
+            )
             progress.result(
-                f"{who}{row.get('bucket')} | type={row.get('naip_site_type') or '—'} | "
+                f"{who}{audit}{row.get('bucket')} | type={row.get('naip_site_type') or '—'} | "
                 f"img={row.get('imagery_used') or '—'} | "
                 f"tier={row.get('nearmap_tier') or '—'} | "
                 f"ai={row.get('escalation_model') or row.get('primary_model') or '—'} | "
@@ -1411,6 +1472,10 @@ def run_enrichment(
     reuse_chips_dirs: list[Path] | None = None,
     confirm_rooftop: bool = False,
     confirm_existing: bool = False,
+    connectx_audit: bool = False,
+    audit_pool: bool = False,
+    audit_llm_classified: bool | None = None,
+    audit_assign_to: str | None = None,
     workers: int | None = None,
 ) -> dict[str, Any]:
     """Run proximity + NAIP/Nearmap/Claude enrichment and Salesforce-apply.
@@ -1441,6 +1506,13 @@ def run_enrichment(
     tower picklist rows use FCC/TowerSource + NAIP/Nearmap. Failures are
     left unchanged.
 
+    ``connectx_audit`` queries ConnectX rooftops not owned by the Site
+    Acquisition Team and runs the full classify path. Confirmed rows get the
+    normal write; Nearmap-oblique no-gear rows are reassigned to the pool and
+    unqualified (No Site/Decommissioned); inconclusive rows are left as-is.
+    ``audit_pool`` audits the pool's own sites instead; ``audit_assign_to``
+    adds that OwnerId to every confirmed write. See ``enrichment.connectx_audit``.
+
     ``workers`` (default ``CLASSIFY_WORKERS``) classify imagery in parallel.
     """
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -1465,6 +1537,7 @@ def run_enrichment(
             f"db_only={str(db_only).lower()} | "
             f"confirm_rooftop={str(confirm_rooftop).lower()} | "
             f"confirm_existing={str(confirm_existing).lower()} | "
+            f"connectx_audit={str(connectx_audit).lower()} | "
             f"stages={','.join(stages or list(DEFAULT_STAGE_FILTER))} | "
             f"workers={workers} | run_dir={run_dir.name}"
             + (f" | reuse_chips={len(reuse_chips_dirs)}" if reuse_chips_dirs else ""),
@@ -1506,6 +1579,9 @@ def run_enrichment(
                 llm_classified=llm_classified,
                 site_type=site_type,
                 verbose=verbose,
+                connectx_audit=connectx_audit,
+                audit_pool=audit_pool,
+                audit_llm_classified=audit_llm_classified,
             )
             if verbose:
                 progress.result(f"{len(sites)} site(s)")
@@ -1526,7 +1602,7 @@ def run_enrichment(
             progress.step(f"processing {len(sites)} of {queued}{suffix}")
 
         sql_state["cursor"] = sql_connection.cursor() if sql_connection is not None else None
-        leave_failures = confirm_rooftop or confirm_existing
+        leave_failures = confirm_rooftop or confirm_existing or connectx_audit
         if apply:
             sink = SiteSink(run_dir.name)
             sink.begin({"sites": len(sites), "apply_enabled": 1})
@@ -1542,11 +1618,23 @@ def run_enrichment(
                 db_only=db_only,
                 confirm_rooftop=confirm_rooftop,
                 confirm_existing=confirm_existing,
+                connectx_audit=connectx_audit,
             ),
             write_holdout=not db_only and not leave_failures,
             error_holdout=not leave_failures,
             sink=sink,
             compact=workers > 1,
+            decorate=(
+                (
+                    lambda row: stamp_audit_verdict(
+                        row,
+                        run_id=run_dir.name,
+                        assign_confirmed_to=audit_assign_to,
+                    )
+                )
+                if connectx_audit
+                else None
+            ),
         )
 
         prefetch_sites = [
@@ -1628,6 +1716,7 @@ def run_enrichment(
                 db_only=db_only,
                 confirm_rooftop=confirm_rooftop,
                 confirm_existing=confirm_existing,
+                connectx_audit=connectx_audit,
                 verbose=verbose,
             )
         if classify_error is not None:
