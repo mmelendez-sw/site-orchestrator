@@ -1,27 +1,29 @@
-"""Hot swap: replace each rep site the ConnectX audit unqualified with a verified pool rooftop.
+"""Refill rep books with verified pool rooftops, against what each rep is owed.
 
 python -m enrichment.reconcile_swaps
 
-Reads every live ConnectX audit run (``runs/*_connectx_audit``):
+**Owed** (one slot per site a rep lost):
 
-- **Losses**: rep-owned sites the audit unqualified (``audit_verdict=no_asset``,
-  ``sf_update_status=unqualified``, original ``OwnerId`` not the pool).
-- **Stock**: pool sites the audit confirmed as Rooftop (``audit_verdict=confirmed``,
-  ``update_site_type=Rooftop``, written, original owner the pool, not already
-  handed to someone with ``AUDIT_ASSIGN_TO``).
+- every site ``enrichment.reconcile_pull`` moved to the pool
+  (``swaps/pull_ledger.csv``, status applied), and
+- every rep-owned site a live ConnectX audit unqualified (rep-books mode).
 
-Both lists are re-checked live in Salesforce before matching: the loss must
-still be Unqualified and away from the rep, the replacement must still be a
-pool-owned, New/Unreviewed Rooftop, and the rep must be an active user.
-Each loss gets one replacement, same Site_State__c first, else any state.
-A replacement write sets ``OwnerId`` = rep and ``Site_Assignment_Date__c`` =
-today.
+**Stock**: pool sites a live audit confirmed as Rooftop (``audit_verdict=
+confirmed``, ``update_site_type=Rooftop``, written, owned by the pool when
+audited, not already handed out with ``AUDIT_ASSIGN_TO``). A pulled site
+that confirms is stock too, and goes back to its own rep first.
 
-``SWAP_APPLY=1`` writes; anything else only plans. Every run writes its plan
-to ``swaps/<stamp>_swap_plan.csv``; applied swaps append to
-``swaps/swap_ledger.csv``, which keeps a loss or a replacement from being
-used twice. Optional: ``SWAP_LIMIT`` (max swaps), ``SWAP_REPS`` (comma list
-of rep names to serve).
+Both lists are re-checked live in Salesforce: a lost site must still be away
+from its rep (audit losses must also still be Unqualified), the rep must be
+active, and stock must still be a pool-owned New/Unreviewed Rooftop. Slots
+fill round-robin across reps (so a shortfall is shared), each taking its own
+site if confirmed, else the same Site_State__c, else any state. A fill sets
+``OwnerId`` = rep and ``Site_Assignment_Date__c`` = today.
+
+``SWAP_APPLY=1`` writes; anything else only plans. Each run writes
+``swaps/<stamp>_swap_plan.csv`` and prints owed / filled / planned / open per
+rep; applied fills append to ``swaps/swap_ledger.csv`` so no slot or stock
+site is used twice. Optional: ``SWAP_LIMIT`` (max fills), ``SWAP_REPS``.
 """
 
 from __future__ import annotations
@@ -41,6 +43,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from enrichment.coerce import lower_text  # noqa: E402
+from enrichment.reconcile_pull import PULL_LEDGER_CSV, read_pull_ledger  # noqa: E402
 from enrichment.connectx_audit import (  # noqa: E402
     VERDICT_CONFIRMED,
     VERDICT_NO_ASSET,
@@ -53,6 +56,7 @@ REPLACEMENT_STAGE = "New/Unreviewed"
 LEDGER_CSV = "swap_ledger.csv"
 LEDGER_COLUMNS = (
     "swapped_at",
+    "source",
     "lost_id",
     "rep_owner_id",
     "rep_name",
@@ -72,6 +76,7 @@ class Loss:
     rep_owner_id: str
     rep_name: str
     state: str
+    source: str = "audit"  # audit (unqualified) | pull (moved to pool)
 
 
 @dataclass(frozen=True)
@@ -140,6 +145,36 @@ def collect_stock(rows: Iterable[tuple[Path, bool, dict]], pool_owner_id: str) -
     return list(out.values())
 
 
+def losses_from_pull_ledger(rows: Iterable[dict[str, str]]) -> list[Loss]:
+    """One owed slot per site the pull moved to the pool."""
+    out: dict[str, Loss] = {}
+    for row in rows:
+        if row.get("status") != "applied":
+            continue
+        out[row["site_id"]] = Loss(
+            lost_id=row["site_id"],
+            rep_owner_id=row["rep_owner_id"],
+            rep_name=row.get("rep_name") or "",
+            state=(row.get("state") or "").strip().upper(),
+            source="pull",
+        )
+    return list(out.values())
+
+
+def _round_robin(losses: Sequence[Loss]) -> list[Loss]:
+    """Interleave reps (largest owed first) so a shortfall is shared evenly."""
+    by_rep: dict[str, list[Loss]] = {}
+    for loss in losses:
+        by_rep.setdefault(loss.rep_owner_id, []).append(loss)
+    queues = sorted(by_rep.values(), key=len, reverse=True)
+    out: list[Loss] = []
+    while any(queues):
+        for queue in queues:
+            if queue:
+                out.append(queue.pop(0))
+    return out
+
+
 def read_ledger(path: Path) -> list[dict[str, str]]:
     if not path.is_file():
         return []
@@ -155,18 +190,27 @@ def plan_swaps(
     used_stock: set[str] = frozenset(),
     limit: int | None = None,
 ) -> list[dict[str, str]]:
-    """One replacement per loss: same state first, else any remaining stock."""
+    """One replacement per owed slot, round-robin across reps.
+
+    A rep's own pulled site comes back first when it confirmed; otherwise the
+    same state, else any remaining stock. Sites that are themselves owed are
+    reserved for their own rep.
+    """
     available = [s for s in stock if s.site_id not in used_stock]
+    open_losses = [l for l in losses if l.lost_id not in used_losses]
+    owed_ids = {l.lost_id[:15] for l in open_losses}
     plan: list[dict[str, str]] = []
-    for loss in losses:
-        if loss.lost_id in used_losses:
-            continue
-        if limit is not None and len(plan) >= limit:
+    for loss in _round_robin(open_losses):
+        if limit is not None and sum(r["status"] == "planned" for r in plan) >= limit:
             break
-        pick = next((s for s in available if loss.state and s.state == loss.state), None)
-        match = "same_state"
-        if pick is None and available:
-            pick, match = available[0], "any_state"
+        pick = next((s for s in available if s.site_id[:15] == loss.lost_id[:15]), None)
+        match = "own_site"
+        if pick is None:
+            others = [s for s in available if s.site_id[:15] not in owed_ids]
+            pick = next((s for s in others if loss.state and s.state == loss.state), None)
+            match = "same_state"
+            if pick is None and others:
+                pick, match = others[0], "any_state"
         if pick is None:
             plan.append(_plan_row(loss, None, "no_stock"))
             continue
@@ -182,12 +226,36 @@ def _plan_row(loss: Loss, pick: Stock | None, match: str) -> dict[str, str]:
         "rep_owner_id": loss.rep_owner_id,
         "rep_name": loss.rep_name,
         "lost_state": loss.state,
+        "source": loss.source,
         "replacement_id": pick.site_id if pick else "",
         "replacement_state": pick.state if pick else "",
         "match": match,
         "status": "planned" if pick else "waiting",
         "error": "",
     }
+
+
+def per_rep_summary(
+    owed: Sequence[Loss], ledger: Sequence[dict], plan: Sequence[dict]
+) -> dict[str, dict[str, int]]:
+    """owed / filled (ledger) / planned (this run) / open, per rep name."""
+    names = {l.rep_owner_id[:15]: l.rep_name for l in owed}
+    out: dict[str, dict[str, int]] = {}
+
+    def bucket(owner_id: str) -> dict[str, int]:
+        name = names.get(owner_id[:15]) or owner_id
+        return out.setdefault(name, {"owed": 0, "filled": 0, "planned": 0, "open": 0})
+
+    for loss in {l.lost_id: l for l in owed}.values():
+        bucket(loss.rep_owner_id)["owed"] += 1
+    for row in ledger:
+        bucket(row["rep_owner_id"])["filled"] += 1
+    for row in plan:
+        if row["status"] == "planned":
+            bucket(row["rep_owner_id"])["planned"] += 1
+    for c in out.values():
+        c["open"] = c["owed"] - c["filled"] - c["planned"]
+    return out
 
 
 def _chunks(items: Sequence[str], size: int = 200):
@@ -233,7 +301,9 @@ def filter_live(
     kept_losses = []
     for loss in losses:
         rec = live_loss.get(loss.lost_id[:15])
-        if rec is None or rec.get("Stage__c") != "Unqualified":
+        if rec is None:
+            notes.append(f"loss {loss.lost_id}: not found — skipped")
+        elif loss.source == "audit" and rec.get("Stage__c") != "Unqualified":
             notes.append(f"loss {loss.lost_id}: no longer Unqualified — skipped")
         elif str(rec.get("OwnerId") or "")[:15] == loss.rep_owner_id[:15]:
             notes.append(f"loss {loss.lost_id}: back with the rep — skipped")
@@ -308,7 +378,9 @@ def main() -> int:
     pool_owner_id = site_acq_owner_id()
 
     rows = list(iter_audit_rows(runs_dir()))
-    losses = collect_losses(rows, pool_owner_id)
+    losses = losses_from_pull_ledger(read_pull_ledger(swaps_dir() / PULL_LEDGER_CSV))
+    pulled = {l.lost_id for l in losses}
+    losses += [l for l in collect_losses(rows, pool_owner_id) if l.lost_id not in pulled]
     if reps:
         losses = [l for l in losses if l.rep_name.lower() in reps]
     stock = collect_stock(rows, pool_owner_id)
@@ -317,12 +389,13 @@ def main() -> int:
     used_losses = {r["lost_id"] for r in ledger}
     used_stock = {r["replacement_id"] for r in ledger}
     print(
-        f"audit losses: {len(losses)} (already swapped {len(used_losses & {l.lost_id for l in losses})}) | "
+        f"owed slots: {len(losses)} (already filled {len(used_losses & {l.lost_id for l in losses})}) | "
         f"verified pool rooftops: {len(stock)} (already given {len(used_stock & {s.site_id for s in stock})})",
         flush=True,
     )
 
     sf = SalesforceClient().sf
+    losses_all = list(losses)
     losses = [l for l in losses if l.lost_id not in used_losses]
     stock = [s for s in stock if s.site_id not in used_stock]
     losses, stock, notes = filter_live(sf, losses, stock, pool_owner_id)
@@ -335,10 +408,11 @@ def main() -> int:
         f"plan: {len(planned)} swap(s), {len(plan) - len(planned)} rep site(s) waiting for stock",
         flush=True,
     )
-    for row in plan:
+    summary = per_rep_summary(losses_all, ledger, plan)
+    print(f"  {'rep':26} {'owed':>5} {'filled':>6} {'planned':>7} {'open':>5}", flush=True)
+    for name, c in sorted(summary.items(), key=lambda kv: -kv[1]["owed"]):
         print(
-            f"  {row['rep_name']:24} lost {row['lost_id']} ({row['lost_state'] or '?'}) → "
-            f"{row['replacement_id'] or '—'} ({row['replacement_state'] or '-'}) [{row['match']}]",
+            f"  {name:26} {c['owed']:5} {c['filled']:6} {c['planned']:7} {c['open']:5}",
             flush=True,
         )
     if apply and planned:
