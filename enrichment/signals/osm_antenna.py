@@ -53,6 +53,7 @@ _limiter = RateLimiter(env_float("OSM_ANTENNA_RPM", 60))
 # the configured URL first, then well-known public mirrors.
 OSM_ANTENNA_TIMEOUT_S = env_float("OSM_ANTENNA_TIMEOUT_S", max(25.0, float(OSM_TIMEOUT_S)))
 _DEFAULT_MIRRORS = (
+    "https://overpass-api.de/api/interpreter",
     "https://overpass.kumi.systems/api/interpreter",
     "https://overpass.private.coffee/api/interpreter",
 )

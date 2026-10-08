@@ -16,7 +16,7 @@ from typing import Any
 
 from PIL import Image
 
-from envutil import env_int
+from envutil import env_flag, env_int
 
 MODEL_IMAGE_MAX_PX = env_int("MODEL_IMAGE_MAX_PX", 768)
 MODEL_MAX_OBLIQUES = env_int("MODEL_MAX_OBLIQUES", 2)
@@ -66,8 +66,18 @@ def _is_naip_view(asset_view: str | None) -> bool:
 
 
 def is_street_level_label(label: Any) -> bool:
-    """True for a supplemental street-level photo (Mapillary / Street View)."""
+    """True for a supplemental street-level photo (Mapillary)."""
     return str(label or "").strip().lower().startswith(STREET_LEVEL_PREFIX)
+
+
+def supplemental_can_confirm() -> bool:
+    """SUPPLEMENTAL_CAN_CONFIRM=1: a boxed street-level photo may stand in for a
+    Nearmap oblique in the cell gates (dual-model agreement still required)."""
+    return env_flag("SUPPLEMENTAL_CAN_CONFIRM", False)
+
+
+def _street_views_only(views: list) -> list:
+    return [(label, img) for label, img in views if is_street_level_label(label)]
 
 
 def is_state_ortho_label(label: Any) -> bool:
@@ -250,6 +260,11 @@ def coerce_asset_box(box) -> list[int] | None:
     if (ymax - ymin) > ASSET_BOX_MAX_SIDE or (xmax - xmin) > ASSET_BOX_MAX_SIDE:
         return None
     return [ymin, xmin, ymax, xmax]
+
+
+def has_street_asset_box(res: dict) -> bool:
+    """True when the asset box sits on a street-level photo."""
+    return is_street_level_label(res.get("asset_view")) and get_valid_asset_box(res) is not None
 
 
 def get_valid_asset_box(res: dict) -> list[int] | None:

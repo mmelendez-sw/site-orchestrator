@@ -388,11 +388,15 @@ def update_site(
 def build_row_payload(row: dict[str, Any], *, write_holdout: bool = True) -> dict[str, Any]:
     """Salesforce payload for one detail row (site fields + queue flags)."""
     from enrichment.connectx_audit import (
+        audit_holdout_payload,
         confirmed_owner_id,
+        is_audit_holdout_row,
         is_unqualify_row,
         unqualify_payload,
     )
 
+    if is_audit_holdout_row(row):
+        return audit_holdout_payload(row)
     if is_unqualify_row(row):
         return unqualify_payload(row)
     payload = row.get("payload")

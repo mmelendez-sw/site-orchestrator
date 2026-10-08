@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+from datetime import date
 from typing import Any
 
 from classifier.evidence import (
@@ -17,7 +19,7 @@ from classifier.views import (
     is_street_level_label,
     parse_box_2d,
 )
-from envutil import env_flag
+from envutil import env_flag, env_float
 from salesforce.site_type_mapping import (
     cell_equipment_confirmed,
     map_site_type_for_upload,
@@ -136,27 +138,55 @@ def _rooftop_oblique_imagery_ok(classified: dict[str, Any]) -> bool:
     return _street_confirm_source(classified) is not None
 
 
-# Verified_Site_Source__c picklist value per street-level source. Mapillary has
-# no picklist value yet: those confirms hold out until an admin adds one.
-STREET_VERIFIED_SOURCES = {"streetview": "Google Map"}
+# Verified_Site_Source__c picklist value per street-level source. Mapillary
+# uses Google Map (the street-level value); a source missing here holds out.
+STREET_VERIFIED_SOURCES = {"mapillary": "Google Map"}
+
+
+# Street photos show architecture (cornices, finials, louvers) that a model
+# can talk itself into calling gear; a street confirm must not hedge.
+STREET_HEDGE_CUES: tuple[str, ...] = (
+    "consistent with",
+    "characteristic of",
+    "appears",
+    "resembl",
+    "suggest",
+    "could be",
+)
+STREET_CONFIRM_MIN_CELL_CONF = 0.9
+
+
+def _street_photo_year(view: str) -> int | None:
+    match = re.search(r"\b((?:19|20)\d{2})-\d{2}\b", view)
+    return int(match.group(1)) if match else None
 
 
 def _street_confirm_source(classified: dict[str, Any]) -> str | None:
-    """``streetview`` / ``mapillary`` when a street photo may confirm a rooftop.
+    """``mapillary`` when a street photo may confirm a rooftop or tower.
 
-    Opt-in (SUPPLEMENTAL_CAN_CONFIRM=1, default off): the asset box must sit
-    on a street-level view. Dual-model agreement is still enforced by the
-    rooftop gates in ``bucket_classification``.
+    Opt-in (SUPPLEMENTAL_CAN_CONFIRM=1, default off). The asset box must sit
+    on a street-level view, Claude must have boxed the gear itself
+    (``agree_localize``, not a yes/no on Gemini's crop), cell confidence must
+    reach 0.9 with unhedged evidence, and the photo must be at most
+    STREET_CONFIRM_MAX_AGE_YEARS (default 5) old.
     """
     if not env_flag("SUPPLEMENTAL_CAN_CONFIRM", False):
         return None
     view = str(classified.get("asset_view") or "")
     if not is_street_level_label(view) or not _compact_asset_box(classified):
         return None
-    lower = view.lower()
-    if "street view" in lower or "google" in lower:
-        return "streetview"
-    if "mapillary" in lower:
+    if str(classified.get("dual_model_resolution") or "").strip().lower() != "agree_localize":
+        return None
+    if not _confidence_ok(classified.get("cell_equipment_confidence"), STREET_CONFIRM_MIN_CELL_CONF):
+        return None
+    text = evidence_text(classified)
+    if has_any(text, HEDGE_CUES) or has_any(text, STREET_HEDGE_CUES):
+        return None
+    year = _street_photo_year(view)
+    max_age = env_float("STREET_CONFIRM_MAX_AGE_YEARS", 5.0)
+    if year is None or date.today().year - year > max_age:
+        return None
+    if "mapillary" in view.lower():
         return "mapillary"
     return "street"
 
@@ -265,6 +295,9 @@ def _tower_gemini_high_conf_ok(classified: dict[str, Any]) -> bool:
     if str(classified.get("site_type") or "").strip().lower() != "tower":
         return False
     if not cell_equipment_confirmed(classified.get("cell_equipment")):
+        return False
+    # A tower boxed on a street photo goes through the street gate (Claude required).
+    if is_street_level_label(classified.get("asset_view")):
         return False
     if not _confidence_ok(
         classified.get("site_confidence"), GEMINI_TOWER_SKIP_CLAUDE_CONF
@@ -508,7 +541,10 @@ def bucket_classification(
                 return _holdout(
                     BUCKET_ROOFTOP, "rooftop_not_certain_on_naip", classified
                 )
-        elif not _tower_gemini_high_conf_ok(classified):
+        elif not _tower_gemini_high_conf_ok(classified) and not (
+            _street_confirm_source(classified) is not None
+            and _dual_model_hard_agree(classified)
+        ):
             return _holdout(BUCKET_OTHER, "tower_naip_only_forbidden", classified)
 
     if site_type_raw == "tower" and not cell_equipment_confirmed(
@@ -621,15 +657,12 @@ def bucket_classification(
         match_source, classified=classified
     )
     street_source = _street_confirm_source(classified)
-    if (
-        site_type_raw == "rooftop"
-        and match_source == MATCH_SOURCE_NONE
-        and street_source is not None
-    ):
+    if match_source == MATCH_SOURCE_NONE and street_source is not None:
         picklist = STREET_VERIFIED_SOURCES.get(street_source)
         if not picklist:
+            bucket = BUCKET_ROOFTOP if site_type_raw == "rooftop" else BUCKET_OTHER
             return _holdout(
-                BUCKET_ROOFTOP, f"street_confirm_{street_source}_needs_picklist", classified
+                bucket, f"street_confirm_{street_source}_needs_picklist", classified
             )
         verified_source = picklist
     # Uncertain rooftops must never stamp Verified_Site_Source__c = NAIP.
@@ -690,7 +723,7 @@ def _resolve_update_coords(
     if require_asset_box and _parse_asset_box_2d(classified):
         if sf_lat is not None and sf_lng is not None:
             if is_street_level_label(classified.get("asset_view")):
-                return sf_lat, sf_lng, "street_view_box_pin"
+                return sf_lat, sf_lng, "street_photo_box_pin"
             return sf_lat, sf_lng, "nearmap_asset_box_pin"
         return None, None, "none"
 

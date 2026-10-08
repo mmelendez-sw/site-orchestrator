@@ -24,7 +24,6 @@ from enrichment.bucketing import (
 )
 
 STREET = "Street-level photo (Mapillary 2024-05, 38 m south of site, facing north)"
-GSV = "Street-level photo (Google Street View 2025-03, 22 m west of site, facing east)"
 ORTHO = "State orthoimagery top-down (NY 2024, ~15 cm)"
 
 
@@ -77,8 +76,8 @@ def _street_rooftop(**kw):
         "cell_equipment_evidence": "sector panel antennas on the parapet",
         "cell_gear_kind": "sector_panel",
         "asset_box_2d": [400, 400, 520, 520],
-        "asset_view": GSV,
-        "dual_model_resolution": "agree_crop",
+        "asset_view": STREET,
+        "dual_model_resolution": "agree_localize",
         "cell_models_agree": True,
         "escalation_model": "claude",
         "nearmap_tier": "naip_only",
@@ -102,19 +101,56 @@ class StreetConfirmGateTests(unittest.TestCase):
             out = self._bucket(_street_rooftop())
         self.assertNotEqual(out["bucket"], "potential_update")
 
-    def test_opt_in_street_view_confirms_with_google_map_source(self):
+    def test_opt_in_mapillary_confirms_with_google_map_source(self):
         with patch.dict(os.environ, {"SUPPLEMENTAL_CAN_CONFIRM": "1"}):
-            self.assertEqual(_street_confirm_source(_street_rooftop()), "streetview")
+            self.assertEqual(_street_confirm_source(_street_rooftop()), "mapillary")
             self.assertTrue(_rooftop_localization_box_ok(_street_rooftop()))
             out = self._bucket(_street_rooftop())
         self.assertEqual(out["bucket"], "potential_update", out.get("holdout_reason"))
         self.assertEqual(out["update_verified_site_source"], "Google Map")
-        self.assertEqual(out["update_coord_source"], "street_view_box_pin")
+        self.assertEqual(out["update_coord_source"], "street_photo_box_pin")
 
-    def test_opt_in_mapillary_holds_out_until_picklist_exists(self):
+    def test_opt_in_unknown_street_source_holds_out(self):
+        other = "Street-level photo (KartaView 2024-05, 30 m south of site, facing north)"
         with patch.dict(os.environ, {"SUPPLEMENTAL_CAN_CONFIRM": "1"}):
-            out = self._bucket(_street_rooftop(asset_view=STREET))
-        self.assertEqual(out["holdout_reason"], "street_confirm_mapillary_needs_picklist")
+            out = self._bucket(_street_rooftop(asset_view=other))
+        self.assertEqual(out["holdout_reason"], "street_confirm_street_needs_picklist")
+
+    def test_opt_in_street_tower_with_dual_agree_writes_google_map(self):
+        tower = _street_rooftop(site_type="tower", tower_subtype="monopole",
+                                site_confidence=0.85, dual_model_resolution="agree_localize")
+        with patch.dict(os.environ, {"SUPPLEMENTAL_CAN_CONFIRM": "1"}):
+            out = self._bucket(tower)
+        self.assertEqual(out["bucket"], "potential_update", out.get("holdout_reason"))
+        self.assertEqual(out["update_verified_site_source"], "Google Map")
+
+    def test_street_tower_without_opt_in_stays_naip_forbidden(self):
+        tower = _street_rooftop(site_type="tower", tower_subtype="monopole",
+                                site_confidence=0.85, dual_model_resolution="agree_localize")
+        with patch.dict(os.environ, {"SUPPLEMENTAL_CAN_CONFIRM": ""}):
+            out = self._bucket(tower)
+        self.assertEqual(out["holdout_reason"], "tower_naip_only_forbidden")
+
+    def test_street_confirm_rejects_crop_only_hedged_old_or_weak(self):
+        old_photo = "Street-level photo (Mapillary 2016-09, 98 m N of site, facing S toward site)"
+        cases = {
+            "crop": _street_rooftop(dual_model_resolution="agree_crop"),
+            "hedged": _street_rooftop(cell_equipment_evidence=(
+                "vertical ribbed elements consistent with sector panel mounts")),
+            "old": _street_rooftop(asset_view=old_photo),
+            "weak": _street_rooftop(cell_equipment_confidence=0.85),
+        }
+        with patch.dict(os.environ, {"SUPPLEMENTAL_CAN_CONFIRM": "1"}):
+            for name, res in cases.items():
+                self.assertIsNone(_street_confirm_source(res), name)
+                self.assertNotEqual(self._bucket(res)["bucket"], "potential_update", name)
+
+    def test_street_tower_skips_gemini_solo_lock(self):
+        tower = _street_rooftop(site_type="tower", tower_subtype="monopole",
+                                site_confidence=0.95, dual_model_resolution="gemini_strong_solo")
+        with patch.dict(os.environ, {"SUPPLEMENTAL_CAN_CONFIRM": "1"}):
+            out = self._bucket(tower)
+        self.assertNotEqual(out["bucket"], "potential_update")
 
     def test_opt_in_still_requires_dual_model_agreement(self):
         with patch.dict(os.environ, {"SUPPLEMENTAL_CAN_CONFIRM": "1"}):
@@ -150,14 +186,14 @@ class EvidenceOnlyIntegrationTests(unittest.TestCase):
             return real_generate(model=model, contents=contents, config=config)
 
         clients["gemini"].models.generate_content = recording_generate
-        street = SupplementalView(label=GSV, image=_img(), source="streetview", captured=None, meta={})
+        street = SupplementalView(label=STREET, image=_img(), source="mapillary", captured=None, meta={})
         e2e._SITE_BY_THREAD["site"] = e2e.ROOF_ID
         env = {"NEARMAP_API_KEY": "x", "NEARMAP_TIERED": "1", "BIFURCATED_AI": "1",
                "GEMINI_ONLY": "0", "NAIP_ONLY": "0", "OSM_PREFILTER": "0",
                "SUPPLEMENTAL_CAN_CONFIRM": can_confirm}
         with tempfile.TemporaryDirectory() as tmp, \
                 patch.dict(os.environ, env), \
-                patch("classifier.sources.enabled_sources", return_value=["streetview"]), \
+                patch("classifier.sources.enabled_sources", return_value=["mapillary"]), \
                 patch("classifier.sources.fetch_supplemental_views", return_value=[street]), \
                 patch("classifier.imagery.fetch_chip", side_effect=e2e._fake_chip), \
                 patch("classifier.imagery.fetch_nearmap_views", side_effect=e2e._fake_nearmap), \
@@ -184,3 +220,55 @@ class EvidenceOnlyIntegrationTests(unittest.TestCase):
         calls, _out = self._run("1")
         naip_only = [c for c in calls if not any("Nearmap" in v for v in c)]
         self.assertTrue(any(any("Street-level" in v for v in c) for c in naip_only))
+
+
+class StreetFirstPassGateTests(unittest.TestCase):
+    def test_gate_keeps_boxed_street_claim_only_when_opted_in(self):
+        from classifier import asset_classifier as ac
+
+        claim = _street_rooftop(cell_equipment_confidence=0.9, dual_model_resolution="")
+        with patch.dict(os.environ, {"SUPPLEMENTAL_CAN_CONFIRM": "1"}):
+            kept = ac.gate_weak_rooftop_cell_claim(dict(claim))
+        self.assertIs(kept["cell_equipment"], True)
+        self.assertEqual(kept["asset_view"], STREET)
+        with patch.dict(os.environ, {"SUPPLEMENTAL_CAN_CONFIRM": ""}):
+            cleared = ac.gate_weak_rooftop_cell_claim(dict(claim))
+        self.assertIsNone(cleared["cell_equipment"])
+
+    def test_gate_still_clears_low_confidence_street_claim(self):
+        from classifier import asset_classifier as ac
+
+        claim = _street_rooftop(cell_equipment_confidence=0.7, dual_model_resolution="")
+        with patch.dict(os.environ, {"SUPPLEMENTAL_CAN_CONFIRM": "1"}):
+            out = ac.gate_weak_rooftop_cell_claim(dict(claim))
+        self.assertIsNone(out["cell_equipment"])
+
+
+class AuditReasonTests(unittest.TestCase):
+    def test_confirmed_reason_names_the_imagery(self):
+        from enrichment.connectx_audit import audit_verdict
+
+        base = {"bucket": "potential_update", "holdout_reason": ""}
+        self.assertEqual(audit_verdict({**base, "update_verified_site_source": "Google Map"}),
+                         ("confirmed", "street_cell_confirmed"))
+        self.assertEqual(audit_verdict({**base, "nearmap_tier": "naip_only"}),
+                         ("confirmed", "naip_cell_confirmed"))
+
+
+class SavedNearmapChipTests(unittest.TestCase):
+    def test_require_nearmap_skips_naip_only_folders(self):
+        import tempfile
+        from pathlib import Path
+
+        from enrichment.naip_classify import load_saved_chip_pack
+
+        with tempfile.TemporaryDirectory() as tmp:
+            newer, older = Path(tmp, "b", "chips"), Path(tmp, "a", "chips")
+            newer.mkdir(parents=True)
+            older.mkdir(parents=True)
+            _img().save(newer / "S1_NAIP.jpg")
+            _img().save(older / "S1_nearmap_north.jpg")
+            pack = load_saved_chip_pack([newer, older], "S1", require_nearmap=True)
+            self.assertEqual(pack["source_dir"], older)
+            self.assertEqual(list(pack["nearmap_views"]), ["North"])
+            self.assertEqual(load_saved_chip_pack([newer, older], "S1")["source_dir"], newer)

@@ -34,7 +34,7 @@ from envutil import env_flag, env_float
 
 logger = logging.getLogger("classifier.sources")
 
-SUPPORTED_SOURCES: tuple[str, ...] = ("state_ortho", "mapillary", "streetview")
+SUPPORTED_SOURCES: tuple[str, ...] = ("state_ortho", "mapillary")
 
 # Mean Earth radius (m) for haversine; Web Mercator uses the WGS84 major axis.
 EARTH_RADIUS_M = 6_371_008.8
@@ -64,7 +64,7 @@ class SourceMeter:
     """Per-site supplemental imagery usage.
 
     ``requests``: HTTP requests sent (any source). ``billable``: requests that
-    cost money (Street View image fetches only). ``cache_hits``: responses
+    cost money (none of the current sources bill). ``cache_hits``: responses
     served from the disk cache. ``by_source``: views returned per source.
     """
 
@@ -143,7 +143,7 @@ def record_views(source: str, count: int) -> None:
 
 # Env vars whose values are secrets; their values are scrubbed from any text
 # passed through ``redact``. Sources add per-config token env names at runtime.
-_SECRET_ENV_NAMES: set[str] = {"MAPILLARY_ACCESS_TOKEN", "GOOGLE_MAPS_API_KEY"}
+_SECRET_ENV_NAMES: set[str] = {"MAPILLARY_ACCESS_TOKEN"}
 _secret_lock = threading.Lock()
 _SECRET_PARAM_RE = re.compile(
     r"(?i)\b(access_token|api_key|apikey|key|token|signature|client_secret)=([^&\s'\"<>]+)"

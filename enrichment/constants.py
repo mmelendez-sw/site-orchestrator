@@ -128,6 +128,9 @@ BUCKET_OTHER = "other_or_else"
 BUCKET_SKIP = "skip"
 # CONNECTX_AUDIT: Nearmap obliques show no telecom gear → unqualify + reassign.
 BUCKET_AUDIT_UNQUALIFY = "audit_unqualify"
+# CONNECTX_AUDIT + AUDIT_HOLDOUT_OWNER: unconfirmed sites → LLM_Holdout + reassign
+# (replaces the unqualify step).
+BUCKET_AUDIT_HOLDOUT = "audit_holdout"
 
 # General-pool owner for unqualified ConnectX audit sites (User, not a queue).
 SITE_ACQ_TEAM_OWNER_ID = "0053l00000G05h9AAB"

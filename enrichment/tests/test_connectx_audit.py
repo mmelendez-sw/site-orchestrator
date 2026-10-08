@@ -406,3 +406,51 @@ class OfflineAuditRunTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AuditHoldoutOwnerTests(unittest.TestCase):
+    MATT = "005TESTMATT00001"
+
+    def _row(self, **kw):
+        row = {"Id": "a0Z1", "bucket": "other_or_else", "holdout_reason": "other",
+               "naip_site_type": "other", "nearmap_tier": "naip_only"}
+        row.update(kw)
+        return row
+
+    def test_inconclusive_becomes_holdout_for_owner(self):
+        from enrichment.connectx_audit import stamp_audit_verdict
+        from enrichment.sf_ops import build_row_payload
+
+        row = stamp_audit_verdict(self._row(), run_id="r", holdout_owner=self.MATT)
+        self.assertEqual(row["audit_verdict"], "inconclusive")
+        self.assertEqual(row["bucket"], "audit_holdout")
+        self.assertEqual(build_row_payload(row), {"OwnerId": self.MATT, "LLM_Holdout__c": True})
+
+    def test_no_asset_is_held_not_unqualified(self):
+        from enrichment.connectx_audit import stamp_audit_verdict
+        from enrichment.sf_ops import build_row_payload
+
+        row = self._row(naip_site_type="other", naip_site_confidence="0.95",
+                        nearmap_tier="full", nearmap_views="Vert,North,East")
+        row = stamp_audit_verdict(row, run_id="r", holdout_owner=self.MATT)
+        self.assertEqual(row["audit_verdict"], "no_asset")
+        payload = build_row_payload(row)
+        self.assertEqual(payload, {"OwnerId": self.MATT, "LLM_Holdout__c": True})
+        self.assertNotIn("Stage__c", payload)
+
+    def test_errors_and_confirms_untouched(self):
+        from enrichment.connectx_audit import stamp_audit_verdict
+
+        err = stamp_audit_verdict(self._row(error="sql_error"), run_id="r", holdout_owner=self.MATT)
+        self.assertNotEqual(err["bucket"], "audit_holdout")
+        ok = stamp_audit_verdict(self._row(bucket="potential_update", holdout_reason=""),
+                                 run_id="r", holdout_owner=self.MATT)
+        self.assertEqual(ok["bucket"], "potential_update")
+        self.assertNotEqual(ok.get("update_owner_id"), self.MATT)
+
+    def test_off_by_default(self):
+        from enrichment.connectx_audit import stamp_audit_verdict
+
+        with patch.dict(os.environ, {"AUDIT_HOLDOUT_OWNER": ""}):
+            row = stamp_audit_verdict(self._row(), run_id="r")
+        self.assertNotEqual(row["bucket"], "audit_holdout")

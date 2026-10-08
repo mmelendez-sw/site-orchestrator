@@ -16,7 +16,8 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from envutil import env_float
+from classifier.prompts import STREET_BOX_NOTE
+from envutil import env_flag, env_float
 
 logger = logging.getLogger(__name__)
 
@@ -118,10 +119,28 @@ def resolve_reuse_chips_dirs(
     return dirs
 
 
-def load_saved_chip_pack(chip_dirs: list[Path], site_id: str) -> dict[str, Any]:
+_saved_nearmap_dirs: list[Path] | None = None
+
+
+def saved_nearmap_chip_dirs() -> list[Path]:
+    """Every run's chips/ folder, newest first (SAVED_NEARMAP_CHIPS=1). Cached."""
+    global _saved_nearmap_dirs
+    if _saved_nearmap_dirs is None:
+        from paths import runs_dir
+
+        root = runs_dir()
+        found = [p / "chips" for p in root.iterdir() if (p / "chips").is_dir()] if root.is_dir() else []
+        _saved_nearmap_dirs = sorted(found, key=lambda p: p.parent.name, reverse=True)
+    return _saved_nearmap_dirs
+
+
+def load_saved_chip_pack(
+    chip_dirs: list[Path], site_id: str, *, require_nearmap: bool = False
+) -> dict[str, Any]:
     """Load NAIP + Nearmap JPEGs saved under ``{site_id}_nearmap_*.jpg``.
 
-    Searches chip_dirs in order and returns the first pack that has any image.
+    Searches chip_dirs in order and returns the first pack that has any image
+    (with ``require_nearmap``, the first that has a Nearmap view).
     """
     from PIL import Image
 
@@ -141,7 +160,7 @@ def load_saved_chip_pack(chip_dirs: list[Path], site_id: str) -> dict[str, Any]:
             if path.is_file():
                 with Image.open(path) as im:
                     nearmap_views[name] = im.convert("RGB")
-        if naip is not None or nearmap_views:
+        if nearmap_views or (naip is not None and not require_nearmap):
             return {
                 "naip": naip,
                 "nearmap_views": nearmap_views,
@@ -379,9 +398,21 @@ def _classify_site_imagery(
     skip_paid_imagery = bool(ac.NAIP_ONLY)
     reuse_dirs = [Path(p) for p in (reuse_chips_dirs or []) if p]
     reuse_saved = bool(reuse_dirs)
-    skip_nearmap_fetch = skip_paid_imagery or reuse_saved
     saved_pack: dict[str, Any] | None = None
-    if reuse_saved:
+    # SAVED_NEARMAP_CHIPS=1: classify on Nearmap chips an earlier run already
+    # bought for this site (no new spend); sites without any keep the normal path.
+    library_reuse = False
+    if not reuse_saved and not presence_only and env_flag("SAVED_NEARMAP_CHIPS", False):
+        pack = load_saved_chip_pack(saved_nearmap_chip_dirs(), site_id, require_nearmap=True)
+        if pack.get("nearmap_views"):
+            saved_pack, reuse_saved, library_reuse = pack, True, True
+            if verbose:
+                progress.step(
+                    f"saved Nearmap chips ({len(pack['nearmap_views'])}) from "
+                    f"{pack['source_dir'].parent.name}"
+                )
+    skip_nearmap_fetch = skip_paid_imagery or reuse_saved
+    if reuse_saved and not library_reuse:
         saved_pack = load_saved_chip_pack(reuse_dirs, site_id)
         if not saved_chip_pack_usable(saved_pack):
             if verbose:
@@ -464,7 +495,9 @@ def _classify_site_imagery(
                 "OSM: no building/tower at pin (Nearmap only if NAIP finds a site)"
             )
 
-    if reuse_saved and saved_pack is not None:
+    if reuse_saved and saved_pack is not None and not (
+        library_reuse and saved_pack.get("naip") is None
+    ):
         img = saved_pack.get("naip")
         naip_chip_m = ac.CHIP_SIZE_M
         img_date = None
@@ -482,11 +515,13 @@ def _classify_site_imagery(
     # Without SUPPLEMENTAL_CAN_CONFIRM they only join calls that already carry
     # Nearmap views, so the buy-Nearmap decision is unchanged (evidence only).
     supplemental_views: list = []
-    if not presence_only and not reuse_saved:
+    if not presence_only and (library_reuse or not reuse_saved):
         supplemental_views = _supplemental_for_site(
             lat, lon, site_id=site_id, chip_dir=chip_dir, state=site_state, verbose=verbose
         )
     supplemental_can_confirm = ac._env_flag("SUPPLEMENTAL_CAN_CONFIRM", default="0")
+    if supplemental_can_confirm and supplemental_views:
+        prompt += STREET_BOX_NOTE
 
     nearmap_views: dict = {}
     nearmap_date = None

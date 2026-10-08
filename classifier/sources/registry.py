@@ -6,7 +6,7 @@ import logging
 import math
 from pathlib import Path
 
-from classifier.sources import base, mapillary, state_ortho, streetview
+from classifier.sources import base, mapillary, state_ortho
 from classifier.sources.base import SUPPORTED_SOURCES, SupplementalView
 from envutil import env_str
 
@@ -15,7 +15,6 @@ logger = logging.getLogger(__name__)
 _MODULES = {
     "state_ortho": state_ortho,
     "mapillary": mapillary,
-    "streetview": streetview,
 }
 _DISABLED_VALUES = frozenset({"none", "off", "0", "false", "no"})
 

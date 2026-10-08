@@ -38,7 +38,7 @@ def token() -> str:
 
 
 def radius_m() -> float:
-    return max(10.0, env_float("MAPILLARY_RADIUS_M", 60.0))
+    return max(10.0, env_float("MAPILLARY_RADIUS_M", 100.0))
 
 
 def max_heading_diff() -> float:
@@ -226,6 +226,10 @@ def fetch(lat: float, lon: float, *, state: str | None = None) -> list[base.Supp
         return []
     radius = radius_m()
     found, from_cache = _search(lat, lon, radius)
+    if not found:
+        # The bbox endpoint is inconsistent: an empty reply often has coverage
+        # on a second ask.
+        found, from_cache = _search(lat, lon, radius, use_cache=False)
     picked = select(candidates(lat, lon, found, radius=radius), limit)
     fresh: dict | None = None
     images: list[tuple[dict, Any]] = []

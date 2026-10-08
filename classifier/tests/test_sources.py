@@ -16,19 +16,16 @@ from unittest.mock import patch
 from PIL import Image
 
 from classifier import sources
-from classifier.sources import base, mapillary, state_ortho, streetview
+from classifier.sources import base, mapillary, state_ortho
 from classifier.views import is_oblique_label, is_top_down_label, trim_views_for_model
 
 SITE_LAT, SITE_LON = 40.0, -74.0
 MAPILLARY_TOKEN = "MLY|secret-mapillary-token-123"
-GOOGLE_KEY = "AIzaSecretGoogleKey987"
 
 SOURCE_ENV = (
     "SUPPLEMENTAL_IMAGERY", "STATE_ORTHO_SOURCES", "STATE_ORTHO_MAX_VIEWS",
     "MAPILLARY_ACCESS_TOKEN", "MAPILLARY_RADIUS_M", "MAPILLARY_MAX_HEADING_DIFF",
     "MAPILLARY_MAX_VIEWS", "MAPILLARY_SEARCH_CACHE_DAYS",
-    "GOOGLE_STREETVIEW_ENABLED", "GOOGLE_MAPS_API_KEY", "STREETVIEW_RADIUS_M",
-    "STREETVIEW_PITCH", "STREETVIEW_FOV", "STREETVIEW_VIEWS",
     "SUPPLEMENTAL_TIMEOUT_S", "IMAGERY_CACHE", "SITE_ORCHESTRATOR_DATA",
     "ORTHO_TEST_TOKEN",
 )
@@ -170,14 +167,14 @@ class EnabledSourcesTests(SourcesTestCase):
 
     def test_unknown_ignored_and_missing_credentials_dropped(self):
         with self.env(SUPPLEMENTAL_IMAGERY="mapillary,bogus,streetview,state_ortho",
-                      MAPILLARY_ACCESS_TOKEN=MAPILLARY_TOKEN, GOOGLE_MAPS_API_KEY=GOOGLE_KEY):
+                      MAPILLARY_ACCESS_TOKEN=MAPILLARY_TOKEN):
             with self.assertLogs("classifier.sources", level="WARNING") as logs:
                 self.assertEqual(sources.enabled_sources(), ["mapillary"])
         text = "\n".join(logs.output)
         self.assertIn("bogus", text)
-        self.assertIn("GOOGLE_STREETVIEW_ENABLED", text)
+        self.assertIn("streetview", text)
         self.assertIn("STATE_ORTHO_SOURCES", text)
-        self.assertNotIn(GOOGLE_KEY, text)
+        self.assertNotIn(MAPILLARY_TOKEN, text)
 
     def test_logged_once(self):
         with self.env(SUPPLEMENTAL_IMAGERY="bogus"):
@@ -191,12 +188,11 @@ class EnabledSourcesTests(SourcesTestCase):
         cfg = self.write_config([{"name": "X", "states": ["NY"], "type": "wms",
                                   "url": "https://x.invalid/wms", "layer": "o"}])
         with self.env(SUPPLEMENTAL_IMAGERY=" Mapillary , state_ortho, MAPILLARY",
-                      MAPILLARY_ACCESS_TOKEN=MAPILLARY_TOKEN, STATE_ORTHO_SOURCES=cfg,
-                      GOOGLE_STREETVIEW_ENABLED="1", GOOGLE_MAPS_API_KEY=GOOGLE_KEY):
+                      MAPILLARY_ACCESS_TOKEN=MAPILLARY_TOKEN, STATE_ORTHO_SOURCES=cfg):
             self.assertEqual(sources.enabled_sources(), ["mapillary", "state_ortho"])
-        with self.env(SUPPLEMENTAL_IMAGERY="streetview,state_ortho", STATE_ORTHO_SOURCES=cfg,
-                      GOOGLE_STREETVIEW_ENABLED="1", GOOGLE_MAPS_API_KEY=GOOGLE_KEY):
-            self.assertEqual(sources.enabled_sources(), ["streetview", "state_ortho"])
+        with self.env(SUPPLEMENTAL_IMAGERY="state_ortho,mapillary", STATE_ORTHO_SOURCES=cfg,
+                      MAPILLARY_ACCESS_TOKEN=MAPILLARY_TOKEN):
+            self.assertEqual(sources.enabled_sources(), ["state_ortho", "mapillary"])
 
 
 # -------------------------------- state ortho --------------------------------
@@ -365,7 +361,7 @@ def mly_image(image_id: str, dist: float, approach: float, *, heading_offset: fl
 
 MLY_IMAGES = [
     mly_image("best_s", 30, 180),                                   # S, facing N
-    mly_image("far", 100, 0),                                       # beyond 60 m
+    mly_image("far", 140, 0),                                       # beyond 100 m
     mly_image("close", 5, 90),                                      # under 8 m
     mly_image("misaligned", 25, 270, heading_offset=80),            # looks away
     mly_image("pano", 20, 45, pano=True),
@@ -404,7 +400,7 @@ class MapillaryTests(SourcesTestCase):
     def test_empty_search_is_not_cached(self):
         """The bbox endpoint can return [] then real data; [] must not stick."""
         thumb = jpeg_bytes(textured_image(128))
-        replies = [{"data": []}, {"data": MLY_IMAGES}]
+        replies = [{"data": []}, {"data": []}, {"data": MLY_IMAGES}]
 
         def handler(url, params, headers):
             if url == mapillary.SEARCH_URL:
@@ -414,6 +410,20 @@ class MapillaryTests(SourcesTestCase):
         self.fake(handler)
         with self.env(MAPILLARY_ACCESS_TOKEN=MAPILLARY_TOKEN):
             self.assertEqual(mapillary.fetch(SITE_LAT, SITE_LON), [])
+            views = mapillary.fetch(SITE_LAT, SITE_LON)
+        self.assertEqual([v.meta["image_id"] for v in views], ["best_s", "east"])
+
+    def test_empty_search_retried_once(self):
+        thumb = jpeg_bytes(textured_image(128))
+        replies = [{"data": []}, {"data": MLY_IMAGES}]
+
+        def handler(url, params, headers):
+            if url == mapillary.SEARCH_URL:
+                return FakeResp(ctype="application/json", payload=replies.pop(0))
+            return FakeResp(content=thumb)
+
+        self.fake(handler)
+        with self.env(MAPILLARY_ACCESS_TOKEN=MAPILLARY_TOKEN):
             views = mapillary.fetch(SITE_LAT, SITE_LON)
         self.assertEqual([v.meta["image_id"] for v in views], ["best_s", "east"])
 
@@ -438,7 +448,7 @@ class MapillaryTests(SourcesTestCase):
             self.assertIn("computed_compass_angle", search["params"]["fields"])
             self.assertEqual(search["params"]["limit"], 100)
             minlon, minlat, maxlon, maxlat = (float(v) for v in search["params"]["bbox"].split(","))
-            self.assertAlmostEqual(base.haversine_m(minlat, SITE_LON, maxlat, SITE_LON), 120.0, delta=0.5)
+            self.assertAlmostEqual(base.haversine_m(minlat, SITE_LON, maxlat, SITE_LON), 200.0, delta=0.5)
             self.assertLess(minlon, SITE_LON)
             self.assertGreater(maxlon, SITE_LON)
 
@@ -474,83 +484,9 @@ class MapillaryTests(SourcesTestCase):
         views = [("NAIP top-down", img), ("Nearmap oblique (North)", img),
                  ("Nearmap oblique (East)", img), ("Nearmap oblique (South)", img),
                  (mapillary.label_for({"distance_m": 30, "approach": 270, "heading": 90}, "2024-06-01"), img),
-                 (streetview.label_for("2023-07", 22, 225, 45, 25, tall=True), img)]
+                 (mapillary.label_for({"distance_m": 22, "approach": 225, "heading": 45}, "2023-07-01"), img)]
         labels = [label for label, _img in trim_views_for_model(views, max_obliques=2)]
         self.assertEqual(sum("Street-level" in label for label in labels), 2)
-
-
-# -------------------------------- Street View --------------------------------
-
-
-class StreetViewTests(SourcesTestCase):
-    def test_disabled_by_default(self):
-        session = self.fake(lambda url, params, headers: FakeResp())
-        with self.env(GOOGLE_MAPS_API_KEY=GOOGLE_KEY, SUPPLEMENTAL_IMAGERY="streetview"):
-            self.assertFalse(streetview.available()[0])
-            self.assertEqual(sources.enabled_sources(), [])
-            self.assertEqual(streetview.fetch(SITE_LAT, SITE_LON), [])
-            self.assertEqual(sources.fetch_supplemental_views(SITE_LAT, SITE_LON,
-                                                              sources=["streetview"]), [])
-        with self.env(GOOGLE_STREETVIEW_ENABLED="1"):
-            self.assertFalse(streetview.available()[0])
-        self.assertEqual(session.calls, [])
-
-    def test_metadata_not_ok_returns_empty(self):
-        session = self.fake(lambda url, params, headers: FakeResp(
-            ctype="application/json", payload={"status": "ZERO_RESULTS"}))
-        with self.env(GOOGLE_STREETVIEW_ENABLED="1", GOOGLE_MAPS_API_KEY=GOOGLE_KEY):
-            with sources.source_meter() as meter:
-                self.assertEqual(streetview.fetch(SITE_LAT, SITE_LON), [])
-        self.assertEqual(len(session.calls), 1)
-        call = session.calls[0]
-        self.assertEqual(call["url"], streetview.METADATA_URL)
-        self.assertEqual(call["params"]["source"], "outdoor")
-        self.assertEqual(call["params"]["radius"], "50")
-        self.assertEqual((meter.requests, meter.billable), (1, 0))
-
-    def test_heading_to_site(self):
-        south_lat, south_lon = base.destination_point(SITE_LAT, SITE_LON, 30, 180)
-        self.assertAlmostEqual(streetview.heading_to_site(south_lat, south_lon, SITE_LAT, SITE_LON) % 360,
-                               0.0, delta=0.2)
-        east_lat, east_lon = base.destination_point(SITE_LAT, SITE_LON, 30, 90)
-        self.assertAlmostEqual(streetview.heading_to_site(east_lat, east_lon, SITE_LAT, SITE_LON),
-                               270.0, delta=0.2)
-
-    def test_fetch_two_views_billable_and_cached(self):
-        pano_lat, pano_lon = base.destination_point(SITE_LAT, SITE_LON, 22, 225)
-        image = jpeg_bytes(textured_image(160))
-
-        def handler(url, params, headers):
-            if url == streetview.METADATA_URL:
-                return FakeResp(ctype="application/json", payload={
-                    "status": "OK", "pano_id": "PANO_1", "date": "2023-07",
-                    "location": {"lat": pano_lat, "lng": pano_lon}, "copyright": "(c) Google"})
-            return FakeResp(content=image)
-
-        session = self.fake(handler)
-        with self.env(GOOGLE_STREETVIEW_ENABLED="1", GOOGLE_MAPS_API_KEY=GOOGLE_KEY,
-                      STREETVIEW_VIEWS="2"):
-            with sources.source_meter() as meter:
-                views = streetview.fetch(SITE_LAT, SITE_LON)
-            self.assertEqual(len(views), 2)
-            self.assertEqual((meter.requests, meter.billable), (3, 2))
-            img_calls = [c for c in session.calls if c["url"] == streetview.IMAGE_URL]
-            self.assertEqual([c["params"]["pitch"] for c in img_calls], ["25", "40"])
-            for call in img_calls:
-                self.assertEqual(call["params"]["pano"], "PANO_1")
-                self.assertEqual(call["params"]["size"], "640x640")
-                self.assertEqual(call["params"]["fov"], "60")
-                self.assertAlmostEqual(float(call["params"]["heading"]), 45.0, delta=0.5)
-            self.assertEqual(views[0].captured, "2023-07")
-            self.assertEqual(views[0].meta["pano_id"], "PANO_1")
-            self.assertIn("Street-level", views[0].label)
-            self.assertIn("SW of site", views[0].label)
-            self.assertFalse(is_oblique_label(views[1].label))
-            self.assertFalse(is_top_down_label(views[1].label))
-
-            with sources.source_meter() as meter:
-                streetview.fetch(SITE_LAT, SITE_LON)
-            self.assertEqual((meter.requests, meter.billable, meter.cache_hits), (1, 0, 2))
 
 
 # ------------------------------ meter / registry ------------------------------
@@ -564,7 +500,7 @@ class MeterTests(SourcesTestCase):
         meter.add_cache_hit()
         meter.add_views("state_ortho", 1)
         meter.add_views("mapillary", 2)
-        meter.add_views("streetview", 0)
+        meter.add_views("state_ortho", 0)
         self.assertEqual(meter.as_row(), {
             "supplemental_sources": "mapillary:2,state_ortho:1",
             "supplemental_requests": 2,
@@ -645,27 +581,23 @@ class RegistryTests(SourcesTestCase):
 
     def test_keys_never_logged(self):
         def handler(url, params, headers):
-            if url == streetview.METADATA_URL:
-                return FakeResp(status=403, ctype="application/json", payload={})
-            raise ConnectionError(f"failed GET {url}?key={GOOGLE_KEY}&token={MAPILLARY_TOKEN}")
+            raise ConnectionError(f"failed GET {url}?key={MAPILLARY_TOKEN}&token={MAPILLARY_TOKEN}")
 
         self.fake(handler)
-        with self.env(GOOGLE_STREETVIEW_ENABLED="1", GOOGLE_MAPS_API_KEY=GOOGLE_KEY,
-                      MAPILLARY_ACCESS_TOKEN=MAPILLARY_TOKEN,
-                      SUPPLEMENTAL_IMAGERY="streetview,mapillary,bogus"):
+        with self.env(MAPILLARY_ACCESS_TOKEN=MAPILLARY_TOKEN,
+                      SUPPLEMENTAL_IMAGERY="mapillary,bogus"):
             with self.assertLogs("classifier", level="DEBUG") as logs:
                 views = sources.fetch_supplemental_views(SITE_LAT, SITE_LON, site_id="S1")
         self.assertEqual(views, [])
         text = "\n".join(logs.output)
         self.assertIn("ConnectionError", text)
-        self.assertNotIn(GOOGLE_KEY, text)
         self.assertNotIn(MAPILLARY_TOKEN, text)
 
     def test_redact(self):
-        with self.env(GOOGLE_MAPS_API_KEY=GOOGLE_KEY):
-            out = base.redact(f"https://x/y?location=1,2&key={GOOGLE_KEY}&pano=P "
-                              f"Authorization: OAuth {MAPILLARY_TOKEN} raw {GOOGLE_KEY}")
-        self.assertNotIn(GOOGLE_KEY, out)
+        with self.env(MAPILLARY_ACCESS_TOKEN=MAPILLARY_TOKEN):
+            out = base.redact(f"https://x/y?location=1,2&key=AIzaQueryKey987&pano=P "
+                              f"Authorization: OAuth {MAPILLARY_TOKEN} raw {MAPILLARY_TOKEN}")
+        self.assertNotIn("AIzaQueryKey987", out)
         self.assertNotIn("secret-mapillary", out)
         self.assertIn("location=1,2", out)
         self.assertIn("pano=P", out)

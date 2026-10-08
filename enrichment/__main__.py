@@ -26,6 +26,9 @@ decided are skipped (AUDIT_RETRY_INCONCLUSIVE=1 retries inconclusive ones).
 AUDIT_POOL=1 audits the Site Acquisition Team's own sites instead;
 AUDIT_ASSIGN_TO=<User Id> reassigns every confirmed Rooftop to that user.
 AUDIT_UNQUALIFY_OWNER=<User Id> owns no-asset sites (default: the pool).
+AUDIT_HOLDOUT_OWNER=<User Id> replaces the unqualify step: no-asset and
+inconclusive sites get LLM_Holdout__c=true and that OwnerId only.
+SAVED_NEARMAP_CHIPS=1 classifies on Nearmap chips an earlier run bought.
 LLM_CLASSIFIED=1/0 filters the audit queue (unset = either).
 Set DB_ONLY=1 to skip all imagery. Every processed site is marked
 LLM_Classified=true (no LLM_Holdout on success). Unique FCC/TowerSource hits ≤25 m

@@ -39,6 +39,7 @@ from enrichment.coerce import lower_text, to_bool, to_float
 from enrichment.constants import (
     AUDIT_UNQUALIFIED_REASON,
     AUDIT_UNQUALIFIED_STAGE,
+    BUCKET_AUDIT_HOLDOUT,
     BUCKET_AUDIT_UNQUALIFY,
     BUCKET_POTENTIAL_UPDATE,
     CONNECTX_AUDIT_STAGE_FILTER,
@@ -122,6 +123,13 @@ def unqualify_owner_id() -> str:
     return (os.environ.get("AUDIT_UNQUALIFY_OWNER") or "").strip() or site_acq_owner_id()
 
 
+def audit_holdout_owner_id() -> str:
+    """``AUDIT_HOLDOUT_OWNER``: when set, unconfirmed sites (no asset or
+    inconclusive) get LLM_Holdout__c=true and this OwnerId instead of being
+    unqualified."""
+    return (os.environ.get("AUDIT_HOLDOUT_OWNER") or "").strip()
+
+
 def _soql_quote(value: str) -> str:
     return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
 
@@ -184,12 +192,21 @@ def query_connectx_audit_sites(client, **kwargs) -> list[dict[str, Any]]:
     return query_all(client, build_connectx_audit_query(**kwargs))
 
 
+def _confirmed_reason(row: dict[str, Any]) -> str:
+    """Name the imagery that carried a confirmation."""
+    if lower_text(row.get("update_verified_site_source")) == "google map":
+        return "street_cell_confirmed"
+    if imagery_bucket(row) in {"nearmap_oblique", "nearmap_vert"}:
+        return "nearmap_cell_confirmed"
+    return "naip_cell_confirmed"
+
+
 def audit_verdict(row: dict[str, Any]) -> tuple[str, str]:
     """(verdict, reason) for one finished detail row. Pure; works on CSV rows."""
     if lower_text(row.get("bucket")) == BUCKET_POTENTIAL_UPDATE:
         if lower_text(row.get("holdout_reason")) == "skip_classify_db_hit":
             return VERDICT_CONFIRMED, "db_hit"
-        return VERDICT_CONFIRMED, "nearmap_cell_confirmed"
+        return VERDICT_CONFIRMED, _confirmed_reason(row)
     reason = lower_text(row.get("holdout_reason"))
     if reason in _RETRY_REASONS:
         return VERDICT_INCONCLUSIVE, reason
@@ -248,15 +265,24 @@ def stamp_audit_verdict(
     run_id: str,
     owner_id: str | None = None,
     assign_confirmed_to: str | None = None,
+    holdout_owner: str | None = None,
     today: date | None = None,
 ) -> dict[str, Any]:
     """Stamp the verdict; ``no_asset`` rows become unqualify candidates.
 
     ``assign_confirmed_to`` adds that OwnerId to confirmed Rooftop writes only.
+    ``holdout_owner`` (default ``AUDIT_HOLDOUT_OWNER``) replaces the unqualify
+    step: no-asset and inconclusive rows get LLM_Holdout__c=true and that
+    OwnerId. Errored rows are left alone so a later run retries them.
     """
     verdict, reason = audit_verdict(row)
     row["audit_verdict"] = verdict
     row["audit_reason"] = reason
+    holdout_owner = audit_holdout_owner_id() if holdout_owner is None else holdout_owner
+    if holdout_owner and verdict in {VERDICT_NO_ASSET, VERDICT_INCONCLUSIVE} and reason != "error":
+        row["bucket"] = BUCKET_AUDIT_HOLDOUT
+        row["update_owner_id"] = holdout_owner
+        return row
     # Only rooftops are being bought; tower confirms keep their owner.
     if (
         verdict == VERDICT_CONFIRMED
@@ -284,6 +310,17 @@ def unqualify_payload(row: dict[str, Any]) -> dict[str, Any]:
         "Unqualified_Date__c": row.get("update_unqualified_date") or date.today().isoformat(),
         "LLM_Classified__c": True,
     }
+
+
+def is_audit_holdout_row(row: dict[str, Any]) -> bool:
+    return lower_text(row.get("bucket")) == BUCKET_AUDIT_HOLDOUT and bool(
+        str(row.get("update_owner_id") or "").strip()
+    )
+
+
+def audit_holdout_payload(row: dict[str, Any]) -> dict[str, Any]:
+    """Salesforce fields for an audit holdout row: holdout flag + new owner only."""
+    return {"OwnerId": row["update_owner_id"], "LLM_Holdout__c": True}
 
 
 def confirmed_owner_id(row: dict[str, Any]) -> str:

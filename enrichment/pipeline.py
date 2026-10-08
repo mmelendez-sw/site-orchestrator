@@ -42,6 +42,7 @@ from enrichment.bucketing import (
 from enrichment.coerce import to_float
 from enrichment.constants import (
     APPLY_LOG_CSV,
+    BUCKET_AUDIT_HOLDOUT,
     BUCKET_AUDIT_UNQUALIFY,
     BUCKET_OTHER,
     BUCKET_POTENTIAL_UPDATE,
@@ -367,7 +368,7 @@ def _collect_apply_rows(
     apply_rows = [
         row
         for row in detail_rows
-        if row.get("bucket") in {BUCKET_POTENTIAL_UPDATE, BUCKET_AUDIT_UNQUALIFY}
+        if row.get("bucket") in {BUCKET_POTENTIAL_UPDATE, BUCKET_AUDIT_UNQUALIFY, BUCKET_AUDIT_HOLDOUT}
         and _needs_sf_apply(row)
     ]
     leave_failures = confirm_rooftop or confirm_existing or connectx_audit
@@ -1310,7 +1311,7 @@ class _RunState:
         row.setdefault("sf_update_error", "")
         row["sf_update_status"] = (
             "pending"
-            if row.get("bucket") in {BUCKET_POTENTIAL_UPDATE, BUCKET_AUDIT_UNQUALIFY}
+            if row.get("bucket") in {BUCKET_POTENTIAL_UPDATE, BUCKET_AUDIT_UNQUALIFY, BUCKET_AUDIT_HOLDOUT}
             else "skipped"
         )
         self.detail_rows.append(row)

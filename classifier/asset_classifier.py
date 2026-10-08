@@ -57,6 +57,7 @@ from classifier.prompts import (
     TOWER_ONLY_SITE_TYPE_VALUES,
     TOWER_ONLY_ZOOM_CLASSIFICATION_PROMPT,
     ZOOM_CLASSIFICATION_PROMPT,
+    STREET_BOX_NOTE,
     cell_confirm_prompt,
     classify_schema,
 )
@@ -67,13 +68,17 @@ from classifier.views import (
     _crop_zoom,
     _grid_boxes,
     _oblique_views_only,
+    _street_views_only,
     _valid_box,
     asset_view_is_nearmap_oblique,
     box_iou,
     coerce_asset_box,
     get_valid_asset_box,
+    has_street_asset_box,
+    is_street_level_label,
     naip_view_label,
     pick_view_for_asset_box,
+    supplemental_can_confirm,
     trim_views_for_model,
 )
 from envutil import env_flag, env_float, env_str
@@ -408,6 +413,9 @@ def gate_weak_rooftop_cell_claim(res: dict) -> dict:
         return res
     if vert_box and has_cues and conf >= 0.85:
         return res
+    street_box = supplemental_can_confirm() and has_street_asset_box(res)
+    if street_box and has_cues and conf >= 0.9:
+        return res
 
     prior = str(res.get("cell_equipment_evidence") or "").strip()
     reason_bits = []
@@ -471,12 +479,18 @@ def maybe_repair_rooftop_asset_box(
         return res
 
     repair_views = _oblique_views_only(views)
+    repair_prompt = ROOFTOP_BOX_REPAIR_PROMPT
+    if supplemental_can_confirm():
+        street = _street_views_only(views)
+        if street:
+            repair_views = repair_views + street
+            repair_prompt += STREET_BOX_NOTE
     if not repair_views:
         _step_done("box repair", "skipped (no Nearmap obliques)")
         return res
 
     repair = classify_site(
-        provider, clients, repair_views, prompt=ROOFTOP_BOX_REPAIR_PROMPT
+        provider, clients, repair_views, prompt=repair_prompt
     )
     normalize_model_result(repair)
 
@@ -704,7 +718,8 @@ def confirm_rooftop_cell_with_claude(
         res["cell_models_agree"] = False
         return res, ("claude" if already_escalated else None), False
 
-    if site == "rooftop" and not _has_nearmap_context(res):
+    street_ok = supplemental_can_confirm() and has_street_asset_box(res)
+    if site == "rooftop" and not _has_nearmap_context(res) and not street_ok:
         res["claude_cell_equipment"] = None
         res["cell_models_agree"] = False
         _step_done("dual-model cell", "skipped (NAIP-only rooftop)")
@@ -734,7 +749,7 @@ def confirm_rooftop_cell_with_claude(
         )
         return res, "claude", agree
 
-    if should_skip_claude_for_gemini_tower(
+    if not street_ok and should_skip_claude_for_gemini_tower(
         res, from_wide_rescue=from_wide_rescue
     ):
         res["claude_cell_equipment"] = None
@@ -783,6 +798,11 @@ def confirm_rooftop_cell_with_claude(
         mode = "localize_iou"
     if site == "tower" and source_expects_asset(res):
         prompt += CLAIMED_SITE_TOWER_CONFIRM_NOTE
+    street_note = supplemental_can_confirm() and any(
+        is_street_level_label(label) for label, _img in (all_views or views)
+    )
+    if street_note:
+        prompt += STREET_BOX_NOTE
 
     claude_res = classify_site(
         "claude",
@@ -802,7 +822,8 @@ def confirm_rooftop_cell_with_claude(
                 "claude",
                 clients,
                 loc_views,
-                prompt=ROOFTOP_CELL_LOCALIZE_CONFIRM_PROMPT,
+                prompt=ROOFTOP_CELL_LOCALIZE_CONFIRM_PROMPT
+                + (STREET_BOX_NOTE if street_note else ""),
                 claude_model=CLAUDE_ESCALATION_MODEL,
             )
             loc_box = get_valid_asset_box(loc_res)
@@ -1178,6 +1199,10 @@ def build_cell_confirm_views(res: dict, views: list) -> tuple[list, bool]:
     Returns (views_for_confirm, used_crop).
     """
     if str(res.get("site_type") or "").strip().lower() == "tower":
+        return views, False
+    # Street photos: Claude must find and box the gear itself (localize + IoU),
+    # not vote on Gemini's crop, which accepts cornices and finials too easily.
+    if is_street_level_label(res.get("asset_view")):
         return views, False
     valid = get_valid_asset_box(res)
     picked = pick_view_for_asset_box(res, views)

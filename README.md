@@ -97,17 +97,34 @@ The design and rollout plan are in [docs/adr/0001-multi-source-evidence-cascade.
 - **FCC ULS microwave locations:** load them weekly into Azure SQL with `python scripts/load_fcc_uls_microwave.py --dry-run`, then run it again without `--dry-run`. The DDL is in `sql/fcc_uls_microwave.sql`.
 - **OpenCelliD:** needs `OPENCELLID_API_KEY` (1,000 requests per day). It's a weak signal only.
 
-**Supplemental imagery.** Set `SUPPLEMENTAL_IMAGERY=state_ortho,mapillary,streetview`, in priority order.
+**Supplemental imagery.** Set `SUPPLEMENTAL_IMAGERY=state_ortho,mapillary`, in priority order.
 
 | Source | Needs | Notes |
 |---|---|---|
 | `state_ortho` | `STATE_ORTHO_SOURCES=<json>` | State or county ArcGIS / WMS orthoimagery. See `docs/state_ortho_sources.example.json`. Preferred over NAIP when there's no Nearmap top-down view. |
-| `mapillary` | `MAPILLARY_ACCESS_TOKEN` | Free street-level photos facing the site (CC BY-SA). |
-| `streetview` | `GOOGLE_STREETVIEW_ENABLED=1` + `GOOGLE_MAPS_API_KEY` | Paid. **Hold until legal reviews Google Maps Platform terms.** |
+| `mapillary` | `MAPILLARY_ACCESS_TOKEN` | Free street-level photos facing the site (CC BY-SA). Searches `MAPILLARY_RADIUS_M` (default 100 m) and retries an empty search once. |
 
 - **Evidence-only by default.** Without `SUPPLEMENTAL_CAN_CONFIRM`, supplemental views only join model calls that already carry Nearmap, so Nearmap purchasing is unchanged.
-- **`SUPPLEMENTAL_CAN_CONFIRM=1`** lets a boxed street-level view stand in for a Nearmap oblique in the rooftop confirm gate. Dual-model agreement is still required, and Street View confirmations write `Verified_Site_Source = Google Map`. Mapillary confirmations hold out until a `Mapillary` picklist value exists.
+- **`SUPPLEMENTAL_CAN_CONFIRM=1`** lets a boxed street-level view stand in for a Nearmap oblique in the rooftop and tower confirm gates, and tells the models they may box gear on street photos. Mapillary confirmations write `Verified_Site_Source = Google Map`. A street confirm needs all of:
+  - Claude's own box on the photo (`agree_localize`), not a yes/no on Gemini's crop. Crop checks accepted ornate cornices as "parapet masts".
+  - Cell confidence of at least 0.9 and evidence without hedges ("consistent with", "appears", "resembles", ...).
+  - A photo no older than `STREET_CONFIRM_MAX_AGE_YEARS` (default 5).
+  - Towers too: no Gemini-only tower lock on a street photo.
 - **Metering:** each detail row gets `supplemental_*` columns (sources, requests, billable requests, cache hits).
+
+**Saved Nearmap chips.** `SAVED_NEARMAP_CHIPS=1` classifies a site on the Nearmap JPEGs any earlier run already bought for it (newest run first, at no new cost). NAIP is fetched fresh when the saved pack has none, and supplemental views still apply. Sites with no saved Nearmap keep the normal path, so with `NAIP_ONLY=1` they never buy Nearmap.
+
+**Audit holdout instead of unqualify.** `AUDIT_HOLDOUT_OWNER=<User Id>` with `CONNECTX_AUDIT=1` replaces the unqualify step. Every no-asset and inconclusive site gets only `LLM_Holdout__c=true` and `OwnerId=<User Id>`; Stage and the Unqualified fields are untouched. Errored sites are skipped so a later run retries them. Confirmed sites write as usual.
+
+Zero-Nearmap audit of the Site Acquisition Team's ConnectX rooftops (drop `APPLY=0` to write):
+
+```powershell
+python -m enrichment.lanes --pool-audit --lanes 5 --batch 10 --stop-at-mb <current MTD MB + 1> `
+  --env APPLY=0 --env NAIP_ONLY=1 --env SAVED_NEARMAP_CHIPS=1 `
+  --env AUDIT_HOLDOUT_OWNER=0056O00000EpUOgQAN `
+  --env SUPPLEMENTAL_IMAGERY=mapillary --env SUPPLEMENTAL_CAN_CONFIRM=1 `
+  --env SIGNALS=1 --env SIGNALS_SOURCES=opencellid
+```
 
 **Model resilience.** `GEMINI_FALLBACK_MODEL=<GA model>` retries Gemini 429/503 failures on that model. After `GEMINI_FALLBACK_AFTER` consecutive failures (default 2), a circuit breaker sends calls straight to the fallback for `GEMINI_FALLBACK_COOLDOWN_S` (default 300). `classify_site` now honours `GEMINI_RETRIES`.
 

@@ -471,6 +471,17 @@ the crown.
 """
 
 
+# Appended when SUPPLEMENTAL_CAN_CONFIRM=1 and street-level photos are in the views.
+STREET_BOX_NOTE = """
+Street-level photos (labels starting "Street-level photo") were taken from a \
+nearby street with the camera facing the site; the label gives the camera \
+position. When cellular gear on the site is clearer in a street-level photo \
+than in any aerial view, draw asset_box_2d on that photo and set asset_view to \
+its exact label. Box only gear on the building or structure the camera faces at \
+the site, never gear on other buildings in the background or on utility poles.
+"""
+
+
 def cell_confirm_prompt(site_type: str, *, used_crop: bool) -> str:
     """Prompt for dual-model cell confirm: tower vs rooftop, crop vs localize."""
     site = str(site_type or "").strip().lower()
