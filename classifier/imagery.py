@@ -442,15 +442,21 @@ def _tile_cache_path(capture_date: str | None, view: str, z: int, x: int, y: int
 
 
 def _fetch_tile(
-    view: str, z: int, x: int, y: int, capture_date: str | None
+    view: str, z: int, x: int, y: int, capture_date: str | None,
+    cache_only: bool = False,
 ) -> tuple[bytes | None, bool]:
-    """(tile JPEG bytes or None on 404, served-from-cache)."""
+    """(tile JPEG bytes or None on 404, served-from-cache).
+
+    ``cache_only`` never calls Nearmap: a tile missing from the cache is None.
+    """
     path = _tile_cache_path(capture_date, view, z, x, y)
     if path is not None and path.is_file():
         try:
             return path.read_bytes(), True
         except OSError:
             pass
+    if cache_only:
+        return None, False
     resp = _nearmap_get(NEARMAP_TILE_URL.format(content=view, z=z, x=x, y=y))
     if resp.status_code == 404:   # no coverage for this tile/view
         return None, False
@@ -757,7 +763,7 @@ BUDGET = NearmapBudget.from_env()
 
 def _stitch_view(lat: float, lon: float, chip_m: float, view: str,
                  capture_date: str | None, *, zoom: int | None = None,
-                 purpose: str = "pack") -> Image.Image | None:
+                 purpose: str = "pack", cache_only: bool = False) -> Image.Image | None:
     zoom = zoom or (NEARMAP_VERT_ZOOM if view == "Vert" else NEARMAP_OBLIQUE_ZOOM)
     x0, x1, y0, y1 = _tile_range(lat, lon, chip_m / 2.0, zoom)
     cols, rows = x1 - x0 + 1, y1 - y0 + 1
@@ -770,7 +776,7 @@ def _stitch_view(lat: float, lon: float, chip_m: float, view: str,
     coords = [(tx, ty) for ty in range(y0, y1 + 1) for tx in range(x0, x1 + 1)]
     with ThreadPoolExecutor(max_workers=min(NEARMAP_TILE_WORKERS, len(coords))) as pool:
         tiles = list(pool.map(
-            lambda xy: _fetch_tile(view, zoom, xy[0], xy[1], capture_date), coords
+            lambda xy: _fetch_tile(view, zoom, xy[0], xy[1], capture_date, cache_only), coords
         ))
     meter = _current_meter()
     billed = meter.record(purpose, tiles) if meter is not None else sum(
@@ -797,6 +803,44 @@ def _stitch_view(lat: float, lon: float, chip_m: float, view: str,
         canvas = canvas.resize((canvas.width, max(1, int(canvas.height * 0.75))))
     canvas.thumbnail((NEARMAP_MAX_PX, NEARMAP_MAX_PX))
     return canvas
+
+
+def _cached_capture_date(lat: float, lon: float, chip_m: float, view: str) -> str | None:
+    """Newest cached survey date holding every tile this view needs, or None."""
+    root = _tile_cache_dir()
+    if root is None or not root.is_dir():
+        return None
+    zoom = NEARMAP_VERT_ZOOM if view == "Vert" else NEARMAP_OBLIQUE_ZOOM
+    x0, x1, y0, y1 = _tile_range(lat, lon, chip_m / 2.0, zoom)
+    for date_dir in sorted((p for p in root.iterdir() if p.is_dir()), reverse=True):
+        tile_dir = date_dir / view / str(zoom)
+        if tile_dir.is_dir() and all(
+            (tile_dir / f"{x}_{y}.jpg").is_file()
+            for x in range(x0, x1 + 1) for y in range(y0, y1 + 1)
+        ):
+            return date_dir.name
+    return None
+
+
+def cached_nearmap_views(lat: float, lon: float, chip_m: float = NEARMAP_CHIP_M,
+                         views: list[str] | None = None) -> tuple[dict, str | None]:
+    """Nearmap views rebuilt only from the on-disk tile cache (never billed).
+
+    Tiles bought for neighbouring sites often cover this pin too. A view is
+    used only when every tile it needs is cached for one survey date.
+    Returns ({view_name: PIL.Image}, newest capture date).
+    """
+    result: dict[str, Any] = {}
+    dates: list[str] = []
+    for view in (views if views is not None else NEARMAP_VIEWS):
+        capture = _cached_capture_date(lat, lon, chip_m, view)
+        if capture is None:
+            continue
+        canvas = _stitch_view(lat, lon, chip_m, view, capture, purpose="cache", cache_only=True)
+        if canvas is not None:
+            result[view] = canvas
+            dates.append(capture)
+    return result, (max(dates) if dates else None)
 
 
 def fetch_nearmap_views(lat: float, lon: float, chip_m: float = NEARMAP_CHIP_M,

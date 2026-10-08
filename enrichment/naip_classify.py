@@ -404,13 +404,17 @@ def _classify_site_imagery(
     library_reuse = False
     if not reuse_saved and not presence_only and env_flag("SAVED_NEARMAP_CHIPS", False):
         pack = load_saved_chip_pack(saved_nearmap_chip_dirs(), site_id, require_nearmap=True)
+        source = pack["source_dir"].parent.name if pack.get("nearmap_views") else ""
+        if not pack.get("nearmap_views") and env_flag("NEARMAP_CACHE_ONLY", False):
+            # Tiles bought for neighbouring sites, stitched from disk (never billed).
+            cached, _date = imagery.cached_nearmap_views(lat, lon)
+            if any(name != "Vert" for name in cached):
+                pack = {"naip": None, "nearmap_views": cached, "source_dir": None}
+                source = "tile cache"
         if pack.get("nearmap_views"):
             saved_pack, reuse_saved, library_reuse = pack, True, True
             if verbose:
-                progress.step(
-                    f"saved Nearmap chips ({len(pack['nearmap_views'])}) from "
-                    f"{pack['source_dir'].parent.name}"
-                )
+                progress.step(f"saved Nearmap ({len(pack['nearmap_views'])} views) from {source}")
     skip_nearmap_fetch = skip_paid_imagery or reuse_saved
     if reuse_saved and not library_reuse:
         saved_pack = load_saved_chip_pack(reuse_dirs, site_id)

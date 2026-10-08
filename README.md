@@ -102,7 +102,7 @@ The design and rollout plan are in [docs/adr/0001-multi-source-evidence-cascade.
 | Source | Needs | Notes |
 |---|---|---|
 | `state_ortho` | `STATE_ORTHO_SOURCES=<json>` | State or county ArcGIS / WMS orthoimagery. See `docs/state_ortho_sources.example.json`. Preferred over NAIP when there's no Nearmap top-down view. |
-| `mapillary` | `MAPILLARY_ACCESS_TOKEN` | Free street-level photos facing the site (CC BY-SA). Searches `MAPILLARY_RADIUS_M` (default 100 m) and retries an empty search once. |
+| `mapillary` | `MAPILLARY_ACCESS_TOKEN` | Free street-level photos facing the site (CC BY-SA). Searches `MAPILLARY_RADIUS_M` (default 100 m) and retries an empty search once. Photos within `STREET_CONFIRM_MAX_AGE_YEARS` rank first, and each photo is cropped toward the site bearing and to its upper part (`MAPILLARY_CROP=0` turns that off; `MAPILLARY_HFOV`, `MAPILLARY_CROP_WIDTH`, `MAPILLARY_CROP_TOP`) so distant rooftop gear survives the model downscale. |
 
 - **Evidence-only by default.** Without `SUPPLEMENTAL_CAN_CONFIRM`, supplemental views only join model calls that already carry Nearmap, so Nearmap purchasing is unchanged.
 - **`SUPPLEMENTAL_CAN_CONFIRM=1`** lets a boxed street-level view stand in for a Nearmap oblique in the rooftop and tower confirm gates, and tells the models they may box gear on street photos. Mapillary confirmations write `Verified_Site_Source = Google Map`. A street confirm needs all of:
@@ -112,7 +112,9 @@ The design and rollout plan are in [docs/adr/0001-multi-source-evidence-cascade.
   - Towers too: no Gemini-only tower lock on a street photo.
 - **Metering:** each detail row gets `supplemental_*` columns (sources, requests, billable requests, cache hits).
 
-**Saved Nearmap chips.** `SAVED_NEARMAP_CHIPS=1` classifies a site on the Nearmap JPEGs any earlier run already bought for it (newest run first, at no new cost). NAIP is fetched fresh when the saved pack has none, and supplemental views still apply. Sites with no saved Nearmap keep the normal path, so with `NAIP_ONLY=1` they never buy Nearmap.
+**Saved Nearmap chips.** `SAVED_NEARMAP_CHIPS=1` classifies a site on the Nearmap JPEGs any earlier run already bought for it (newest run first, at no new cost). NAIP is fetched fresh when the saved pack has none, and supplemental views still apply. Sites with no saved Nearmap keep the normal path, so with `NAIP_ONLY=1` they never buy Nearmap. Add `NEARMAP_CACHE_ONLY=1` to also stitch views from tiles cached for neighbouring sites (never a Nearmap call; a view is used only when every tile is cached).
+
+**Nearmap priority list.** `python scripts/build_nearmap_priority.py --runs <folders or YYYY-MM-DD> --out priority.csv` ranks undecided sites (1 gear seen without obliques, 2 rooftop/tower host, 3 other, 6 already had obliques, 9 imprecise pin) for `python -m enrichment.lanes --priority-csv priority.csv`, so a Nearmap budget buys the likeliest confirms first.
 
 **Audit holdout instead of unqualify.** `AUDIT_HOLDOUT_OWNER=<User Id>` with `CONNECTX_AUDIT=1` replaces the unqualify step. Every no-asset and inconclusive site gets only `LLM_Holdout__c=true` and `OwnerId=<User Id>`; Stage and the Unqualified fields are untouched. Errored sites are skipped so a later run retries them. Confirmed sites write as usual.
 
@@ -120,9 +122,10 @@ Zero-Nearmap audit of the Site Acquisition Team's ConnectX rooftops (drop `APPLY
 
 ```powershell
 python -m enrichment.lanes --pool-audit --lanes 5 --batch 10 --stop-at-mb <current MTD MB + 1> `
-  --env APPLY=0 --env NAIP_ONLY=1 --env SAVED_NEARMAP_CHIPS=1 `
+  --env APPLY=0 --env NAIP_ONLY=1 --env SAVED_NEARMAP_CHIPS=1 --env NEARMAP_CACHE_ONLY=1 `
   --env AUDIT_HOLDOUT_OWNER=0056O00000EpUOgQAN `
   --env SUPPLEMENTAL_IMAGERY=mapillary --env SUPPLEMENTAL_CAN_CONFIRM=1 `
+  --env MAPILLARY_MAX_VIEWS=3 --env MODEL_MAX_STREET_VIEWS=3 `
   --env SIGNALS=1 --env SIGNALS_SOURCES=opencellid
 ```
 

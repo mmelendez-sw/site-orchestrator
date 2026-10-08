@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from pathlib import Path
 from typing import Any
 
@@ -43,6 +44,15 @@ def radius_m() -> float:
 
 def max_heading_diff() -> float:
     return max(1.0, min(180.0, env_float("MAPILLARY_MAX_HEADING_DIFF", 50.0)))
+
+
+def max_age_years() -> float:
+    """Photos older than this cannot confirm (STREET_CONFIRM_MAX_AGE_YEARS); rank them last."""
+    return env_float("STREET_CONFIRM_MAX_AGE_YEARS", 5.0)
+
+
+def crop_enabled() -> bool:
+    return env_str("MAPILLARY_CROP", "1").strip().lower() not in {"0", "false", "no", "off"}
 
 
 def max_views() -> int:
@@ -171,9 +181,34 @@ def candidates(lat: float, lon: float, images: list[dict], *,
             "heading_diff": diff,
             "captured_ms": captured_ms,
         })
-    out.sort(key=lambda c: (int(c["heading_diff"] // ALIGNMENT_BUCKET_DEG),
+    # In-date photos first: an older photo can add evidence but cannot confirm.
+    cutoff_ms = (time.time() - max_age_years() * 365.25 * 86400) * 1000
+    out.sort(key=lambda c: (c["captured_ms"] < cutoff_ms,
+                            int(c["heading_diff"] // ALIGNMENT_BUCKET_DEG),
                             -c["captured_ms"], c["distance_m"], c["id"]))
     return out
+
+
+def crop_toward_site(img: Any, heading: float, bearing_to_site: float) -> Any:
+    """Crop a street photo to the part that looks at the site.
+
+    Models see images downscaled to ~768 px, so rooftop gear 50-100 m away in
+    a 2048 px photo shrinks to a few pixels. Keep the horizontal slice where
+    the site bearing falls (MAPILLARY_HFOV, default 80 degrees, across the
+    frame; MAPILLARY_CROP_WIDTH of the width) and the top MAPILLARY_CROP_TOP
+    of the height, where rooflines are, dropping road and hood.
+    """
+    width, height = img.size
+    hfov = max(30.0, env_float("MAPILLARY_HFOV", 80.0))
+    keep_w = min(1.0, max(0.3, env_float("MAPILLARY_CROP_WIDTH", 0.55)))
+    keep_h = min(1.0, max(0.4, env_float("MAPILLARY_CROP_TOP", 0.7)))
+    offset = ((bearing_to_site - heading + 540.0) % 360.0) - 180.0
+    center = min(1.0, max(0.0, 0.5 + offset / hfov))
+    half = keep_w / 2
+    left = min(max(0.0, center - half), 1.0 - keep_w)
+    x0 = int(left * width)
+    box = (x0, 0, x0 + int(keep_w * width), int(keep_h * height))
+    return img.crop(box)
 
 
 def select(ranked: list[dict], limit: int) -> list[dict]:
@@ -198,9 +233,10 @@ def select(ranked: list[dict], limit: int) -> list[dict]:
 
 def label_for(cand: dict, captured: str | None) -> str:
     when = f" {captured[:7]}" if captured else ""
+    cropped = ", cropped toward site" if cand.get("cropped") else ""
     return (f"Street-level photo (Mapillary{when}, camera {cand['distance_m']:.0f} m "
             f"{base.compass_abbrev(cand['approach'])} of site, facing "
-            f"{base.compass_abbrev(cand['heading'])} toward site)")
+            f"{base.compass_abbrev(cand['heading'])} toward site{cropped})")
 
 
 def _download(cand: dict) -> bytes | None:
@@ -250,6 +286,9 @@ def fetch(lat: float, lon: float, *, state: str | None = None) -> list[base.Supp
             images.append((cand, img))
     views = []
     for cand, img in images:
+        if crop_enabled():
+            img = crop_toward_site(img, cand["heading"], cand["bearing_to_site"])
+            cand = dict(cand, cropped=True)
         captured = base.iso_date_from_epoch_ms(cand["captured_ms"])
         views.append(base.SupplementalView(
             label=label_for(cand, captured),

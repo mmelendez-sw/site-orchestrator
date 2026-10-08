@@ -8,6 +8,7 @@ import math
 import os
 import tempfile
 import threading
+import time
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
@@ -27,6 +28,8 @@ SOURCE_ENV = (
     "MAPILLARY_ACCESS_TOKEN", "MAPILLARY_RADIUS_M", "MAPILLARY_MAX_HEADING_DIFF",
     "MAPILLARY_MAX_VIEWS", "MAPILLARY_SEARCH_CACHE_DAYS",
     "SUPPLEMENTAL_TIMEOUT_S", "IMAGERY_CACHE", "SITE_ORCHESTRATOR_DATA",
+    "MAPILLARY_CROP", "MAPILLARY_HFOV", "MAPILLARY_CROP_WIDTH", "MAPILLARY_CROP_TOP",
+    "STREET_CONFIRM_MAX_AGE_YEARS",
     "ORTHO_TEST_TOKEN",
 )
 
@@ -371,6 +374,28 @@ MLY_IMAGES = [
 ]
 
 
+class MapillaryCropTests(SourcesTestCase):
+    def test_crop_follows_site_bearing(self):
+        from PIL import Image
+
+        img = Image.new("RGB", (2000, 1500))
+        with self.env():
+            ahead = mapillary.crop_toward_site(img, 90.0, 90.0)
+            right = mapillary.crop_toward_site(img, 90.0, 120.0)   # site 30 deg right
+            left = mapillary.crop_toward_site(img, 350.0, 330.0)   # site 20 deg left, across north
+        self.assertEqual(ahead.size, (1100, 1050))
+        self.assertEqual(right.size, (1100, 1050))
+        self.assertEqual(left.size, (1100, 1050))
+
+    def test_old_photos_rank_after_recent(self):
+        now_ms = time.time() * 1000
+        imgs = [mly_image("old_aligned", 30, 180, captured_ms=now_ms - 8 * 365 * 86400e3),
+                mly_image("new_offset", 30, 180, heading_offset=25, captured_ms=now_ms - 365 * 86400e3)]
+        with self.env():
+            ids = [c["id"] for c in mapillary.candidates(SITE_LAT, SITE_LON, imgs)]
+        self.assertEqual(ids, ["new_offset", "old_aligned"])
+
+
 class MapillaryTests(SourcesTestCase):
     def test_filtering_and_ranking(self):
         with self.env():
@@ -456,7 +481,7 @@ class MapillaryTests(SourcesTestCase):
             self.assertEqual(first.source, "mapillary")
             self.assertEqual(first.captured, "2024-06-01")
             self.assertEqual(first.label,
-                             "Street-level photo (Mapillary 2024-06, camera 30 m S of site, facing N toward site)")
+                             "Street-level photo (Mapillary 2024-06, camera 30 m S of site, facing N toward site, cropped toward site)")
             self.assertEqual(first.meta["distance_m"], 30.0)
             for view in views:
                 self.assertIn("Street-level", view.label)
