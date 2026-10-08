@@ -248,3 +248,29 @@ def pin_check(
         check.building_id = at_pin["building_id"]
         check.distance_m = at_pin["distance_m"]
     return check
+
+
+_ULS_IN_BUILDING_SQL = """
+SELECT COUNT(*) FROM dbo.OvertureBuilding b
+JOIN dbo.FccUlsMicrowaveLocation u
+  ON u.latitude BETWEEN b.ymin AND b.ymax AND u.longitude BETWEEN b.xmin AND b.xmax
+WHERE b.building_id = ? AND b.shape.STContains(geometry::Point(u.longitude, u.latitude, 4326)) = 1
+"""
+
+
+def uls_in_building(building_id: str) -> int | None:
+    """Active FCC ULS microwave locations inside the building outline (None if unavailable).
+
+    On the 2026-10-07 pool audit, 8% of confirmed rooftops had one vs 2% of
+    no-asset sites: precise but rare evidence of rooftop telecom gear.
+    """
+    if not building_id:
+        return 0
+    cur = _cursor()
+    if cur is None:
+        return None
+    try:
+        return int(cur.execute(_ULS_IN_BUILDING_SQL, building_id).fetchone()[0])
+    except Exception:  # noqa: BLE001
+        _drop_cursor()
+        return None

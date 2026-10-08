@@ -56,7 +56,8 @@ def download(url: str, dest: Path) -> Path:
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(".part")
     print(f"downloading {url} -> {dest}")
-    req = urllib.request.Request(url, headers={"User-Agent": "site-orchestrator/uls-loader"})
+    # data.fcc.gov 403s custom User-Agents on full downloads; urllib's default passes.
+    req = urllib.request.Request(url)
     with urllib.request.urlopen(req, timeout=120) as resp, tmp.open("wb") as out:
         total = 0
         while True:

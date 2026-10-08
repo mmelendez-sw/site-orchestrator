@@ -27,6 +27,10 @@ class NearmapPriorityTests(unittest.TestCase):
                                                    nearmap_views="Vert,North"))[0], 6)
         self.assertEqual(bnp.nearmap_priority(_row(sf_lat="40.712"))[0], 9)
 
+    def test_building_evidence_promotes(self):
+        self.assertEqual(bnp.nearmap_priority(_row(naip_site_type="other"), "tall building"),
+                         (1.0, "tall building, no obliques"))
+
     def test_decided_sites_skipped(self):
         self.assertIsNone(bnp.nearmap_priority(_row(audit_verdict="confirmed")))
         self.assertIsNone(bnp.nearmap_priority(_row(audit_verdict="no_asset")))

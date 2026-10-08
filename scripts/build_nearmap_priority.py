@@ -7,7 +7,10 @@ Reads the newest detail row per Id across the given runs (folder names or
 YYYY-MM-DD prefixes, dry runs included) and writes ``Id,tier,why``; lower
 tiers run first in ``enrichment.lanes``:
 
-1  a model saw gear (street photo / NAIP / zoom) and no Nearmap oblique yet
+1  a model saw gear (street photo / NAIP / zoom), or (--evidence) the pin's
+   building is >= 15 m tall or holds an FCC ULS microwave location, and no
+   Nearmap oblique yet. On the 2026-10-07 pool audit no no-asset site sat in a
+   building >= 15 m (27% of confirmed rooftops did).
 2  rooftop or tower host, no gear call, no Nearmap oblique yet
 3  other / unclear call, no Nearmap oblique yet
 6  already had Nearmap obliques and still undecided (a third view at most)
@@ -51,7 +54,27 @@ def _decimals(value: Any) -> int:
     return len(text.split(".", 1)[1]) if "." in text else 0
 
 
-def nearmap_priority(row: dict[str, Any]) -> tuple[float, str] | None:
+TALL_BUILDING_M = 15.0
+
+
+def building_evidence(row: dict[str, Any]) -> str:
+    """'tall building' / 'microwave license in building' / '' from footprints + ULS."""
+    from enrichment import footprints
+
+    try:
+        chk = footprints.pin_check(float(row["sf_lat"]), float(row["sf_lng"]))
+    except (KeyError, TypeError, ValueError):
+        return ""
+    if chk.status not in {"inside", "snapped"}:
+        return ""
+    if (chk.height_m or 0) >= TALL_BUILDING_M:
+        return "tall building"
+    if (footprints.uls_in_building(chk.building_id) or 0) > 0:
+        return "microwave license in building"
+    return ""
+
+
+def nearmap_priority(row: dict[str, Any], evidence: str = "") -> tuple[float, str] | None:
     """(tier, why) for one detail row, or None when the site is decided."""
     verdict = lower_text(row.get("audit_verdict")) or audit_verdict(row)[0]
     if verdict in {VERDICT_CONFIRMED, VERDICT_NO_ASSET}:
@@ -64,6 +87,8 @@ def nearmap_priority(row: dict[str, Any]) -> tuple[float, str] | None:
     site = lower_text(row.get("naip_site_type") or row.get("site_type"))
     if any(to_bool(row.get(key)) is True for key in GEAR_FIELDS):
         return 1.0, f"gear seen ({site or 'unknown'}), no obliques"
+    if evidence:
+        return 1.0, f"{evidence}, no obliques"
     if site in {"rooftop", "tower"}:
         return 2.0, f"{site} host, no obliques"
     return 3.0, f"{site or 'unknown'}, no obliques"
@@ -84,19 +109,25 @@ def newest_rows(run_dirs: list[Path]) -> dict[str, dict[str, Any]]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    from dotenv import load_dotenv
+
     from enrichment.outputs import expand_run_specs
     from paths import runs_dir
+
+    load_dotenv(ROOT / ".env")  # here, not at import: tests import this module
 
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--runs", required=True, help="comma list of run folders or YYYY-MM-DD prefixes")
     p.add_argument("--out", type=Path, required=True)
+    p.add_argument("--evidence", action="store_true",
+                   help="also rank by building height / ULS-in-building (needs dbo.OvertureBuilding)")
     args = p.parse_args(argv)
 
     specs = [s.strip() for s in args.runs.split(",") if s.strip()]
     rows = newest_rows(list(expand_run_specs(specs, runs_root=runs_dir())))
     ranked = []
     for sf_id, row in rows.items():
-        pick = nearmap_priority(row)
+        pick = nearmap_priority(row, building_evidence(row) if args.evidence else "")
         if pick is not None:
             ranked.append((pick[0], sf_id, pick[1]))
     ranked.sort()
