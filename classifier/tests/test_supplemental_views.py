@@ -272,3 +272,22 @@ class SavedNearmapChipTests(unittest.TestCase):
             self.assertEqual(pack["source_dir"], older)
             self.assertEqual(list(pack["nearmap_views"]), ["North"])
             self.assertEqual(load_saved_chip_pack([newer, older], "S1")["source_dir"], newer)
+
+
+class StreetBoxPadTests(unittest.TestCase):
+    def test_thin_street_box_is_widened_not_dropped(self):
+        from classifier.views import get_valid_asset_box, pad_street_asset_box
+
+        res = {"asset_view": STREET, "asset_box_2d": [472, 440, 547, 461]}
+        self.assertIsNone(get_valid_asset_box(dict(res)))
+        padded = pad_street_asset_box(dict(res))
+        box = get_valid_asset_box(padded)
+        self.assertIsNotNone(box)
+        self.assertLessEqual(box[1], 440)
+        self.assertGreaterEqual(box[3], 461)
+
+    def test_overhead_box_untouched(self):
+        from classifier.views import pad_street_asset_box
+
+        res = {"asset_view": "Nearmap oblique (North)", "asset_box_2d": [472, 440, 547, 461]}
+        self.assertEqual(pad_street_asset_box(dict(res))["asset_box_2d"], [472, 440, 547, 461])

@@ -76,6 +76,7 @@ from classifier.views import (
     get_valid_asset_box,
     has_street_asset_box,
     is_street_level_label,
+    pad_street_asset_box,
     naip_view_label,
     pick_view_for_asset_box,
     supplemental_can_confirm,
@@ -1400,14 +1401,14 @@ def classify_site(provider: str, clients: dict,
         classify_prompt = prompt
     if provider == "gemini":
         contents = _views_to_gemini_contents(send_views, classify_prompt)
-        return _call_gemini_json(
+        return pad_street_asset_box(_call_gemini_json(
             clients["gemini"], contents, gemini_schema, retries,
             model=gemini_model or GEMINI_MODEL,
-        )
+        ))
     content = _views_to_claude_content(send_views, classify_prompt)
-    return _call_claude_json(
+    return pad_street_asset_box(_call_claude_json(
         clients["claude"], content, claude_schema, tool_name,
-        3 if retries is None else retries, model=claude_model)
+        3 if retries is None else retries, model=claude_model))
 
 
 def site_confidence_band(res: dict) -> str:

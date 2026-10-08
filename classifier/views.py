@@ -267,6 +267,32 @@ def has_street_asset_box(res: dict) -> bool:
     return is_street_level_label(res.get("asset_view")) and get_valid_asset_box(res) is not None
 
 
+def pad_street_asset_box(res: dict) -> dict:
+    """Widen a thin box on a street-level photo to the minimum side.
+
+    Distant towers and parapet masts are often under 3% of a street photo's
+    width; rejecting those boxes sent real towers down the Gemini-only path.
+    Overhead/oblique boxes keep the strict minimum.
+    """
+    if not isinstance(res, dict) or not is_street_level_label(res.get("asset_view")):
+        return res
+    parsed = _box_ints(res.get("asset_box_2d"))
+    if parsed is None:
+        return res
+    ymin, xmin, ymax, xmax = (max(0, min(1000, v)) for v in parsed)
+    if ymin >= ymax or xmin >= xmax:
+        return res
+    half = ASSET_BOX_MIN_FRAC * 1000 / 2
+    if ymax - ymin < 2 * half:
+        mid = (ymin + ymax) / 2
+        ymin, ymax = int(max(0, mid - half)), int(min(1000, mid + half + 1))
+    if xmax - xmin < 2 * half:
+        mid = (xmin + xmax) / 2
+        xmin, xmax = int(max(0, mid - half)), int(min(1000, mid + half + 1))
+    res["asset_box_2d"] = [ymin, xmin, ymax, xmax]
+    return res
+
+
 def get_valid_asset_box(res: dict) -> list[int] | None:
     return coerce_asset_box(res.get("asset_box_2d"))
 
