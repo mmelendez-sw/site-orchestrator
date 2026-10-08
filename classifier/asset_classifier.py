@@ -1537,7 +1537,12 @@ def skip_nearmap_after_naip_reason(
     osm_info: dict | None = None,
     naip_age_years: float | None = None,
 ) -> str | None:
-    """First skip-Nearmap reason after the NAIP pass, else None."""
+    """First skip-Nearmap reason after the NAIP pass, else None.
+
+    NEARMAP_ALWAYS=1 (re-reviews of held-out sites) never skips.
+    """
+    if _env_flag("NEARMAP_ALWAYS", default="0"):
+        return None
     locked = locked_gemini_tower_skip_nearmap_reason(
         res, db_backed=db_backed, osm_tower=osm_tower
     )

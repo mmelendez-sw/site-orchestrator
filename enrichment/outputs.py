@@ -40,6 +40,8 @@ DETAIL_COLUMNS: tuple[str, ...] = (
     "footprint_area_m2",
     "footprint_height_m",
     "footprint_floors",
+    "consistency_check",
+    "consistency_second",
     "address_query",
     "address_lat",
     "address_lng",

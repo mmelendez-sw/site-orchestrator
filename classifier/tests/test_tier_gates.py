@@ -1177,3 +1177,17 @@ class StealthGateTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NearmapAlwaysTests(unittest.TestCase):
+    def test_nearmap_always_disables_naip_skips(self):
+        import os
+        from unittest.mock import patch
+        from classifier import asset_classifier as ac
+
+        res = {"site_type": "other", "site_confidence": 0.95}
+        info = {"ok": True, "has_building": False, "has_tower_or_mast": False}
+        with patch.dict(os.environ, {"NEARMAP_ALWAYS": "0"}):
+            self.assertIsNotNone(ac.skip_nearmap_after_naip_reason(res, osm_info=info))
+        with patch.dict(os.environ, {"NEARMAP_ALWAYS": "1"}):
+            self.assertIsNone(ac.skip_nearmap_after_naip_reason(res, osm_info=info))

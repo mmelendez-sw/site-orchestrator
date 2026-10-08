@@ -127,17 +127,15 @@ python scripts/load_overture_buildings.py load      # stage + swap into dbo.Over
 
 **Nearmap priority list.** `python scripts/build_nearmap_priority.py --runs <folders or YYYY-MM-DD> --out priority.csv` ranks undecided sites (1 gear seen without obliques, 2 rooftop/tower host, 3 other, 6 already had obliques, 9 imprecise pin) for `python -m enrichment.lanes --priority-csv priority.csv`, so a Nearmap budget buys the likeliest confirms first.
 
+`--profile free` turns on NAIP_ONLY, SAVED_NEARMAP_CHIPS, NEARMAP_CACHE_ONLY, FOOTPRINT_PIN_CHECK, CONFIRM_CONSISTENCY, Mapillary (3 views, can confirm) and ULS + OpenCelliD signals; any `--env` overrides it. `CONFIRM_CONSISTENCY=1` re-classifies each imagery-only confirm on its saved chips (no Nearmap purchase) and writes only when both passes confirm the same Site_Type; a disagreement is held out as `consistency_disagree`.
+
 **Audit holdout instead of unqualify.** `AUDIT_HOLDOUT_OWNER=<User Id>` with `CONNECTX_AUDIT=1` replaces the unqualify step. Every no-asset and inconclusive site gets only `LLM_Holdout__c=true` and `OwnerId=<User Id>`; Stage and the Unqualified fields are untouched. Errored sites are skipped so a later run retries them. Confirmed sites write as usual.
 
 Zero-Nearmap audit of the Site Acquisition Team's ConnectX rooftops (drop `APPLY=0` to write):
 
 ```powershell
-python -m enrichment.lanes --pool-audit --lanes 5 --batch 10 --stop-at-mb <current MTD MB + 1> `
-  --env APPLY=0 --env NAIP_ONLY=1 --env SAVED_NEARMAP_CHIPS=1 --env NEARMAP_CACHE_ONLY=1 --env FOOTPRINT_PIN_CHECK=1 `
-  --env AUDIT_HOLDOUT_OWNER=0056O00000EpUOgQAN `
-  --env SUPPLEMENTAL_IMAGERY=mapillary --env SUPPLEMENTAL_CAN_CONFIRM=1 `
-  --env MAPILLARY_MAX_VIEWS=3 --env MODEL_MAX_STREET_VIEWS=3 `
-  --env SIGNALS=1 --env SIGNALS_SOURCES=opencellid
+python -m enrichment.lanes --pool-audit --profile free --lanes 5 --batch 10 --stop-at-mb <current MTD MB + 1> `
+  --env APPLY=0 --env AUDIT_HOLDOUT_OWNER=0056O00000EpUOgQAN
 ```
 
 **Model resilience.** `GEMINI_FALLBACK_MODEL=<GA model>` retries Gemini 429/503 failures on that model. After `GEMINI_FALLBACK_AFTER` consecutive failures (default 2), a circuit breaker sends calls straight to the fallback for `GEMINI_FALLBACK_COOLDOWN_S` (default 300). `classify_site` now honours `GEMINI_RETRIES`.

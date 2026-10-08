@@ -328,6 +328,7 @@ def _classify_site_imagery(
     db_backed: bool = False,
     reuse_chips_dirs: list[Path] | None = None,
     presence_only: bool = False,
+    consistency_pass: bool = False,
     site_state: str | None = None,
 ) -> dict[str, Any]:
     """Classify one coordinate with the full Nearmap + bifurcated AI stack.
@@ -539,7 +540,7 @@ def _classify_site_imagery(
     # Without SUPPLEMENTAL_CAN_CONFIRM they only join calls that already carry
     # Nearmap views, so the buy-Nearmap decision is unchanged (evidence only).
     supplemental_views: list = []
-    if not presence_only and (library_reuse or not reuse_saved):
+    if not presence_only and (library_reuse or consistency_pass or not reuse_saved):
         supplemental_views = _supplemental_for_site(
             lat, lon, site_id=site_id, chip_dir=chip_dir, state=site_state, verbose=verbose
         )

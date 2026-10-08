@@ -443,6 +443,9 @@ class AuditHoldoutOwnerTests(unittest.TestCase):
 
         err = stamp_audit_verdict(self._row(error="sql_error"), run_id="r", holdout_owner=self.MATT)
         self.assertNotEqual(err["bucket"], "audit_holdout")
+        budget = stamp_audit_verdict(self._row(holdout_reason="nearmap_budget"), run_id="r", holdout_owner=self.MATT)
+        self.assertEqual(budget["audit_reason"], "nearmap_budget")
+        self.assertNotEqual(budget["bucket"], "audit_holdout")
         ok = stamp_audit_verdict(self._row(bucket="potential_update", holdout_reason=""),
                                  run_id="r", holdout_owner=self.MATT)
         self.assertEqual(ok["bucket"], "potential_update")

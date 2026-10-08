@@ -34,6 +34,7 @@ from typing import Any, Callable, Iterable
 
 from enrichment import progress
 from enrichment.bucketing import (
+    _holdout,
     bucket_classification,
     imagery_bucket,
     naip_rooftop_confirm_decision,
@@ -109,7 +110,7 @@ from enrichment.sf_ops import (
     status_from_entry,
     query_sites_by_ids,
 )
-from envutil import env_float, env_int
+from envutil import env_flag, env_float, env_int
 from paths import runs_dir
 from salesforce.site_type_mapping import (
     is_sales_tower_type,
@@ -1073,6 +1074,80 @@ def _call_classify(classify_fn, kwargs: dict[str, Any]) -> dict[str, Any]:
         return classify_fn(**{k: kwargs[k] for k in ("site_id", "lat", "lon", "chip_dir")})
 
 
+# Gemini + Claude already agreed on gear: two independent votes, no re-check.
+_DUAL_AGREE = frozenset({"agree", "agree_crop", "agree_localize"})
+
+
+def _second_pass_agrees(
+    first: dict[str, Any], second: dict[str, Any], again: dict[str, Any], first_type: str = ""
+) -> bool:
+    """The second pass sees the same kind of site with gear, even if a gate stops it.
+
+    A second confirm with a different Salesforce Site_Type is a disagreement.
+    """
+    if again.get("bucket") == BUCKET_POTENTIAL_UPDATE:
+        second_type = str(again.get("update_site_type") or "")
+        return not second_type or not first_type or second_type == first_type
+    same_type = (
+        str(second.get("site_type") or "").strip().lower()
+        == str(first.get("site_type") or "").strip().lower()
+    )
+    return same_type and second.get("cell_equipment") is True
+
+
+def _consistency_check(
+    prep: PreparedSite,
+    classify_fn,
+    kwargs: dict[str, Any],
+    base: dict[str, Any],
+    classified: dict[str, Any],
+    *,
+    verbose: bool,
+) -> dict[str, Any]:
+    """CONFIRM_CONSISTENCY=1: re-classify a single-model imagery confirm on its saved chips.
+
+    Gemini-only confirms (e.g. ``gemini_strong_solo`` towers) have come out
+    confirmed in one run and no-asset in the next on identical Nearmap chips.
+    Gemini + Claude double confirms skip this (see ``_DUAL_AGREE``): on the
+    2026-10-08 live run the reuse pass, which skips box repair and crops,
+    rejected 32 of them. The second pass reads this run's chip folder (no
+    Nearmap purchase; Mapillary from cache) and agrees when it sees the same
+    site type with gear (``_second_pass_agrees``). A disagreement is held out
+    as ``consistency_disagree``.
+    """
+    chip_dir = kwargs.get("chip_dir")
+    if not chip_dir:
+        return {"consistency_check": "skipped_no_chips"}
+    second_kwargs = dict(
+        kwargs,
+        lat=float(base["classify_lat"]),
+        lon=float(base["classify_lng"]),
+        reuse_chips_dirs=[Path(chip_dir)],
+        consistency_pass=True,
+        verbose=False,
+    )
+    try:
+        second = _call_classify(classify_fn, second_kwargs)
+    except Exception as exc:  # noqa: BLE001
+        if verbose:
+            progress.warn(f"consistency pass failed: {exc}")
+        second = {"error": f"consistency_failed: {exc}"}
+    again = _bucket(prep, second) if not second.get("error") else {"bucket": BUCKET_OTHER,
+                                                                   "holdout_reason": second["error"]}
+    summary = f"{again.get('bucket')}:{again.get('update_site_type') or second.get('site_type') or ''}:{again.get('holdout_reason') or ''}"
+    agree = not second.get("error") and _second_pass_agrees(
+        classified, second, again, str(base.get("update_site_type") or "")
+    )
+    if verbose:
+        progress.result(f"consistency pass: {'agree' if agree else 'DISAGREE'} ({summary})")
+    if agree:
+        return {"consistency_check": "agree", "consistency_second": summary}
+    site = str(classified.get("site_type") or "").strip().lower()
+    held = _holdout(BUCKET_ROOFTOP if site == "rooftop" else BUCKET_OTHER, "consistency_disagree", classified)
+    held.update({"consistency_check": "disagree", "consistency_second": summary})
+    return held
+
+
 def _bucket(prep: PreparedSite, classified: dict[str, Any]) -> dict[str, Any]:
     if prep.rooftop_confirm:
         return naip_rooftop_confirm_decision(
@@ -1171,6 +1246,14 @@ def _classify_prepared(
         except (TypeError, ValueError):
             pass
     base.update(_bucket(prep, classified))
+    if (
+        base.get("bucket") == BUCKET_POTENTIAL_UPDATE
+        and prep.hit is None
+        and not prep.rooftop_confirm
+        and env_flag("CONFIRM_CONSISTENCY", False)
+        and str(classified.get("dual_model_resolution") or "").strip().lower() not in _DUAL_AGREE
+    ):
+        base.update(_consistency_check(prep, classify_fn, kwargs, base, classified, verbose=verbose))
     if classified.get("nearmap_budget_blocked") and base.get("bucket") != BUCKET_POTENTIAL_UPDATE:
         # Needed Nearmap the monthly budget refused: keep it queued for next month.
         base["holdout_reason"] = _NEARMAP_BUDGET_HOLDOUT

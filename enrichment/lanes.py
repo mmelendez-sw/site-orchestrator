@@ -173,11 +173,32 @@ def base_child_env(parent: dict[str, str]) -> dict[str, str]:
     return {k: v for k, v in parent.items() if k.upper() not in STRIPPED_PARENT_KEYS}
 
 
-def lane_extra_env(extra: dict[str, str], *, pool_audit: bool) -> dict[str, str]:
-    """Defaults (pool audit, APPLY=1, ...) overlaid by the operator's --env."""
+# --profile free: classify with no new Nearmap spend using every free source
+# (saved / cached Nearmap, footprint pin check, Mapillary, ULS + OpenCelliD
+# signals) and the consistency check on imagery-only confirms.
+FREE_PROFILE_ENV = {
+    "NAIP_ONLY": "1",
+    "SAVED_NEARMAP_CHIPS": "1",
+    "NEARMAP_CACHE_ONLY": "1",
+    "FOOTPRINT_PIN_CHECK": "1",
+    "CONFIRM_CONSISTENCY": "1",
+    "SUPPLEMENTAL_IMAGERY": "mapillary",
+    "SUPPLEMENTAL_CAN_CONFIRM": "1",
+    "MAPILLARY_MAX_VIEWS": "3",
+    "MODEL_MAX_STREET_VIEWS": "3",
+    "SIGNALS": "1",
+    "SIGNALS_SOURCES": "uls,opencellid",
+}
+PROFILES = {"free": FREE_PROFILE_ENV}
+
+
+def lane_extra_env(extra: dict[str, str], *, pool_audit: bool, profile: str | None = None) -> dict[str, str]:
+    """Defaults (pool audit, APPLY=1, ...), then --profile, overlaid by the operator's --env."""
     merged = dict(LANE_DEFAULT_ENV)
     if pool_audit:
         merged.update(POOL_AUDIT_ENV)
+    if profile:
+        merged.update(PROFILES[profile])
     merged.update(extra)
     return merged
 
@@ -791,6 +812,8 @@ def _parser() -> argparse.ArgumentParser:
                    help="stop launching batches once month-to-date Nearmap MB >= this")
     p.add_argument("--stop-when-covered", action="store_true",
                    help="terminate + flush once confirmed pool rooftops >= open owed rep slots")
+    p.add_argument("--profile", choices=sorted(PROFILES),
+                   help="free: zero new Nearmap spend with every free source (see FREE_PROFILE_ENV)")
     p.add_argument("--env", action="append", default=[], metavar="KEY=VALUE",
                    help="passed to every batch (repeatable)")
     p.add_argument("--status-every", type=float, default=120.0, help="seconds between status tables")
@@ -817,7 +840,7 @@ def main(argv: Sequence[str] | None = None, *, launcher: Launcher = default_laun
     from paths import runs_dir
 
     try:
-        extra = lane_extra_env(parse_env_pairs(args.env), pool_audit=args.pool_audit)
+        extra = lane_extra_env(parse_env_pairs(args.env), pool_audit=args.pool_audit, profile=args.profile)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

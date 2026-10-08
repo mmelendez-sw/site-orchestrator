@@ -279,7 +279,14 @@ def stamp_audit_verdict(
     row["audit_verdict"] = verdict
     row["audit_reason"] = reason
     holdout_owner = audit_holdout_owner_id() if holdout_owner is None else holdout_owner
-    if holdout_owner and verdict in {VERDICT_NO_ASSET, VERDICT_INCONCLUSIVE} and reason != "error":
+    confirmed_owner = (os.environ.get("AUDIT_CONFIRMED_OWNER") or "").strip()
+    if verdict == VERDICT_CONFIRMED and holdout_owner:
+        # A re-review may confirm a site an earlier run held out.
+        row["update_clear_holdout"] = True
+    if verdict == VERDICT_CONFIRMED and confirmed_owner:
+        row["update_owner_id"] = confirmed_owner
+    # Budget blocks, SQL/classify errors and missing chips stay queued for a retry.
+    if holdout_owner and verdict in {VERDICT_NO_ASSET, VERDICT_INCONCLUSIVE} and reason not in _RETRY_REASONS:
         row["bucket"] = BUCKET_AUDIT_HOLDOUT
         row["update_owner_id"] = holdout_owner
         return row

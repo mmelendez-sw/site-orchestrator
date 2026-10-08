@@ -382,3 +382,15 @@ class BatchTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FreeProfileTests(unittest.TestCase):
+    def test_profile_sits_between_defaults_and_env(self):
+        from enrichment.lanes import lane_extra_env
+
+        env = lane_extra_env({"MAPILLARY_MAX_VIEWS": "2"}, pool_audit=True, profile="free")
+        self.assertEqual(env["NAIP_ONLY"], "1")
+        self.assertEqual(env["CONFIRM_CONSISTENCY"], "1")
+        self.assertEqual(env["MAPILLARY_MAX_VIEWS"], "2")
+        self.assertEqual(env["CONNECTX_AUDIT"], "1")
+        self.assertNotIn("NAIP_ONLY", lane_extra_env({}, pool_audit=True))
