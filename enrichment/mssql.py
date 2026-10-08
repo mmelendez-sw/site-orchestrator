@@ -371,7 +371,38 @@ def _access_token_struct() -> bytes:
     return struct.pack("<I", len(encoded)) + encoded
 
 
+# Azure SQL serverless returns 40613 ("not currently available") while it
+# resumes from auto-pause; the first connection wakes it within ~a minute.
+_WAKING_CODES = ("40613", "40197", "40501")
+
+
+def _is_database_waking(exc: Exception) -> bool:
+    text = str(exc)
+    return any(code in text for code in _WAKING_CODES)
+
+
 def connect_mssql(connection_string: str | None = None):
+    """Open a pyodbc connection; retry while a paused database resumes.
+
+    ``AZURE_SQL_WAKE_RETRIES`` (default 4) tries, ``AZURE_SQL_WAKE_WAIT_S``
+    (default 20) seconds apart, only for the resume/throttle error codes.
+    """
+    tries = max(1, int(_to_float(os.environ.get("AZURE_SQL_WAKE_RETRIES")) or 4))
+    wait_s = _to_float(os.environ.get("AZURE_SQL_WAKE_WAIT_S"))
+    wait_s = 20.0 if wait_s is None else max(0.0, wait_s)
+    for attempt in range(1, tries + 1):
+        try:
+            return _connect_mssql_once(connection_string)
+        except Exception as exc:
+            if attempt >= tries or not _is_database_waking(exc):
+                raise
+            logger.warning("Azure SQL is resuming (attempt %s/%s); retrying in %.0fs",
+                           attempt, tries, wait_s)
+            time.sleep(wait_s)
+    raise RuntimeError("unreachable")
+
+
+def _connect_mssql_once(connection_string: str | None = None):
     """Open a pyodbc connection using Azure SQL env settings."""
     try:
         import pyodbc

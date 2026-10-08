@@ -972,6 +972,13 @@ _CLASSIFIED_FIELDS = (
 )
 # Fields copied only from a fresh classify (not a cluster-reuse copy).
 _FRESH_CLASSIFIED_FIELDS = (
+    "footprint_status",
+    "footprint_source",
+    "footprint_building_id",
+    "footprint_distance_m",
+    "footprint_area_m2",
+    "footprint_height_m",
+    "footprint_floors",
     "escalation_reason",
     "naip_screen_site_type",
     "naip_screen_site_confidence",

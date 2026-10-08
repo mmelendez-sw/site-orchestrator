@@ -114,6 +114,17 @@ The design and rollout plan are in [docs/adr/0001-multi-source-evidence-cascade.
 
 **Saved Nearmap chips.** `SAVED_NEARMAP_CHIPS=1` classifies a site on the Nearmap JPEGs any earlier run already bought for it (newest run first, at no new cost). NAIP is fetched fresh when the saved pack has none, and supplemental views still apply. Sites with no saved Nearmap keep the normal path, so with `NAIP_ONLY=1` they never buy Nearmap. Add `NEARMAP_CACHE_ONLY=1` to also stitch views from tiles cached for neighbouring sites (never a Nearmap call; a view is used only when every tile is cached).
 
+**Building footprints (pin check before imagery).** `scripts/load_overture_buildings.py` loads Overture Maps building outlines within 100 m of every Site__c pin into `dbo.OvertureBuilding` (about 1.5M rows; only the matching Overture row groups are downloaded). Re-run all four steps after a new Overture release (each release stays online ~60 days):
+
+```powershell
+python scripts/load_overture_buildings.py sites     # Site__c pins (read-only SOQL)
+python scripts/load_overture_buildings.py plan      # row groups near sites (metadata only)
+python scripts/load_overture_buildings.py extract   # resumable download + 100 m filter
+python scripts/load_overture_buildings.py load      # stage + swap into dbo.OvertureBuilding
+```
+
+`FOOTPRINT_PIN_CHECK=1` then checks each pin before NAIP/Mapillary/Nearmap: on a building it stays; off a building it snaps to the nearest building within `FOOTPRINT_SNAP_MAX_M` (60 m), or for imprecise pins (<= 3 decimals) to the building the Census address is in. A snap never moves the imagery center more than `FOOTPRINT_MAX_SHIFT_M` (30 m), so a tower at the pin stays in a ~100 m Nearmap chip. `no_building` is recorded but never skips Nearmap: on the pool audit most such pins were real monopoles or stealth sites, which have no footprint. FCC/TowerSource tower matches skip the check. Detail rows get `footprint_*` columns. Data: Overture Maps Foundation (ODbL).
+
 **Nearmap priority list.** `python scripts/build_nearmap_priority.py --runs <folders or YYYY-MM-DD> --out priority.csv` ranks undecided sites (1 gear seen without obliques, 2 rooftop/tower host, 3 other, 6 already had obliques, 9 imprecise pin) for `python -m enrichment.lanes --priority-csv priority.csv`, so a Nearmap budget buys the likeliest confirms first.
 
 **Audit holdout instead of unqualify.** `AUDIT_HOLDOUT_OWNER=<User Id>` with `CONNECTX_AUDIT=1` replaces the unqualify step. Every no-asset and inconclusive site gets only `LLM_Holdout__c=true` and `OwnerId=<User Id>`; Stage and the Unqualified fields are untouched. Errored sites are skipped so a later run retries them. Confirmed sites write as usual.
@@ -122,7 +133,7 @@ Zero-Nearmap audit of the Site Acquisition Team's ConnectX rooftops (drop `APPLY
 
 ```powershell
 python -m enrichment.lanes --pool-audit --lanes 5 --batch 10 --stop-at-mb <current MTD MB + 1> `
-  --env APPLY=0 --env NAIP_ONLY=1 --env SAVED_NEARMAP_CHIPS=1 --env NEARMAP_CACHE_ONLY=1 `
+  --env APPLY=0 --env NAIP_ONLY=1 --env SAVED_NEARMAP_CHIPS=1 --env NEARMAP_CACHE_ONLY=1 --env FOOTPRINT_PIN_CHECK=1 `
   --env AUDIT_HOLDOUT_OWNER=0056O00000EpUOgQAN `
   --env SUPPLEMENTAL_IMAGERY=mapillary --env SUPPLEMENTAL_CAN_CONFIRM=1 `
   --env MAPILLARY_MAX_VIEWS=3 --env MODEL_MAX_STREET_VIEWS=3 `

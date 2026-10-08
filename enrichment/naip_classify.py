@@ -389,6 +389,25 @@ def _classify_site_imagery(
     unused_point: tuple[float, float] | None = None
     osm_tower = False
 
+    # FOOTPRINT_PIN_CHECK=1: fix an off-building pin before any imagery.
+    footprint = None
+    if not db_backed:
+        from enrichment import footprints
+
+        if footprints.enabled():
+            footprint = footprints.pin_check(pin_lat, pin_lon, address_lat, address_lon)
+            if footprint.status == footprints.STATUS_SNAPPED:
+                lat, lon = footprint.anchor_lat, footprint.anchor_lon
+                classify_coord_source = f"footprint_{footprint.source}"
+                unused_point = (pin_lat, pin_lon)
+            if verbose:
+                progress.result(
+                    f"footprint: {footprint.status}"
+                    + (f" ({footprint.source}, {footprint.distance_m:.0f} m)"
+                       if footprint.distance_m is not None else "")
+                )
+    footprint_anchored = footprint is not None and footprint.status in {"inside", "snapped"}
+
     prompt = classification_prompt_for_run(
         presence_only=presence_only,
         input_confidence=input_confidence,
@@ -458,7 +477,8 @@ def _classify_site_imagery(
         if osm_tower and verbose:
             progress.result("OSM communication tower nearby")
         if (
-            should_compare_rooftop_hosts(
+            not footprint_anchored
+            and should_compare_rooftop_hosts(
                 pin_address_offset_m, db_backed=db_backed
             )
             and address_lat is not None
@@ -1232,6 +1252,7 @@ def _classify_site_imagery(
             asset_lat, asset_lon, asset_offset_m, asset_coord_source = located
 
     return {
+        **(footprint.as_row() if footprint is not None else {}),
         "lat": lat,
         "lon": lon,
         "classify_coord_source": classify_coord_source,
