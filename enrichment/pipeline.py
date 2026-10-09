@@ -22,6 +22,7 @@ from __future__ import annotations
 import csv
 import json
 import logging
+import os
 import queue
 import threading
 import time
@@ -1115,6 +1116,19 @@ def _call_classify(classify_fn, kwargs: dict[str, Any]) -> dict[str, Any]:
 _DUAL_AGREE = frozenset({"agree", "agree_crop", "agree_localize"})
 
 
+def _rereview_mode() -> bool:
+    """Re-reviewing held-out sites (AUDIT_RETRY_INCONCLUSIVE=1, or CONFIRM_CONSISTENCY=strict).
+
+    A site that was disputed before, re-run on the same imagery, will sometimes
+    come out confirmed by chance: on 2026-10-09 four of six such re-run
+    confirms were a tree, a fire escape, a turret and a bare roof. In this
+    mode every imagery confirm needs a second, strict pass that also writes.
+    """
+    return env_flag("AUDIT_RETRY_INCONCLUSIVE", False) or (
+        (os.environ.get("CONFIRM_CONSISTENCY") or "").strip().lower() == "strict"
+    )
+
+
 def _second_pass_agrees(
     first: dict[str, Any], second: dict[str, Any], again: dict[str, Any], first_type: str = ""
 ) -> bool:
@@ -1125,6 +1139,9 @@ def _second_pass_agrees(
     if again.get("bucket") == BUCKET_POTENTIAL_UPDATE:
         second_type = str(again.get("update_site_type") or "")
         return not second_type or not first_type or second_type == first_type
+    if _rereview_mode():
+        # Re-reviews: the second pass must itself pass the write gates.
+        return False
     same_type = (
         str(second.get("site_type") or "").strip().lower()
         == str(first.get("site_type") or "").strip().lower()
@@ -1294,7 +1311,10 @@ def _classify_prepared(
         and prep.hit is None
         and not prep.rooftop_confirm
         and env_flag("CONFIRM_CONSISTENCY", True)
-        and str(classified.get("dual_model_resolution") or "").strip().lower() not in _DUAL_AGREE
+        and (
+            str(classified.get("dual_model_resolution") or "").strip().lower() not in _DUAL_AGREE
+            or _rereview_mode()
+        )
     ):
         base.update(_consistency_check(prep, classify_fn, kwargs, base, classified, verbose=verbose))
     if classified.get("nearmap_budget_blocked") and base.get("bucket") != BUCKET_POTENTIAL_UPDATE:

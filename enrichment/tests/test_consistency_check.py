@@ -49,6 +49,17 @@ class ConsistencyCheckTests(unittest.TestCase):
                                               self.classified, verbose=False)
         self.assertEqual(out["consistency_check"], "agree")
 
+    def test_rereview_requires_strict_second_write(self):
+        import os
+
+        def classify_fn(**kw):
+            return {"site_type": "rooftop", "cell_equipment": True}
+        with patch.dict(os.environ, {"AUDIT_RETRY_INCONCLUSIVE": "1"}),                 patch.object(pipeline, "_bucket", return_value={"bucket": "potential_rooftop",
+                                                                 "holdout_reason": "rooftop_low_cell_confidence"}):
+            out = pipeline._consistency_check(None, classify_fn, self.kwargs, dict(self.base),
+                                              self.classified, verbose=False)
+        self.assertEqual(out["holdout_reason"], "consistency_disagree")
+
     def test_no_chip_dir_skips(self):
         out, calls = self._run({}, kwargs=dict(self.kwargs, chip_dir=None))
         self.assertEqual((out, calls), ({"consistency_check": "skipped_no_chips"}, []))
