@@ -150,6 +150,9 @@ GEMINI_SOFT_KEEP_CELL_CONF = env_float("GEMINI_SOFT_KEEP_CELL_CONF", 0.85)
 # Skip Claude (escalation + tower dual-model) when Gemini site_confidence is
 # at/above this. Rooftop HVAC FPs still go through Claude dual-confirm.
 GEMINI_SOLO_CELL_CONF = env_float("GEMINI_SOLO_CELL_CONF", 0.85)
+# Gear (not only structure) confidence a Gemini-only tower lock needs. Of 1,609
+# past imagery-only locks 11 sat below 0.80, including a billboard pole at 0.70.
+GEMINI_TOWER_LOCK_CELL_CONF = env_float("GEMINI_TOWER_LOCK_CELL_CONF", 0.80)
 EMPTY_CHIP_LOCK_CONF = env_float("NEARMAP_EMPTY_LOCK_CONF", 0.90)
 # Do not burn Claude on weak Gemini — below this site_confidence, skip
 # full-scene escalation and dual-model Claude. Weak calls stay holdout.
@@ -1209,7 +1212,12 @@ def should_skip_claude_for_gemini_tower(
     if res.get("cell_equipment") is not True:
         return False
     conf = normalize_confidence(res.get("site_confidence"))
-    return conf is not None and conf >= GEMINI_SOLO_CELL_CONF
+    if conf is None or conf < GEMINI_SOLO_CELL_CONF:
+        return False
+    # The lock is about the antennas, not only the structure: a billboard pole
+    # at site 0.9 / cell 0.7 was confirmed as a Monopole on 2026-10-08.
+    cell = normalize_confidence(res.get("cell_equipment_confidence"))
+    return cell is None or cell >= GEMINI_TOWER_LOCK_CELL_CONF
 
 
 def gemini_confidence_locks_claude(res: dict) -> bool:

@@ -311,6 +311,20 @@ def _supplemental_for_site(
     return [(view.label, view.image) for view in found]
 
 
+ALL_OBLIQUE_DIRECTIONS = ("North", "East", "South", "West")
+
+
+def dispute_oblique_stages(have: dict, configured: list[str] | tuple[str, ...]) -> list[list[str]]:
+    """Oblique directions to buy when the models disagree, in purchase order.
+
+    Missing configured directions first (normally North / East), then the
+    remaining South / West. Directions already in ``have`` are skipped.
+    """
+    first = [v for v in configured if v not in have]
+    rest = [v for v in ALL_OBLIQUE_DIRECTIONS if v not in have and v not in first]
+    return [stage for stage in (first, rest) if stage]
+
+
 def _classify_site_imagery(
     *,
     site_id: str,
@@ -1243,47 +1257,62 @@ def _classify_site_imagery(
             allow_gemini_solo=False,
             all_views=views,
         )
+        # Gemini saw gear, Claude did not: before giving up, buy the oblique
+        # directions this site has not been looked at from (configured North /
+        # East first, then South / West) and let Claude search the new views.
+        # Gear on one face only is common (8 of 13 gear sites in the 2026-10-08
+        # direction test). DISPUTE_EXTRA_OBLIQUES=0 turns this off.
+        purchase_ok = (
+            bool(ac.NEARMAP_API_KEY)
+            and not ac.NAIP_ONLY
+            and (not skip_nearmap_fetch or library_reuse)
+        )
         if (
             not cell_agree
-            and str(res.get("site_type") or "").strip().lower() == "rooftop"
+            and str(res.get("site_type") or "").strip().lower() in {"rooftop", "tower"}
             and res.get("gemini_pre_escalation_cell") is True
-            and not skip_nearmap_fetch
-            and ac.NEARMAP_API_KEY
-            and any(v in nearmap_views for v in imagery.OBLIQUE_VIEWS)
-            and any(v not in nearmap_views for v in imagery.OBLIQUE_VIEWS)
+            and purchase_ok
+            and env_flag("DISPUTE_EXTRA_OBLIQUES", True)
+            and any(v in nearmap_views for v in ALL_OBLIQUE_DIRECTIONS)
         ):
-            # obliques_settled stopped after one oblique on Gemini's confidence;
-            # gear facing the other way was never looked at.
-            missing = [v for v in imagery.OBLIQUE_VIEWS if v not in nearmap_views]
-            if verbose:
-                progress.step(f"Claude disagreed on one oblique -> buy {', '.join(missing)}")
-            try:
-                extra, _extra_date = imagery.fetch_nearmap_views(
-                    lat, lon, views=missing, purpose="oblique_extra"
-                )
-            except Exception as exc:  # noqa: BLE001
-                extra = {}
+            for stage in dispute_oblique_stages(nearmap_views, imagery.OBLIQUE_VIEWS):
                 if verbose:
-                    progress.warn(f"extra oblique fetch failed: {exc}")
-            if extra:
+                    progress.step(f"Claude disagreed -> buy {', '.join(stage)} obliques")
+                try:
+                    extra, _extra_date = imagery.fetch_nearmap_views(
+                        lat, lon, views=stage, purpose="oblique_extra"
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    extra = {}
+                    if verbose:
+                        progress.warn(f"extra oblique fetch failed: {exc}")
+                if not extra:
+                    continue
                 nearmap_views.update(extra)
                 nearmap_tier = nearmap_tier_for(nearmap_views)
-                views = build_views(nearmap_views)
+                # Only the new directions (plus Vert): the model view cap would
+                # otherwise drop them in favour of the obliques already judged.
+                focus = {k: v for k, v in nearmap_views.items() if k == "Vert" or k in extra}
+                retry_views = build_views(focus)
                 retry = dict(res)
                 retry.update({
                     "cell_equipment": True,
                     "cell_equipment_confidence": res.get("gemini_pre_escalation_cell_conf"),
                     "cell_equipment_evidence": res.get("gemini_pre_escalation_evidence"),
                     "cell_gear_kind": res.get("gemini_pre_escalation_gear") or "unclear",
+                    "asset_box_2d": None,
+                    "asset_view": None,
                     "nearmap_tier": nearmap_tier,
                 })
                 retry, dual_retry, agree_retry = ac.confirm_rooftop_cell_with_claude(
-                    retry, clients, views, already_escalated=False, allow_soft_keep=False,
+                    retry, clients, retry_views, already_escalated=False, allow_soft_keep=False,
                     from_wide_rescue=from_wide_rescue, used_crop=False,
-                    allow_gemini_solo=False, all_views=views,
+                    allow_gemini_solo=False, all_views=retry_views,
                 )
                 if agree_retry:
                     res, dual_model, cell_agree = retry, dual_retry or dual_model, True
+                    views = build_views(nearmap_views)
+                    break
         if dual_model and not escalation_model:
             escalation_model = dual_model
             escalation_reason_str = escalation_reason_str or (

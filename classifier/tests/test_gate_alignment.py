@@ -77,6 +77,19 @@ class StrictCropTests(unittest.TestCase):
         self.assertIsNot(out["cell_equipment"], True)
 
 
+class TowerLockGearConfidenceTests(unittest.TestCase):
+    def test_low_gear_confidence_does_not_lock(self):
+        from enrichment.bucketing import _tower_gemini_high_conf_ok
+
+        pole = {"site_type": "tower", "site_confidence": 0.9, "cell_equipment": True,
+                "cell_equipment_confidence": 0.7, "dual_model_resolution": "gemini_strong_solo"}
+        self.assertFalse(ac.should_skip_claude_for_gemini_tower(dict(pole)))
+        self.assertFalse(_tower_gemini_high_conf_ok(dict(pole)))
+        strong = dict(pole, cell_equipment_confidence=0.82)
+        self.assertTrue(ac.should_skip_claude_for_gemini_tower(dict(strong)))
+        self.assertTrue(_tower_gemini_high_conf_ok(dict(strong)))
+
+
 class DisputedLabelTests(unittest.TestCase):
     def test_claude_veto_is_disputed_not_gear_seen(self):
         from enrichment.connectx_audit import audit_verdict

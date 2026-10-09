@@ -304,6 +304,10 @@ def _tower_gemini_high_conf_ok(classified: dict[str, Any]) -> bool:
         classified.get("site_confidence"), GEMINI_TOWER_SKIP_CLAUDE_CONF
     ):
         return False
+    # Gear confidence too (a billboard pole at site 0.9 / cell 0.7 passed before).
+    cell_raw = classified.get("cell_equipment_confidence")
+    if cell_raw not in (None, "") and not _confidence_ok(cell_raw, env_float("GEMINI_TOWER_LOCK_CELL_CONF", 0.80)):
+        return False
     resolution = str(classified.get("dual_model_resolution") or "").strip().lower()
     return resolution in {"", "gemini_strong_solo"}
 
