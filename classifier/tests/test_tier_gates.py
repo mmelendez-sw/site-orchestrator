@@ -210,7 +210,7 @@ class SkipNearmapAfterNaipTests(unittest.TestCase):
         "communication_tower": False,
     }
 
-    def test_db_backed_medium_tower_skips(self):
+    def test_db_backed_medium_tower_buys_nearmap(self):
         reason = db_backed_naip_tower_skip_nearmap_reason(
             {
                 "site_type": "tower",
@@ -219,10 +219,21 @@ class SkipNearmapAfterNaipTests(unittest.TestCase):
             },
             db_backed=True,
         )
+        self.assertIsNone(reason)
+
+    def test_db_backed_locked_tower_skips(self):
+        reason = db_backed_naip_tower_skip_nearmap_reason(
+            {
+                "site_type": "tower",
+                "site_confidence": 0.90,
+                "cell_equipment": True,
+            },
+            db_backed=True,
+        )
         self.assertEqual(reason, "DB-hit NAIP tower medium+ cell decided")
 
-    def test_db_backed_tower_cell_false_skips(self):
-        self.assertIsNotNone(
+    def test_db_backed_tower_cell_false_buys_nearmap(self):
+        self.assertIsNone(
             db_backed_naip_tower_skip_nearmap_reason(
                 {
                     "site_type": "tower",
@@ -258,14 +269,18 @@ class SkipNearmapAfterNaipTests(unittest.TestCase):
         )
 
     def test_rooftop_cell_lock_skips(self):
-        reason = rooftop_naip_cell_skip_nearmap_reason(
-            {
-                "site_type": "rooftop",
-                "site_confidence": 0.90,
-                "cell_equipment": True,
-                "cell_equipment_confidence": 0.90,
-            }
-        )
+        import os
+        from unittest.mock import patch
+
+        with patch.dict(os.environ, {"NAIP_ROOFTOP_SKIP": "1"}):  # opt-in since 2026-10-08
+            reason = rooftop_naip_cell_skip_nearmap_reason(
+                {
+                    "site_type": "rooftop",
+                    "site_confidence": 0.90,
+                    "cell_equipment": True,
+                    "cell_equipment_confidence": 0.90,
+                }
+            )
         self.assertEqual(reason, "NAIP rooftop cell conf>=0.9")
 
     def test_rooftop_cell_below_lock_still_needs_nearmap(self):
@@ -338,6 +353,7 @@ class SkipNearmapAfterNaipTests(unittest.TestCase):
         )
 
     def test_combined_db_medium_tower(self):
+        # Medium confidence is below the NAIP write gate's tower lock: buy Nearmap.
         reason = skip_nearmap_after_naip_reason(
             {
                 "site_type": "tower",
@@ -346,7 +362,7 @@ class SkipNearmapAfterNaipTests(unittest.TestCase):
             },
             db_backed=True,
         )
-        self.assertEqual(reason, "DB-hit NAIP tower medium+ cell decided")
+        self.assertIsNone(reason)
 
     def test_combined_empty_osm(self):
         reason = skip_nearmap_after_naip_reason(
@@ -1191,3 +1207,17 @@ class NearmapAlwaysTests(unittest.TestCase):
             self.assertIsNotNone(ac.skip_nearmap_after_naip_reason(res, osm_info=info))
         with patch.dict(os.environ, {"NEARMAP_ALWAYS": "1"}):
             self.assertIsNone(ac.skip_nearmap_after_naip_reason(res, osm_info=info))
+
+
+class NaipRooftopSkipTests(unittest.TestCase):
+    def test_naip_rooftop_lock_no_longer_skips_nearmap_by_default(self):
+        import os
+        from unittest.mock import patch
+        from classifier import asset_classifier as ac
+
+        res = {"site_type": "rooftop", "site_confidence": 0.95, "cell_equipment": True,
+               "cell_equipment_confidence": 0.95}
+        with patch.dict(os.environ, {"NAIP_ROOFTOP_SKIP": ""}):
+            self.assertIsNone(ac.rooftop_naip_cell_skip_nearmap_reason(res))
+        with patch.dict(os.environ, {"NAIP_ROOFTOP_SKIP": "1"}):
+            self.assertIsNotNone(ac.rooftop_naip_cell_skip_nearmap_reason(res))

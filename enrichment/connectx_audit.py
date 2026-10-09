@@ -40,6 +40,7 @@ from enrichment.constants import (
     AUDIT_UNQUALIFIED_REASON,
     AUDIT_UNQUALIFIED_STAGE,
     BUCKET_AUDIT_HOLDOUT,
+    BUCKET_OTHER,
     BUCKET_AUDIT_UNQUALIFY,
     BUCKET_POTENTIAL_UPDATE,
     CONNECTX_AUDIT_STAGE_FILTER,
@@ -126,7 +127,7 @@ def unqualify_owner_id() -> str:
 def audit_holdout_owner_id() -> str:
     """``AUDIT_HOLDOUT_OWNER``: when set, unconfirmed sites (no asset or
     inconclusive) get LLM_Holdout__c=true and this OwnerId instead of being
-    unqualified."""
+    unqualified. ``keep`` writes nothing for them (rep books stay as they are)."""
     return (os.environ.get("AUDIT_HOLDOUT_OWNER") or "").strip()
 
 
@@ -212,10 +213,10 @@ def audit_verdict(row: dict[str, Any]) -> tuple[str, str]:
         return VERDICT_INCONCLUSIVE, reason
     if str(row.get("error") or "").strip():
         return VERDICT_INCONCLUSIVE, "error"
-    if any(to_bool(row.get(key)) is True for key in _CELL_FIELDS):
-        return VERDICT_INCONCLUSIVE, "gear_seen_unconfirmed"
     if lower_text(row.get("dual_model_resolution")) in _DISPUTED_RESOLUTIONS:
         return VERDICT_INCONCLUSIVE, "gear_claim_disputed"
+    if any(to_bool(row.get(key)) is True for key in _CELL_FIELDS):
+        return VERDICT_INCONCLUSIVE, "gear_seen_unconfirmed"
     if lower_text(row.get("nearmap_tier")) == "no_coverage":
         return VERDICT_INCONCLUSIVE, "no_nearmap_coverage"
     if imagery_bucket(row) != "nearmap_oblique":
@@ -279,12 +280,21 @@ def stamp_audit_verdict(
     row["audit_verdict"] = verdict
     row["audit_reason"] = reason
     holdout_owner = audit_holdout_owner_id() if holdout_owner is None else holdout_owner
-    confirmed_owner = (os.environ.get("AUDIT_CONFIRMED_OWNER") or "").strip()
-    if verdict == VERDICT_CONFIRMED and holdout_owner:
-        # A re-review may confirm a site an earlier run held out.
+    keep_books = holdout_owner.lower() == "keep"
+    confirmed_owner = "" if keep_books else (os.environ.get("AUDIT_CONFIRMED_OWNER") or "").strip()
+    if keep_books:
+        assign_confirmed_to = None
+    if verdict == VERDICT_CONFIRMED:
+        # A re-review may confirm a site an earlier run held out; writing
+        # LLM_Holdout__c=false on any confirm is harmless.
         row["update_clear_holdout"] = True
     if verdict == VERDICT_CONFIRMED and confirmed_owner:
         row["update_owner_id"] = confirmed_owner
+    if holdout_owner.lower() == "keep" and verdict in {VERDICT_NO_ASSET, VERDICT_INCONCLUSIVE}:
+        # AUDIT_HOLDOUT_OWNER=keep: leave unconfirmed sites in their owner's book,
+        # untouched (no unqualify, no reassign, no holdout write).
+        row["bucket"] = BUCKET_OTHER if lower_text(row.get("bucket")) == BUCKET_POTENTIAL_UPDATE else row.get("bucket")
+        return row
     # Budget blocks, SQL/classify errors and missing chips stay queued for a retry.
     if holdout_owner and verdict in {VERDICT_NO_ASSET, VERDICT_INCONCLUSIVE} and reason not in _RETRY_REASONS:
         row["bucket"] = BUCKET_AUDIT_HOLDOUT
@@ -398,6 +408,13 @@ def prior_audit_ids(runs_root: Path, *, retry_inconclusive: bool = False) -> lis
             continue
         if verdict in {VERDICT_CONFIRMED, VERDICT_NO_ASSET}:
             if status in {"updated", "unqualified"}:
+                ids.append(sf_id)
+            elif (
+                verdict == VERDICT_NO_ASSET and live and not retry_inconclusive
+                and status in {"dequeued", "skipped"}
+            ):
+                # Held out (AUDIT_HOLDOUT_OWNER) or left in place (keep): decided,
+                # like an inconclusive row, unless AUDIT_RETRY_INCONCLUSIVE.
                 ids.append(sf_id)
         elif verdict == VERDICT_INCONCLUSIVE and live and not retry_inconclusive:
             if lower_text(row.get("audit_reason")) not in _RETRY_REASONS:

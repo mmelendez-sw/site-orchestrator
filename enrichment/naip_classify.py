@@ -424,11 +424,19 @@ def _classify_site_imagery(
     library_reuse = False
     if not reuse_saved and not presence_only and env_flag("SAVED_NEARMAP_CHIPS", False):
         pack = load_saved_chip_pack(saved_nearmap_chip_dirs(), site_id, require_nearmap=True)
+        saved_views = pack.get("nearmap_views") or {}
+        purchases_allowed = not ac.NAIP_ONLY and bool(imagery.nearmap_api_key())
+        complete = all(view in saved_views for view in imagery.OBLIQUE_VIEWS)
+        if not any(name != "Vert" for name in saved_views) or (purchases_allowed and not complete):
+            # Vert-only packs cannot confirm a rooftop, and an incomplete pack
+            # (e.g. Vert+North) must not block buying the missing oblique: take
+            # the normal path, whose tile cache serves already-bought tiles free.
+            pack = {"naip": None, "nearmap_views": {}, "source_dir": None}
         source = pack["source_dir"].parent.name if pack.get("nearmap_views") else ""
         if not pack.get("nearmap_views") and env_flag("NEARMAP_CACHE_ONLY", False):
             # Tiles bought for neighbouring sites, stitched from disk (never billed).
             cached, _date = imagery.cached_nearmap_views(lat, lon)
-            if any(name != "Vert" for name in cached):
+            if any(name != "Vert" for name in cached):  # needs an oblique to be worth reusing
                 pack = {"naip": None, "nearmap_views": cached, "source_dir": None}
                 source = "tile cache"
         if pack.get("nearmap_views"):
@@ -1176,9 +1184,15 @@ def _classify_site_imagery(
     ):
         if verbose:
             progress.step("Claude escalate?")
+        pre_escalation = dict(res)
         res, escalation_model, escalation_reason_str = ac.maybe_escalate_to_claude(
             res, clients, views, prompt, input_conf, allow=True
         )
+        # A fresh Claude result drops the Nearmap context the confirm step and
+        # write gates read; carry it over.
+        for key in ("nearmap_tier", "nearmap_views", "classification_stage"):
+            if res.get(key) in (None, "") and pre_escalation.get(key) not in (None, ""):
+                res[key] = pre_escalation[key]
         if verbose and escalation_model:
             progress.result(
                 f"escalated ({escalation_reason_str}) → {res.get('site_type')}"
@@ -1214,13 +1228,56 @@ def _classify_site_imagery(
             res,
             clients,
             confirm_views,
-            already_escalated=bool(escalation_model),
+            # Imagery-only sites need agree_crop / agree_localize, so a plain
+            # escalation "agree" only short-circuits for DB-backed sites.
+            already_escalated=bool(escalation_model) and db_backed,
             allow_soft_keep=False,
             from_wide_rescue=from_wide_rescue,
             used_crop=used_crop,
             allow_gemini_solo=False,
             all_views=views,
         )
+        if (
+            not cell_agree
+            and str(res.get("site_type") or "").strip().lower() == "rooftop"
+            and res.get("gemini_pre_escalation_cell") is True
+            and not skip_nearmap_fetch
+            and ac.NEARMAP_API_KEY
+            and any(v in nearmap_views for v in imagery.OBLIQUE_VIEWS)
+            and any(v not in nearmap_views for v in imagery.OBLIQUE_VIEWS)
+        ):
+            # obliques_settled stopped after one oblique on Gemini's confidence;
+            # gear facing the other way was never looked at.
+            missing = [v for v in imagery.OBLIQUE_VIEWS if v not in nearmap_views]
+            if verbose:
+                progress.step(f"Claude disagreed on one oblique -> buy {', '.join(missing)}")
+            try:
+                extra, _extra_date = imagery.fetch_nearmap_views(
+                    lat, lon, views=missing, purpose="oblique_extra"
+                )
+            except Exception as exc:  # noqa: BLE001
+                extra = {}
+                if verbose:
+                    progress.warn(f"extra oblique fetch failed: {exc}")
+            if extra:
+                nearmap_views.update(extra)
+                nearmap_tier = nearmap_tier_for(nearmap_views)
+                views = build_views(nearmap_views)
+                retry = dict(res)
+                retry.update({
+                    "cell_equipment": True,
+                    "cell_equipment_confidence": res.get("gemini_pre_escalation_cell_conf"),
+                    "cell_equipment_evidence": res.get("gemini_pre_escalation_evidence"),
+                    "cell_gear_kind": res.get("gemini_pre_escalation_gear") or "unclear",
+                    "nearmap_tier": nearmap_tier,
+                })
+                retry, dual_retry, agree_retry = ac.confirm_rooftop_cell_with_claude(
+                    retry, clients, views, already_escalated=False, allow_soft_keep=False,
+                    from_wide_rescue=from_wide_rescue, used_crop=False,
+                    allow_gemini_solo=False, all_views=views,
+                )
+                if agree_retry:
+                    res, dual_model, cell_agree = retry, dual_retry or dual_model, True
         if dual_model and not escalation_model:
             escalation_model = dual_model
             escalation_reason_str = escalation_reason_str or (
@@ -1263,6 +1320,7 @@ def _classify_site_imagery(
         "site_evidence": res.get("site_evidence"),
         "cell_equipment": res.get("cell_equipment"),
         "cell_equipment_confidence": res.get("cell_equipment_confidence"),
+        "gemini_cell_confidence": res.get("gemini_pre_escalation_cell_conf"),
         "cell_equipment_evidence": res.get("cell_equipment_evidence"),
         "cell_gear_kind": res.get("cell_gear_kind"),
         "gemini_cell_equipment": res.get("gemini_cell_equipment"),

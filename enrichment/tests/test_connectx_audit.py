@@ -396,7 +396,7 @@ class OfflineAuditRunTests(unittest.TestCase):
         self.assertEqual(set(written), {REAL_ID, EMPTY_ID})
         self.assertEqual(written[REAL_ID]["Site_Type__c"], "Rooftop")
         self.assertNotIn("OwnerId", written[REAL_ID])
-        self.assertNotIn("LLM_Holdout__c", written[REAL_ID])
+        self.assertIs(written[REAL_ID]["LLM_Holdout__c"], False)  # every audit confirm clears the holdout
         self.assertEqual(written[EMPTY_ID]["OwnerId"], SITE_ACQ_TEAM_OWNER_ID)
         self.assertEqual(written[EMPTY_ID]["Stage__c"], "Unqualified")
         self.assertEqual(written[EMPTY_ID]["Unqualified_Reason__c"], "No Site/Decommissioned")
@@ -457,3 +457,26 @@ class AuditHoldoutOwnerTests(unittest.TestCase):
         with patch.dict(os.environ, {"AUDIT_HOLDOUT_OWNER": ""}):
             row = stamp_audit_verdict(self._row(), run_id="r")
         self.assertNotEqual(row["bucket"], "audit_holdout")
+
+
+class KeepBooksTests(unittest.TestCase):
+    def test_keep_writes_nothing_for_unconfirmed(self):
+        from enrichment.connectx_audit import stamp_audit_verdict
+        from enrichment.pipeline import _collect_apply_rows
+
+        no_asset = {"Id": "a1", "bucket": "other_or_else", "holdout_reason": "other", "naip_site_type": "other",
+                    "naip_site_confidence": "0.95", "nearmap_tier": "full", "nearmap_views": "Vert,North,East"}
+        row = stamp_audit_verdict(dict(no_asset), run_id="r", holdout_owner="keep")
+        self.assertEqual(row["audit_verdict"], "no_asset")
+        self.assertNotIn("update_stage", row)
+        self.assertFalse(row.get("update_owner_id"))
+        self.assertEqual(_collect_apply_rows([row], dequeue_holdouts=True, db_only=False, confirm_rooftop=False,
+                                             confirm_existing=False, connectx_audit=True), [])
+
+    def test_keep_still_writes_confirmed_without_owner(self):
+        from enrichment.connectx_audit import stamp_audit_verdict
+
+        row = stamp_audit_verdict({"Id": "a2", "bucket": "potential_update", "holdout_reason": "",
+                                   "update_site_type": "Rooftop"}, run_id="r", holdout_owner="keep")
+        self.assertEqual((row["audit_verdict"], row["bucket"]), ("confirmed", "potential_update"))
+        self.assertFalse(row.get("update_owner_id"))

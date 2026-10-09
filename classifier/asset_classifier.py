@@ -867,6 +867,41 @@ def confirm_rooftop_cell_with_claude(
         )
 
     # Claude says true.
+    crop_conf = normalize_confidence(claude_res.get("cell_equipment_confidence"))
+    if (
+        used_crop
+        and site == "rooftop"
+        and all_views
+        and crop_conf is not None
+        and crop_conf < ROOFTOP_CELL_CONF_MIN
+    ):
+        # A hesitant crop yes (e.g. 0.7) would sit under the write bar for
+        # good: let Claude search all views once and keep the stronger answer.
+        loc_res = classify_site(
+            "claude",
+            clients,
+            all_views,
+            prompt=ROOFTOP_CELL_LOCALIZE_CONFIRM_PROMPT + (STREET_BOX_NOTE if street_note else ""),
+            claude_model=CLAUDE_ESCALATION_MODEL,
+        )
+        loc_box = get_valid_asset_box(loc_res)
+        loc_conf = normalize_confidence(loc_res.get("cell_equipment_confidence")) or 0.0
+        if loc_res.get("cell_equipment") is True and loc_box and loc_conf > crop_conf:
+            res["claude_cell_equipment"] = True
+            res["claude_dual_mode"] = "crop_low_then_localize"
+            res["cell_equipment_confidence"] = loc_conf
+            if loc_res.get("cell_equipment_evidence"):
+                res["cell_equipment_evidence"] = loc_res.get("cell_equipment_evidence")
+            if loc_res.get("cell_gear_kind"):
+                res["cell_gear_kind"] = loc_res.get("cell_gear_kind")
+            res["asset_box_2d"] = loc_box
+            res["asset_view"] = loc_res.get("asset_view") or res.get("asset_view")
+            res["cell_equipment"] = True
+            res["cell_models_agree"] = True
+            res["dual_model_resolution"] = "agree_localize"
+            normalize_model_result(res)
+            _step_done("dual-model cell", "low crop yes -> localize agree")
+            return res, "claude", True
     if used_crop:
         # Keep Gemini's box/coords; Claude only confirmed the crop contents.
         if claude_res.get("cell_equipment_confidence") is not None:
@@ -1465,8 +1500,11 @@ def db_backed_naip_tower_skip_nearmap_reason(
 ) -> str | None:
     """Skip Nearmap when FCC/TowerSource plus NAIP already decided a tower.
 
-    Medium+ site confidence and cell_equipment true/false is enough — the
-    database anchors the pin. Imagery-only towers still buy obliques.
+    Only at the Gemini tower lock (cell true, site conf >= GEMINI_SOLO_CELL_CONF):
+    that is all the NAIP write gate accepts (``_tower_gemini_high_conf_ok``).
+    A medium-confidence skip left 64 DB-backed towers unwritable as
+    ``tower_naip_only_forbidden`` with no Nearmap obliques to confirm on.
+    Imagery-only towers still buy obliques.
     """
     if not db_backed:
         return None
@@ -1474,13 +1512,23 @@ def db_backed_naip_tower_skip_nearmap_reason(
         return None
     if not tier_confident_stop(res):
         return None
+    if not should_skip_claude_for_gemini_tower(res):
+        return None
     return "DB-hit NAIP tower medium+ cell decided"
 
 
 def rooftop_naip_cell_skip_nearmap_reason(
     res: dict, naip_age_years: float | None = None
 ) -> str | None:
-    """Skip Nearmap when NAIP already locked rooftop cell at the empty-chip lock."""
+    """Skip Nearmap when NAIP already locked rooftop cell at the empty-chip lock.
+
+    Off unless NAIP_ROOFTOP_SKIP=1: NAIP (60 cm) cannot resolve rooftop panels.
+    On the 2026-10-08 Outreach-Verified run 40 of 83 unconfirmed rooftops took
+    this skip (Gemini >= 0.9 on NAIP), Claude then vetoed 36 of them on the
+    same NAIP chip, and with no Nearmap obliques they could never confirm.
+    """
+    if not _env_flag("NAIP_ROOFTOP_SKIP", default="0"):
+        return None
     if not _is_rooftop(res):
         return None
     if res.get("cell_equipment") is not True:

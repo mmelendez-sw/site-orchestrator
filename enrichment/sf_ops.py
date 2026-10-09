@@ -413,7 +413,7 @@ def build_row_payload(row: dict[str, Any], *, write_holdout: bool = True) -> dic
         owner_id = confirmed_owner_id(row)
         if owner_id:
             payload["OwnerId"] = owner_id
-        if row.get("update_clear_holdout") is True and is_enrichment_payload(payload):
+        if to_bool(row.get("update_clear_holdout")) is True and is_enrichment_payload(payload):
             payload["LLM_Holdout__c"] = False
         return payload
     # Preserve explicit queue flags on prebuilt payloads; fill any gaps.

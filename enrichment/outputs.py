@@ -42,6 +42,8 @@ DETAIL_COLUMNS: tuple[str, ...] = (
     "footprint_floors",
     "consistency_check",
     "consistency_second",
+    "gemini_cell_confidence",
+    "update_clear_holdout",
     "address_query",
     "address_lat",
     "address_lng",

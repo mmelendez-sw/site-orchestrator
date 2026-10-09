@@ -519,12 +519,45 @@ def _apply_rows(
     return results
 
 
+REVIEW_CSV = "review_queue.csv"
+REVIEW_COLUMNS = (
+    "Id", "review_reason", "naip_site_type", "gemini_cell_confidence", "cell_equipment_confidence",
+    "dual_model_resolution", "holdout_reason", "audit_reason", "nearmap_views",
+    "supplemental_sources", "cell_equipment_evidence", "chip_dir",
+)
+REVIEW_GEMINI_CONF = 0.9
+
+
+def review_reason(row: dict[str, Any]) -> str:
+    """Why an unconfirmed row needs a person, or '' (models split hard, stealth, unstable)."""
+    if row.get("bucket") == BUCKET_POTENTIAL_UPDATE:
+        return ""
+    try:
+        gemini = float(row.get("gemini_cell_confidence") or 0)
+    except (TypeError, ValueError):
+        gemini = 0.0
+    resolution = str(row.get("dual_model_resolution") or "").strip().lower()
+    if resolution == "claude_veto" and gemini >= REVIEW_GEMINI_CONF:
+        return f"gemini {gemini:.2f} vs claude veto"
+    if "stealth" in str(row.get("audit_reason") or row.get("holdout_reason") or ""):
+        return "possible stealth host"
+    if row.get("holdout_reason") == "consistency_disagree":
+        return "single-model confirm, second pass disagreed"
+    return ""
+
+
 def _write_summary_csvs(run_dir: Path, detail_rows: list[dict[str, Any]]) -> tuple[int, int]:
     candidates = [r for r in detail_rows if r.get("bucket") == BUCKET_POTENTIAL_UPDATE]
     holdouts = [r for r in detail_rows if r.get("bucket") in {BUCKET_ROOFTOP, BUCKET_OTHER}]
     write_csv(run_dir / DETAIL_CSV, detail_rows, DETAIL_COLUMNS)
     write_csv(run_dir / CANDIDATE_CSV, candidates, CANDIDATE_COLUMNS)
     write_csv(run_dir / HOLDOUT_CSV, holdouts, HOLDOUT_COLUMNS)
+    review = []
+    for row in detail_rows:
+        reason = review_reason(row)
+        if reason:
+            review.append({**row, "review_reason": reason, "chip_dir": str(run_dir / "chips")})
+    write_csv(run_dir / REVIEW_CSV, review, REVIEW_COLUMNS)
     return len(candidates), len(holdouts)
 
 
@@ -973,6 +1006,7 @@ _CLASSIFIED_FIELDS = (
 )
 # Fields copied only from a fresh classify (not a cluster-reuse copy).
 _FRESH_CLASSIFIED_FIELDS = (
+    "gemini_cell_confidence",
     "footprint_status",
     "footprint_source",
     "footprint_building_id",
@@ -1143,6 +1177,12 @@ def _consistency_check(
     if agree:
         return {"consistency_check": "agree", "consistency_second": summary}
     site = str(classified.get("site_type") or "").strip().lower()
+    if second.get("error"):
+        # Transient (429, timeout, missing chips): stay queued for a retry
+        # rather than being decided as a disagreement.
+        held = _holdout(BUCKET_ROOFTOP if site == "rooftop" else BUCKET_OTHER, "classify_error", classified)
+        held.update({"consistency_check": "error", "consistency_second": summary})
+        return held
     held = _holdout(BUCKET_ROOFTOP if site == "rooftop" else BUCKET_OTHER, "consistency_disagree", classified)
     held.update({"consistency_check": "disagree", "consistency_second": summary})
     return held

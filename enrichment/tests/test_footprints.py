@@ -30,10 +30,18 @@ class PinCheckTests(unittest.TestCase):
         self.assertEqual((out.status, out.anchor_lat, out.anchor_lon), ("inside", *PIN))
 
     def test_address_building_wins_over_nearby(self):
+        # Address building's centroid is ~122 m from the pin, its nearest edge ~22 m: snap to the edge.
         out = self.run_check({PIN: _bld("near", inside=False, dist=20),
-                              ADDR: _bld("addr", inside=True, dist=0, centroid=(40.0011, -74.0))}, ADDR)
+                              ADDR: _bld("addr", inside=True, dist=0, centroid=(40.0011, -74.0),
+                                         near=(40.0002, -74.0))}, ADDR)
         self.assertEqual((out.status, out.source, out.building_id), ("snapped", "address", "addr"))
-        self.assertEqual((out.anchor_lat, out.anchor_lon), (40.0011, -74.0))
+        self.assertEqual((out.anchor_lat, out.anchor_lon), (40.0002, -74.0))
+
+    def test_address_snap_respects_shift_cap_from_pin(self):
+        out = self.run_check({PIN: _bld("near", inside=False, dist=20),
+                              ADDR: _bld("addr", inside=True, dist=0, centroid=(40.0011, -74.0),
+                                         near=(40.0009, -74.0))}, ADDR)
+        self.assertEqual((out.source, out.building_id), ("pin", "near"))
 
     def test_precise_pin_ignores_address(self):
         near = _bld("near", inside=False, dist=20, centroid=(40.1236, -74.1236), near=(40.12350, -74.12350))

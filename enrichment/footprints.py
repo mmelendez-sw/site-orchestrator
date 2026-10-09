@@ -155,6 +155,8 @@ def nearest_building(lat: float, lon: float) -> dict[str, Any] | None:
         row = cur.execute(_NEAREST_SQL, params).fetchone()
     except Exception as exc:  # noqa: BLE001
         _drop_cursor()
+        with _down_lock:
+            _down_until[0] = time.time() + 300
         raise LookupError(str(exc)) from exc
     if row is None:
         return None
@@ -231,8 +233,9 @@ def pin_check(
             if haversine_m(pin_lat, pin_lon, address_lat, address_lon) <= address_max:
                 at_address = lookup(address_lat, address_lon)
                 if at_address is not None and at_address["inside"]:
-                    anchor = _anchor(at_address, address_lat, address_lon) or (address_lat, address_lon)
-                    return _check(at_address, STATUS_SNAPPED, "address", anchor)
+                    anchor = _anchor(at_address, pin_lat, pin_lon)
+                    if anchor is not None:
+                        return _check(at_address, STATUS_SNAPPED, "address", anchor)
         if at_pin is not None and at_pin["distance_m"] <= snap_max:
             anchor = _anchor(at_pin, pin_lat, pin_lon)
             if anchor is None:
