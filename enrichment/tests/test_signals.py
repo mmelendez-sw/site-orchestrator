@@ -95,7 +95,7 @@ class _Base(unittest.TestCase):
         env = {
             "SITE_ORCHESTRATOR_DATA": self._tmp.name,
             "SIGNALS": "1",
-            "SIGNALS_SOURCES": "",
+            "SIGNALS_SOURCES": "uls,opencellid,osm",
             "OPENCELLID_API_KEY": "",
         }
         patcher = mock.patch.dict(os.environ, env)
@@ -449,13 +449,14 @@ class StrengthAndEnvTests(_Base):
             self.assertEqual(s({"uls_nearest_m": 31.0, "uls_count": 1}, {"uls"}), "strong")
 
     def test_signals_enabled_parsing(self):
-        for raw, want in (("", False), ("0", False), ("1", True), ("true", True), ("no", False)):
+        # On by default in the end-to-end flow; "0"/"no" turns it off.
+        for raw, want in (("", True), ("0", False), ("1", True), ("true", True), ("no", False)):
             with mock.patch.dict(os.environ, {"SIGNALS": raw}):
                 self.assertEqual(signals.signals_enabled(), want, raw)
 
     def test_sources_parsing(self):
         cases = {
-            "": ("uls", "opencellid", "osm"),
+            "": ("uls", "opencellid"),  # OSM is opt-in (flaky public Overpass)
             "osm": ("osm",),
             " OSM , uls ,bogus": ("uls", "osm"),
             "opencellid,osm_antenna": ("opencellid", "osm"),

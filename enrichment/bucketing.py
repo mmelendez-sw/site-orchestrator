@@ -14,6 +14,7 @@ from classifier.evidence import (
     has_any,
 )
 from classifier.views import (
+    supplemental_can_confirm,
     is_oblique_label,
     is_state_ortho_label,
     is_street_level_label,
@@ -170,7 +171,7 @@ def _street_confirm_source(classified: dict[str, Any]) -> str | None:
     reach 0.9 with unhedged evidence, and the photo must be at most
     STREET_CONFIRM_MAX_AGE_YEARS (default 5) old.
     """
-    if not env_flag("SUPPLEMENTAL_CAN_CONFIRM", False):
+    if not supplemental_can_confirm():
         return None
     view = str(classified.get("asset_view") or "")
     if not is_street_level_label(view) or not _compact_asset_box(classified):

@@ -64,7 +64,7 @@ class TrimTests(unittest.TestCase):
         views = [("NAIP top-down", _img())] + [(f"{STREET} #{i}", _img()) for i in range(4)]
         labels = self._labels(views)
         self.assertEqual(labels[0], "NAIP top-down")
-        self.assertEqual(sum(is_street_level_label(lbl) for lbl in labels), 2)
+        self.assertEqual(sum(is_street_level_label(lbl) for lbl in labels), 3)  # MODEL_MAX_STREET_VIEWS default
 
 
 def _street_rooftop(**kw):
@@ -95,7 +95,7 @@ class StreetConfirmGateTests(unittest.TestCase):
         )
 
     def test_off_by_default_street_box_cannot_write(self):
-        with patch.dict(os.environ, {"SUPPLEMENTAL_CAN_CONFIRM": ""}):
+        with patch.dict(os.environ, {"SUPPLEMENTAL_CAN_CONFIRM": "0"}):
             self.assertIsNone(_street_confirm_source(_street_rooftop()))
             self.assertFalse(_rooftop_oblique_imagery_ok(_street_rooftop()))
             out = self._bucket(_street_rooftop())
@@ -127,7 +127,7 @@ class StreetConfirmGateTests(unittest.TestCase):
     def test_street_tower_without_opt_in_stays_naip_forbidden(self):
         tower = _street_rooftop(site_type="tower", tower_subtype="monopole",
                                 site_confidence=0.85, dual_model_resolution="agree_localize")
-        with patch.dict(os.environ, {"SUPPLEMENTAL_CAN_CONFIRM": ""}):
+        with patch.dict(os.environ, {"SUPPLEMENTAL_CAN_CONFIRM": "0"}):
             out = self._bucket(tower)
         self.assertEqual(out["holdout_reason"], "tower_naip_only_forbidden")
 
@@ -231,7 +231,7 @@ class StreetFirstPassGateTests(unittest.TestCase):
             kept = ac.gate_weak_rooftop_cell_claim(dict(claim))
         self.assertIs(kept["cell_equipment"], True)
         self.assertEqual(kept["asset_view"], STREET)
-        with patch.dict(os.environ, {"SUPPLEMENTAL_CAN_CONFIRM": ""}):
+        with patch.dict(os.environ, {"SUPPLEMENTAL_CAN_CONFIRM": "0"}):
             cleared = ac.gate_weak_rooftop_cell_claim(dict(claim))
         self.assertIsNone(cleared["cell_equipment"])
 

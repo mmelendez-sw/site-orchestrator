@@ -119,8 +119,8 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--runs", required=True, help="comma list of run folders or YYYY-MM-DD prefixes")
     p.add_argument("--out", type=Path, required=True)
-    p.add_argument("--evidence", action="store_true",
-                   help="also rank by building height / ULS-in-building (needs dbo.OvertureBuilding)")
+    p.add_argument("--no-evidence", dest="evidence", action="store_false",
+                   help="skip the building height / ULS-in-building ranking (needs dbo.OvertureBuilding)")
     args = p.parse_args(argv)
 
     specs = [s.strip() for s in args.runs.split(",") if s.strip()]

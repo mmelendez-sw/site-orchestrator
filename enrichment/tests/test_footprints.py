@@ -69,6 +69,12 @@ class PinCheckTests(unittest.TestCase):
                                         near=(40.0004, -74.0))})
         self.assertEqual((far.status, far.anchor_lat), ("off_building", PIN[0]))
 
+    def test_off_building_carries_the_building_point(self):
+        far = self.run_check({PIN: _bld("f", inside=False, dist=45, centroid=(40.0008, -74.0),
+                                        near=(40.0004, -74.0))})
+        self.assertEqual(far.status, "off_building")
+        self.assertEqual((far.building_lat, far.building_lon), (40.0008, -74.0))
+
     def test_no_building_within_snap_radius(self):
         out = self.run_check({PIN: _bld("far", inside=False, dist=140)})
         self.assertEqual((out.status, out.anchor_lat), ("no_building", None))

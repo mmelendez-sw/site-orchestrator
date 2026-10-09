@@ -78,14 +78,15 @@ OSM_TELECOM_NEAREST_KEY = "_osm_telecom_nearest_m"
 
 def signals_enabled() -> bool:
     """SIGNALS env flag (default "0"). Read at call time."""
-    return env_flag("SIGNALS", "0")
+    return env_flag("SIGNALS", "1")
 
 
 def enabled_sources() -> tuple[str, ...]:
     """Sources named in SIGNALS_SOURCES (default all), in canonical order."""
     names = env_csv("SIGNALS_SOURCES")
     if names is None:
-        return ALL_SOURCES
+        # OSM Overpass is too unreliable to run by default; name it to opt in.
+        return tuple(s for s in ALL_SOURCES if s != "osm")
     picked: set[str] = set()
     for raw in names:
         canon = _SOURCE_ALIASES.get(raw.strip().lower())

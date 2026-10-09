@@ -74,6 +74,15 @@ from pathlib import Path
 from dotenv import dotenv_values, load_dotenv
 
 ROOT = Path(__file__).resolve().parents[1]
+
+# Banners and progress use non-ASCII (arrows, dashes). On Windows a redirected
+# stdout defaults to cp1252 and the first "->" arrow would crash the run.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            pass
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 

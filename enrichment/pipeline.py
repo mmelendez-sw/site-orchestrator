@@ -521,7 +521,7 @@ def _apply_rows(
 
 REVIEW_CSV = "review_queue.csv"
 REVIEW_COLUMNS = (
-    "Id", "review_reason", "naip_site_type", "gemini_cell_confidence", "cell_equipment_confidence",
+    "Id", "review_reason", "footprint_status", "footprint_distance_m", "naip_site_type", "gemini_cell_confidence", "cell_equipment_confidence",
     "dual_model_resolution", "holdout_reason", "audit_reason", "nearmap_views",
     "supplemental_sources", "cell_equipment_evidence", "chip_dir",
 )
@@ -543,6 +543,9 @@ def review_reason(row: dict[str, Any]) -> str:
         return "possible stealth host"
     if row.get("holdout_reason") == "consistency_disagree":
         return "single-model confirm, second pass disagreed"
+    if row.get("footprint_status") == "no_building":
+        # 4% of no-building pins confirmed on 2026-10-08: bad pin or a tower.
+        return "no building within 60 m of the pin (bad pin or tower?)"
     return ""
 
 
@@ -1290,7 +1293,7 @@ def _classify_prepared(
         base.get("bucket") == BUCKET_POTENTIAL_UPDATE
         and prep.hit is None
         and not prep.rooftop_confirm
-        and env_flag("CONFIRM_CONSISTENCY", False)
+        and env_flag("CONFIRM_CONSISTENCY", True)
         and str(classified.get("dual_model_resolution") or "").strip().lower() not in _DUAL_AGREE
     ):
         base.update(_consistency_check(prep, classify_fn, kwargs, base, classified, verbose=verbose))

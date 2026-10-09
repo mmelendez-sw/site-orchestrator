@@ -401,13 +401,17 @@ def _classify_site_imagery(
                 lat, lon = footprint.anchor_lat, footprint.anchor_lon
                 classify_coord_source = f"footprint_{footprint.source}"
                 unused_point = (pin_lat, pin_lon)
+            elif footprint.status == footprints.STATUS_OFF_BUILDING and footprint.building_lat is not None:
+                # Building 30-60 m away: keep the pin (a tower there stays in
+                # frame) and let the second-pack rule look at the building.
+                unused_point = (footprint.building_lat, footprint.building_lon)
             if verbose:
                 progress.result(
                     f"footprint: {footprint.status}"
                     + (f" ({footprint.source}, {footprint.distance_m:.0f} m)"
                        if footprint.distance_m is not None else "")
                 )
-    footprint_anchored = footprint is not None and footprint.status in {"inside", "snapped"}
+    footprint_anchored = footprint is not None and footprint.status in {"inside", "snapped", "off_building"}
 
     prompt = classification_prompt_for_run(
         presence_only=presence_only,
@@ -422,7 +426,7 @@ def _classify_site_imagery(
     # SAVED_NEARMAP_CHIPS=1: classify on Nearmap chips an earlier run already
     # bought for this site (no new spend); sites without any keep the normal path.
     library_reuse = False
-    if not reuse_saved and not presence_only and env_flag("SAVED_NEARMAP_CHIPS", False):
+    if not reuse_saved and not presence_only and env_flag("SAVED_NEARMAP_CHIPS", True):
         pack = load_saved_chip_pack(saved_nearmap_chip_dirs(), site_id, require_nearmap=True)
         saved_views = pack.get("nearmap_views") or {}
         purchases_allowed = not ac.NAIP_ONLY and bool(imagery.nearmap_api_key())
@@ -433,7 +437,7 @@ def _classify_site_imagery(
             # the normal path, whose tile cache serves already-bought tiles free.
             pack = {"naip": None, "nearmap_views": {}, "source_dir": None}
         source = pack["source_dir"].parent.name if pack.get("nearmap_views") else ""
-        if not pack.get("nearmap_views") and env_flag("NEARMAP_CACHE_ONLY", False):
+        if not pack.get("nearmap_views") and env_flag("NEARMAP_CACHE_ONLY", True):
             # Tiles bought for neighbouring sites, stitched from disk (never billed).
             cached, _date = imagery.cached_nearmap_views(lat, lon)
             if any(name != "Vert" for name in cached):  # needs an oblique to be worth reusing
@@ -552,7 +556,9 @@ def _classify_site_imagery(
         supplemental_views = _supplemental_for_site(
             lat, lon, site_id=site_id, chip_dir=chip_dir, state=site_state, verbose=verbose
         )
-    supplemental_can_confirm = ac._env_flag("SUPPLEMENTAL_CAN_CONFIRM", default="0")
+    from classifier.views import supplemental_can_confirm as _can_confirm
+
+    supplemental_can_confirm = _can_confirm()
     if supplemental_can_confirm and supplemental_views:
         prompt += STREET_BOX_NOTE
 

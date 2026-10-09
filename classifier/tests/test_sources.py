@@ -433,7 +433,7 @@ class MapillaryTests(SourcesTestCase):
             return FakeResp(content=thumb)
 
         self.fake(handler)
-        with self.env(MAPILLARY_ACCESS_TOKEN=MAPILLARY_TOKEN):
+        with self.env(MAPILLARY_ACCESS_TOKEN=MAPILLARY_TOKEN, MAPILLARY_MAX_VIEWS="2"):
             self.assertEqual(mapillary.fetch(SITE_LAT, SITE_LON), [])
             views = mapillary.fetch(SITE_LAT, SITE_LON)
         self.assertEqual([v.meta["image_id"] for v in views], ["best_s", "east"])
@@ -448,7 +448,7 @@ class MapillaryTests(SourcesTestCase):
             return FakeResp(content=thumb)
 
         self.fake(handler)
-        with self.env(MAPILLARY_ACCESS_TOKEN=MAPILLARY_TOKEN):
+        with self.env(MAPILLARY_ACCESS_TOKEN=MAPILLARY_TOKEN, MAPILLARY_MAX_VIEWS="2"):
             views = mapillary.fetch(SITE_LAT, SITE_LON)
         self.assertEqual([v.meta["image_id"] for v in views], ["best_s", "east"])
 
@@ -461,7 +461,7 @@ class MapillaryTests(SourcesTestCase):
             return FakeResp(content=thumb)
 
         session = self.fake(handler)
-        with self.env(MAPILLARY_ACCESS_TOKEN=MAPILLARY_TOKEN):
+        with self.env(MAPILLARY_ACCESS_TOKEN=MAPILLARY_TOKEN, MAPILLARY_MAX_VIEWS="2"):
             with sources.source_meter() as meter:
                 views = mapillary.fetch(SITE_LAT, SITE_LON)
             self.assertEqual([v.meta["image_id"] for v in views], ["best_s", "east"])
@@ -619,7 +619,7 @@ class RegistryTests(SourcesTestCase):
         self.assertNotIn(MAPILLARY_TOKEN, text)
 
     def test_redact(self):
-        with self.env(MAPILLARY_ACCESS_TOKEN=MAPILLARY_TOKEN):
+        with self.env(MAPILLARY_ACCESS_TOKEN=MAPILLARY_TOKEN, MAPILLARY_MAX_VIEWS="2"):
             out = base.redact(f"https://x/y?location=1,2&key=AIzaQueryKey987&pano=P "
                               f"Authorization: OAuth {MAPILLARY_TOKEN} raw {MAPILLARY_TOKEN}")
         self.assertNotIn("AIzaQueryKey987", out)

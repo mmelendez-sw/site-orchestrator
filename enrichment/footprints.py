@@ -76,6 +76,8 @@ class PinCheck:
     height_m: float | None = None
     num_floors: int | None = None
     building_class: str = ""
+    building_lat: float | None = None  # nearest building's centroid (off_building)
+    building_lon: float | None = None
 
     def as_row(self) -> dict[str, Any]:
         def num(value: float | None) -> Any:
@@ -93,7 +95,7 @@ class PinCheck:
 
 
 def enabled() -> bool:
-    return env_flag("FOOTPRINT_PIN_CHECK", False)
+    return env_flag("FOOTPRINT_PIN_CHECK", True)
 
 
 def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -239,7 +241,9 @@ def pin_check(
         if at_pin is not None and at_pin["distance_m"] <= snap_max:
             anchor = _anchor(at_pin, pin_lat, pin_lon)
             if anchor is None:
-                return _check(at_pin, STATUS_OFF_BUILDING, "pin", (pin_lat, pin_lon))
+                off = _check(at_pin, STATUS_OFF_BUILDING, "pin", (pin_lat, pin_lon))
+                off.building_lat, off.building_lon = at_pin["centroid_lat"], at_pin["centroid_lon"]
+                return off
             return _check(at_pin, STATUS_SNAPPED, "pin", anchor)
     except LookupError:
         return PinCheck(status=STATUS_UNAVAILABLE)

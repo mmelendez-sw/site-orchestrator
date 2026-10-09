@@ -20,7 +20,7 @@ from envutil import env_flag, env_int
 
 MODEL_IMAGE_MAX_PX = env_int("MODEL_IMAGE_MAX_PX", 768)
 MODEL_MAX_OBLIQUES = env_int("MODEL_MAX_OBLIQUES", 2)
-MODEL_MAX_STREET_VIEWS = env_int("MODEL_MAX_STREET_VIEWS", 2)
+MODEL_MAX_STREET_VIEWS = env_int("MODEL_MAX_STREET_VIEWS", 3)
 # Lite NAIP screen uses a smaller image than Flash confirm.
 SCREEN_IMAGE_MAX_PX = env_int("SCREEN_IMAGE_MAX_PX", 768)
 
@@ -73,7 +73,7 @@ def is_street_level_label(label: Any) -> bool:
 def supplemental_can_confirm() -> bool:
     """SUPPLEMENTAL_CAN_CONFIRM=1: a boxed street-level photo may stand in for a
     Nearmap oblique in the cell gates (dual-model agreement still required)."""
-    return env_flag("SUPPLEMENTAL_CAN_CONFIRM", False)
+    return env_flag("SUPPLEMENTAL_CAN_CONFIRM", True)
 
 
 def _street_views_only(views: list) -> list:

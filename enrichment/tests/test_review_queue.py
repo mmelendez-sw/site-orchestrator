@@ -15,6 +15,7 @@ class ReviewQueueTests(unittest.TestCase):
                          "possible stealth host")
         self.assertEqual(review_reason({"bucket": "potential_rooftop", "holdout_reason": "consistency_disagree"}),
                          "single-model confirm, second pass disagreed")
+        self.assertIn("no building", review_reason({"bucket": "other_or_else", "footprint_status": "no_building"}))
         self.assertEqual(review_reason({"bucket": "potential_update", "dual_model_resolution": "claude_veto",
                                         "gemini_cell_confidence": "0.99"}), "")
 

@@ -56,7 +56,7 @@ def crop_enabled() -> bool:
 
 
 def max_views() -> int:
-    return max(0, env_int("MAPILLARY_MAX_VIEWS", 2))
+    return max(0, env_int("MAPILLARY_MAX_VIEWS", 3))
 
 
 def search_cache_days() -> float:

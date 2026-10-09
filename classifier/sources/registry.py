@@ -46,7 +46,8 @@ def enabled_sources() -> list[str]:
     Unset / ``none`` -> []. Unknown names are ignored and sources missing
     credentials or config are dropped (each logged once per process).
     """
-    raw = env_str("SUPPLEMENTAL_IMAGERY")
+    # Mapillary is on by default (free; dropped when MAPILLARY_ACCESS_TOKEN is unset).
+    raw = env_str("SUPPLEMENTAL_IMAGERY", "mapillary")
     if not raw or raw.lower() in _DISABLED_VALUES:
         return []
     return _filter([part for part in raw.split(",")])

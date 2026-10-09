@@ -191,9 +191,30 @@ _UPSERT_SITE = _merge_sql(
 _INSERT_SITE = _insert_sql("dbo.EnrichmentSiteOutcome", SITE_COLUMNS)
 
 
+_ddl_done = False
+
+
 def ensure_tables(cursor) -> None:
+    """Run the DDL once per process, serialized across processes.
+
+    The DDL drops and recreates the KPI views; parallel lanes finishing
+    together raced each other (deadlock 1205, "already an object named
+    vEnrichmentKpisByState" 2714). An app lock held for the transaction makes
+    concurrent writers take turns.
+    """
+    global _ddl_done
+    if _ddl_done:
+        return
+    cursor.execute(
+        "EXEC sp_getapplock @Resource = 'enrichment_metrics_ddl', @LockMode = 'Exclusive', "
+        "@LockOwner = 'Transaction', @LockTimeout = 120000"
+    )
     for stmt in ddl_statements():
         cursor.execute(stmt)
+    _ddl_done = True
+
+
+_RETRYABLE_SQL = ("1205", "2714", "deadlock")
 
 
 def _salesforce_id(rec: dict[str, Any]) -> str:
@@ -227,22 +248,36 @@ def upsert_snapshot(cursor, snap: dict[str, Any]) -> int:
     return len(rows)
 
 
-def _with_connection(action: Callable[[Any], Any], *, ensure: bool = True):
+def _with_connection(action: Callable[[Any], Any], *, ensure: bool = True, attempts: int = 3):
+    """Run ``action`` in one transaction; retry deadlocks / DDL races."""
+    import time as _time
+
     from enrichment.mssql import connect_mssql
 
-    conn = connect_mssql()
-    try:
-        cursor = conn.cursor()
-        if ensure:
-            ensure_tables(cursor)
-        result = action(cursor)
-        conn.commit()
-        return result
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+    global _ddl_done
+    for attempt in range(1, attempts + 1):
+        conn = connect_mssql()
+        try:
+            cursor = conn.cursor()
+            if ensure:
+                ensure_tables(cursor)
+            result = action(cursor)
+            conn.commit()
+            return result
+        except Exception as exc:
+            try:
+                conn.rollback()
+            except Exception:  # noqa: BLE001
+                pass
+            if ensure:
+                _ddl_done = False  # rolled back with the transaction
+            if attempt >= attempts or not any(code in str(exc) for code in _RETRYABLE_SQL):
+                raise
+            logger.warning("metrics SQL %s; retry %s/%s", str(exc)[:80], attempt, attempts - 1)
+            _time.sleep(2.0 * attempt)
+        finally:
+            conn.close()
+    raise RuntimeError("unreachable")
 
 
 def write_snapshot(snap: dict[str, Any]) -> int:
