@@ -36,8 +36,9 @@ class LowCropYesTests(unittest.TestCase):
         self.assertEqual(res["asset_view"], "Nearmap oblique (East)")
 
     def test_confident_crop_yes_unchanged(self):
-        with patch.object(ac, "classify_site", return_value={"cell_equipment": True,
-                                                            "cell_equipment_confidence": 0.9}) as call:
+        with patch.object(ac, "classify_site", return_value={
+                "cell_equipment": True, "cell_equipment_confidence": 0.9, "cell_gear_kind": "sector_panel",
+                "cell_equipment_evidence": "Three sector panels on a pipe mast at the parapet."}) as call:
             res, _model, agree = ac.confirm_rooftop_cell_with_claude(
                 self._res(), {"claude": object()}, [("crop", _img())], already_escalated=False,
                 allow_soft_keep=False, used_crop=True, allow_gemini_solo=False,
@@ -45,6 +46,35 @@ class LowCropYesTests(unittest.TestCase):
         self.assertTrue(agree)
         self.assertEqual(res["dual_model_resolution"], "agree_crop")
         self.assertEqual(call.call_count, 1)
+
+
+class StrictCropTests(unittest.TestCase):
+    def test_hedged_or_unnamed_crop_yes_is_not_a_write(self):
+        for reply in ({"cell_equipment": True, "cell_equipment_confidence": 0.9, "cell_gear_kind": "sector_panel",
+                       "cell_equipment_evidence": "equipment that appears consistent with sector panels"},
+                      {"cell_equipment": True, "cell_equipment_confidence": 0.9, "cell_gear_kind": "unclear",
+                       "cell_equipment_evidence": "rooftop equipment"},
+                      {"cell_equipment": True, "cell_equipment_confidence": 0.78, "cell_gear_kind": "rru",
+                       "cell_equipment_evidence": "RRUs beside panels"}):
+            self.assertFalse(ac._strict_rooftop_crop_yes(reply), reply)
+        self.assertTrue(ac._strict_rooftop_crop_yes(
+            {"cell_equipment": True, "cell_equipment_confidence": 0.85, "cell_gear_kind": "microwave",
+             "cell_equipment_evidence": "A round microwave dish on a steel frame."}))
+
+    def test_hedged_crop_yes_without_localize_holds_out(self):
+        import os
+        os.environ["ROOFTOP_CROP_STRICT"] = "1"
+        self.addCleanup(os.environ.pop, "ROOFTOP_CROP_STRICT", None)
+        replies = [{"cell_equipment": True, "cell_equipment_confidence": 0.9, "cell_gear_kind": "sector_panel",
+                    "cell_equipment_evidence": "what appears to be panel antennas"},
+                   {"cell_equipment": None, "cell_equipment_confidence": 0.4}]
+        res = LowCropYesTests()._res()
+        with patch.object(ac, "classify_site", side_effect=lambda *a, **k: dict(replies.pop(0))):
+            out, _m, agree = ac.confirm_rooftop_cell_with_claude(
+                res, {"claude": object()}, [("crop", _img())], already_escalated=False, allow_soft_keep=False,
+                used_crop=True, allow_gemini_solo=False, all_views=[("Nearmap oblique (North)", _img())])
+        self.assertFalse(agree)
+        self.assertIsNot(out["cell_equipment"], True)
 
 
 class DisputedLabelTests(unittest.TestCase):

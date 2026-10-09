@@ -97,7 +97,9 @@ class _ClaudeMessages:
                      "site_evidence": "roof with antennas", "cell_equipment": True,
                      "cell_equipment_confidence": 0.9,
                      "cell_equipment_evidence": "sector panels visible in the crop",
-                     "cell_gear_kind": "sector_panel"}
+                     "cell_gear_kind": "sector_panel",
+                     # Rooftops are confirmed by Claude's own localize box (IoU vs Gemini).
+                     "asset_box_2d": [425, 435, 525, 545], "asset_view": "Nearmap oblique (North)"}
 
         class Resp:
             content = [Block()]
@@ -235,7 +237,7 @@ class OfflineEndToEndTests(unittest.TestCase):
         self.assertEqual(tower["nearmap_tier"], "full")
         self.assertEqual(tower["dual_model_resolution"], "gemini_strong_solo")
         self.assertEqual(tower["sf_update_status"], "updated")
-        # Rooftop: Nearmap obliques + Claude crop agree → Rooftop write.
+        # Rooftop: Nearmap obliques + a confident, named, unhedged Claude crop yes.
         self.assertEqual(roof["bucket"], "potential_update", roof["holdout_reason"])
         self.assertEqual(roof["update_site_type"], "Rooftop")
         self.assertEqual(roof["dual_model_resolution"], "agree_crop")

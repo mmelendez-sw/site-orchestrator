@@ -7,6 +7,7 @@ Salesforce), then reports every site whose decision would change.
 
   python scripts/replay_decisions.py 2026-09
   python scripts/replay_decisions.py 2026-09-17_130656_sf_enrichment --show 50
+  python scripts/replay_decisions.py 2026-10-08_194832_g1ov_L4_C4_connectx_audit --env SUPPLEMENTAL_CAN_CONFIRM=1
 
 Exit code 1 when any decision changed, so it can gate a local pre-merge check.
 """
@@ -15,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 import sys
 from collections import Counter
 from pathlib import Path
@@ -41,7 +43,13 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("specs", nargs="+", help="run folder names or YYYY-MM[-DD] prefixes")
     parser.add_argument("--show", type=int, default=20, help="changed rows to print")
+    parser.add_argument("--env", action="append", default=[], metavar="KEY=VALUE",
+                        help="gate flags the run used (e.g. SUPPLEMENTAL_CAN_CONFIRM=1); "
+                             "without them a street-photo confirm replays as a holdout")
     args = parser.parse_args()
+    for pair in args.env:
+        key, _sep, value = pair.partition("=")
+        os.environ[key.strip()] = value.strip()
 
     run_dirs: list[Path] = []
     for spec in args.specs:

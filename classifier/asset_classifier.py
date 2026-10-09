@@ -568,6 +568,31 @@ def enforce_rooftop_cell_requires_box(res: dict, views: list | None = None) -> d
     return res
 
 
+ROOFTOP_CROP_STRICT_CONF = env_float("ROOFTOP_CROP_STRICT_CONF", 0.80)
+_CROP_HEDGE_CUES = (
+    "appear", "consistent with", "resembl", "suggest", "could be", "looks like",
+    "what looks", "possibly", "possible", "likely", "may be", "might be", "seems",
+)
+
+
+def _strict_rooftop_crop_yes(claude_res: dict) -> bool:
+    """A Claude crop 'yes' a rooftop write can rest on.
+
+    The 2026-10-08 spot check found agree_crop rooftops whose box sat on HVAC
+    wells, bulkheads and rooftop units, confirmed with "appears consistent
+    with sector panels". Require confidence >= ROOFTOP_CROP_STRICT_CONF, a
+    named gear kind, and evidence without hedging.
+    """
+    conf = normalize_confidence(claude_res.get("cell_equipment_confidence"))
+    if conf is None or conf < ROOFTOP_CROP_STRICT_CONF:
+        return False
+    kind = str(claude_res.get("cell_gear_kind") or "").strip().lower()
+    if kind in {"", "unclear", "none"}:
+        return False
+    text = str(claude_res.get("cell_equipment_evidence") or "").lower()
+    return not any(cue in text for cue in _CROP_HEDGE_CUES)
+
+
 def confirm_rooftop_cell_with_claude(
     res: dict,
     clients: dict,
@@ -868,12 +893,20 @@ def confirm_rooftop_cell_with_claude(
 
     # Claude says true.
     crop_conf = normalize_confidence(claude_res.get("cell_equipment_confidence"))
+    # ROOFTOP_CROP_STRICT=1 is an experiment, off by default: on 42 Salesforce-
+    # labelled agree_crop rooftops every answer (36 real, 6 no-site) used hedged
+    # wording, so the rule rejected real sites without separating the wrong ones.
+    crop_strict = (
+        not (used_crop and site == "rooftop")
+        or not _env_flag("ROOFTOP_CROP_STRICT", default="0")
+        or _strict_rooftop_crop_yes(claude_res)
+    )
     if (
         used_crop
         and site == "rooftop"
         and all_views
         and crop_conf is not None
-        and crop_conf < ROOFTOP_CELL_CONF_MIN
+        and (crop_conf < ROOFTOP_CELL_CONF_MIN or not crop_strict)
     ):
         # A hesitant crop yes (e.g. 0.7) would sit under the write bar for
         # good: let Claude search all views once and keep the stronger answer.
@@ -902,6 +935,14 @@ def confirm_rooftop_cell_with_claude(
             normalize_model_result(res)
             _step_done("dual-model cell", "low crop yes -> localize agree")
             return res, "claude", True
+    if not crop_strict:
+        # Hedged / unnamed / low-confidence crop yes and no clean localize: hold out.
+        weak = dict(claude_res)
+        weak["cell_equipment"] = None
+        weak["cell_equipment_evidence"] = (
+            f"{claude_res.get('cell_equipment_evidence') or ''} | crop yes too weak to write"
+        ).strip(" |")
+        return _apply_claude_veto(weak, reason="hedged crop yes")
     if used_crop:
         # Keep Gemini's box/coords; Claude only confirmed the crop contents.
         if claude_res.get("cell_equipment_confidence") is not None:
@@ -1239,6 +1280,12 @@ def build_cell_confirm_views(res: dict, views: list) -> tuple[list, bool]:
     # Street photos: Claude must find and box the gear itself (localize + IoU),
     # not vote on Gemini's crop, which accepts cornices and finials too easily.
     if is_street_level_label(res.get("asset_view")):
+        return views, False
+    # Rooftops keep the zoomed crop: at full-scene model size (~768 px) small
+    # dishes and panels vanish and Claude vetoes real sites (a full-scene-only
+    # re-check passed 4 of 203 confirmations). agree_crop was 86% precise on
+    # Salesforce-labelled rooftops. ROOFTOP_CROP_CONFIRM=0 forces localize.
+    if not _env_flag("ROOFTOP_CROP_CONFIRM", default="1"):
         return views, False
     valid = get_valid_asset_box(res)
     picked = pick_view_for_asset_box(res, views)
