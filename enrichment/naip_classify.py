@@ -903,6 +903,20 @@ def _classify_site_imagery(
         and not no_nearmap_coverage
         and ac.needs_pin_offset_scout(res)
     )
+    # Arenas and other large roofs: the pin chip can miss parapet gear.
+    # FORCE_ROOF_SCOUT=1 still buys the wide Vert scout and a re-center
+    # pack when that scout finds a host, even if the pin pack said "other"
+    # or locked an HVAC-only box.
+    force_roof_scout = (
+        env_flag("FORCE_ROOF_SCOUT")
+        and not presence_only
+        and not no_nearmap_coverage
+        and str(res.get("site_type") or "").strip().lower()
+        in {"rooftop", "tower", "other", "unclear"}
+    )
+    if force_roof_scout:
+        pin_offset_scout = True
+        nearmap_blocks_rescue = False
     naip_rescue = (
         not presence_only
         and not reuse_saved
@@ -948,7 +962,7 @@ def _classify_site_imagery(
     pin_pack = (nearmap_views, nearmap_date, nearmap_aoi_m, views, nearmap_tier)
     if (
         pin_offset_scout
-        and not skip_nearmap_fetch
+        and (not skip_nearmap_fetch or force_roof_scout)
         and ac.NEARMAP_API_KEY
         and not no_nearmap_coverage
     ):
@@ -1085,7 +1099,7 @@ def _classify_site_imagery(
 
     # Pin-offset rescue: if pin-centered Nearmap was weak/other but wide/zoom
     # found a positive, re-center Nearmap on the asset box and require confirmation.
-    pin_centered_weak = nearmap_settled_other or (
+    pin_centered_weak = nearmap_settled_other or force_roof_scout or (
         str(pre_scout_res.get("site_type") or "").lower() == "rooftop"
         and pre_scout_res.get("cell_equipment") is not True
         and not nearmap_blocks_rescue
@@ -1108,7 +1122,7 @@ def _classify_site_imagery(
     if (
         pin_centered_weak
         and scout_found_cell
-        and not skip_paid_imagery
+        and (not skip_paid_imagery or force_roof_scout)
         and ac.NEARMAP_API_KEY
     ):
         box = res.get("asset_box_2d")
