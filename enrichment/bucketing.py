@@ -20,7 +20,7 @@ from classifier.views import (
     is_street_level_label,
     parse_box_2d,
 )
-from envutil import env_flag, env_float
+from envutil import env_float
 from salesforce.site_type_mapping import (
     cell_equipment_confirmed,
     map_site_type_for_upload,
