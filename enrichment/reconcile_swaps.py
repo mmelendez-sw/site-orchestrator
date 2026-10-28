@@ -34,10 +34,11 @@ from __future__ import annotations
 import csv
 import os
 import sys
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any
 
 from dotenv import load_dotenv
 
@@ -46,13 +47,13 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from enrichment.coerce import lower_text  # noqa: E402
-from enrichment.reconcile_pull import PULL_LEDGER_CSV, read_pull_ledger  # noqa: E402
 from enrichment.connectx_audit import (  # noqa: E402
     VERDICT_CONFIRMED,
     VERDICT_NO_ASSET,
     iter_audit_rows,
     site_acq_owner_id,
 )
+from enrichment.reconcile_pull import PULL_LEDGER_CSV, read_pull_ledger  # noqa: E402
 
 POOL_OWNER_NAME = "Site Acquisition Team"
 REPLACEMENT_STAGE = "New/Unreviewed"
@@ -71,7 +72,6 @@ LEDGER_COLUMNS = (
     "status",
     "error",
 )
-PLAN_COLUMNS = LEDGER_COLUMNS
 
 
 @dataclass(frozen=True)

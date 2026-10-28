@@ -7,14 +7,12 @@ import math
 import os
 import struct
 import time
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any
 
 from enrichment.coerce import to_float as _to_float
-from enrichment.geo import haversine_meters
-from envutil import env_int
-
 from enrichment.constants import (
     BBOX_BUFFER_DEG,
     FCC_TABLE,
@@ -27,6 +25,8 @@ from enrichment.constants import (
     PROXIMITY_MAX_M,
     TOWERSOURCE_TABLE,
 )
+from enrichment.geo import haversine_meters
+from envutil import env_int
 
 logger = logging.getLogger(__name__)
 

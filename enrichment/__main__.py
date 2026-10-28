@@ -107,24 +107,6 @@ def limit_source(
 LIMIT_SOURCE = limit_source(dotenv_values(ROOT / ".env"))
 load_dotenv(ROOT / ".env")
 
-from enrichment.pipeline import apply_paused_run, default_run_dir, run_enrichment  # noqa: E402
-from enrichment.outputs import (  # noqa: E402
-    holdout_ids_from_run_specs,
-    site_ids_from_run_specs,
-)
-from enrichment.naip_classify import resolve_reuse_chips_dirs  # noqa: E402
-from enrichment.sf_ops import (  # noqa: E402
-    parse_carrier_like,
-    parse_metro_classification,
-    parse_owners,
-    parse_site_type,
-)
-from enrichment.constants import (  # noqa: E402
-    CONFIRM_ROOFTOP_STAGE_FILTER,
-    CONNECTX_AUDIT_STAGE_FILTER,
-    DB_ONLY_STAGE_FILTER,
-    DEFAULT_STAGE_FILTER,
-)
 from enrichment.connectx_audit import (  # noqa: E402
     AUDIT_DRY_RUN_SUFFIX,
     AUDIT_RUN_SUFFIX,
@@ -132,12 +114,28 @@ from enrichment.connectx_audit import (  # noqa: E402
     site_acq_owner_id,
     unqualify_owner_id,
 )
-from paths import ensure_data_layout, runs_dir  # noqa: E402
-from salesforce.sf_client import SalesforceClient  # noqa: E402
-
-
+from enrichment.constants import (  # noqa: E402
+    CONFIRM_ROOFTOP_STAGE_FILTER,
+    CONNECTX_AUDIT_STAGE_FILTER,
+    DB_ONLY_STAGE_FILTER,
+    DEFAULT_STAGE_FILTER,
+)
+from enrichment.naip_classify import resolve_reuse_chips_dirs  # noqa: E402
+from enrichment.outputs import (  # noqa: E402
+    holdout_ids_from_run_specs,
+    site_ids_from_run_specs,
+)
+from enrichment.pipeline import apply_paused_run, default_run_dir, run_enrichment  # noqa: E402
+from enrichment.sf_ops import (  # noqa: E402
+    parse_carrier_like,
+    parse_metro_classification,
+    parse_owners,
+    parse_site_type,
+)
 from envutil import env_csv as _csv_env  # noqa: E402
 from envutil import env_flag  # noqa: E402
+from paths import ensure_data_layout, runs_dir  # noqa: E402
+from salesforce.sf_client import SalesforceClient  # noqa: E402
 
 _RETIRED_DELAYS = ("GEMINI_DELAY_S", "CLAUDE_DELAY_S")
 _SQL_SKIP_SPEC = "sql"

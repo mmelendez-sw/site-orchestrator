@@ -315,11 +315,11 @@ class _AuditClaude:
 
 class OfflineAuditRunTests(unittest.TestCase):
     def test_audit_confirms_unqualifies_and_leaves_inconclusive(self):
+        import enrichment.metrics as metrics_mod
         from classifier import llm
         from enrichment import naip_classify
         from enrichment.pipeline import run_enrichment
         from enrichment.tests import test_e2e_offline as e2e
-        import enrichment.metrics as metrics_mod
 
         sf = e2e._Client()
         gemini_log: list = []

@@ -22,7 +22,8 @@ LO (51 fields): 0 record_type, 1 unique_system_identifier, 2 uls_file_number,
 from __future__ import annotations
 
 import logging
-from typing import Any, Iterable, Iterator, Sequence
+from collections.abc import Iterable, Iterator, Sequence
+from typing import Any
 
 from enrichment.geo import haversine_meters
 from enrichment.signals import round_m, warn_once

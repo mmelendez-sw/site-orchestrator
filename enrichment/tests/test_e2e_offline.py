@@ -169,10 +169,10 @@ def _fake_nearmap(lat, lon, chip_m=100, views=None, **_kwargs):
 
 class OfflineEndToEndTests(unittest.TestCase):
     def test_tower_and_rooftop_sites_classify_bucket_and_apply(self):
+        import enrichment.metrics as metrics_mod
         from classifier import llm
         from enrichment import naip_classify
         from enrichment.pipeline import run_enrichment
-        import enrichment.metrics as metrics_mod
 
         gemini_log: list = []
         claude_log: list = []

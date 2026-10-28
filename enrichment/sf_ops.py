@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Iterable, Sequence
-
-from salesforce.field_map import OBJECT_NAME
-from salesforce.sf_client import SalesforceClient
+from collections.abc import Iterable, Sequence
+from typing import Any
 
 from enrichment.coerce import is_missing, to_bool, to_float
 from enrichment.constants import (
@@ -15,6 +13,8 @@ from enrichment.constants import (
     EXCLUDED_STAGE_FILTER,
     SF_QUERY_FIELDS,
 )
+from salesforce.field_map import OBJECT_NAME
+from salesforce.sf_client import SalesforceClient
 
 logger = logging.getLogger(__name__)
 

@@ -21,9 +21,10 @@ import argparse
 import csv
 import sys
 from collections import Counter
+from collections.abc import Iterable, Sequence
 from datetime import date
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:

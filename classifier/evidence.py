@@ -10,7 +10,8 @@ first-pass gate, so it extends the shared base rather than redefining it.
 
 from __future__ import annotations
 
-from typing import Any, Iterable
+from collections.abc import Iterable
+from typing import Any
 
 CELL_EVIDENCE_KEYS: tuple[str, ...] = ("cell_equipment_evidence", "site_evidence")
 

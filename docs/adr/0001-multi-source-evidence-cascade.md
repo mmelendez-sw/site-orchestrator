@@ -1,6 +1,7 @@
 # ADR 0001: Multi-source evidence cascade for rooftop verification (ICEMAN)
 
-- **Status:** Proposed. Implemented behind flags on `dev-multi-source-imagery`; nothing is enabled by default.
+- **Status:** Accepted. Since commit 5d6a201 the footprint pin check, saved/cached Nearmap reuse, Mapillary (may confirm), ULS + OpenCelliD signals and the consistency re-check are on by default.
+- **Update 2026-10-28:** the `state_ortho` source was removed (never enabled in a production run). Mapillary is the only supplemental imagery source; `state_ortho` and `STATE_ORTHO_SOURCES` below are historical.
 - **Date:** 2026-10-07
 - **Owner:** Matt Melendez
 - **Scope:** `python -m enrichment` (including `CONNECTX_AUDIT`), `classifier/`, operator tooling.

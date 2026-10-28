@@ -27,8 +27,9 @@ import logging
 import math
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from envutil import env_csv, env_flag, env_float
 
@@ -57,12 +58,6 @@ _SOURCE_ALIASES = {
     "ocid": SOURCE_OPENCELLID,
     "osm": SOURCE_OSM,
     "osm_antenna": SOURCE_OSM,
-}
-
-SOURCE_KEYS: dict[str, tuple[str, ...]] = {
-    SOURCE_ULS: ("uls_nearest_m", "uls_count", "uls_call_signs"),
-    SOURCE_OPENCELLID: ("opencellid_nearest_m", "opencellid_count"),
-    SOURCE_OSM: ("osm_antenna_count",),
 }
 
 STRENGTH_STRONG = "strong"

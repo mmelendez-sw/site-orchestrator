@@ -3,11 +3,9 @@
 NAIP (60 cm) is too coarse to see rooftop antennas and Nearmap is paid. These
 cheaper sources add extra labelled views:
 
-* ``state_ortho`` - state/county orthoimagery services (15-30 cm), config
-  file at ``STATE_ORTHO_SOURCES``.
 * ``mapillary`` - street-level photos (``MAPILLARY_ACCESS_TOKEN``).
 
-Enable with ``SUPPLEMENTAL_IMAGERY=state_ortho,mapillary`` (order = priority)
+Enable with ``SUPPLEMENTAL_IMAGERY=mapillary`` (comma list, order = priority)
 and call ``fetch_supplemental_views`` inside ``source_meter()`` per site.
 """
 

@@ -52,12 +52,12 @@ from classifier.prompts import (
     SCAN_PROMPT,
     SCAN_SCHEMA,
     SITE_TYPE_VALUES,
+    STREET_BOX_NOTE,
     TOWER_ONLY_CLASSIFICATION_PROMPT,
     TOWER_ONLY_SCAN_PROMPT,
     TOWER_ONLY_SITE_TYPE_VALUES,
     TOWER_ONLY_ZOOM_CLASSIFICATION_PROMPT,
     ZOOM_CLASSIFICATION_PROMPT,
-    STREET_BOX_NOTE,
     cell_confirm_prompt,
     classify_schema,
 )
@@ -76,8 +76,8 @@ from classifier.views import (
     get_valid_asset_box,
     has_street_asset_box,
     is_street_level_label,
-    pad_street_asset_box,
     naip_view_label,
+    pad_street_asset_box,
     pick_view_for_asset_box,
     supplemental_can_confirm,
     trim_views_for_model,
@@ -1673,29 +1673,6 @@ def rooftop_requires_nearmap_tiers(res: dict) -> bool:
     still need paid imagery for facade confirmation.
     """
     return _is_rooftop(res)
-
-
-def tower_cell_requires_nearmap_obliques(
-    res: dict, *, db_backed: bool = False
-) -> bool:
-    """Whether a tower+cell call must continue to Nearmap obliques.
-
-    Imagery-only (no FCC/TowerSource) always continues: pin-centered Vert
-    often frames a neighbor rooftop or a different pole than the SF pin.
-
-    DB-hit Gemini towers that already decided cell at medium+ site conf
-    may stop on NAIP. Rooftops are handled separately by
-    rooftop_requires_nearmap_tiers.
-    """
-    if str(res.get("site_type") or "").strip().lower() != "tower":
-        return False
-    if res.get("cell_equipment") is not True:
-        return False
-    if db_backed and db_backed_naip_tower_skip_nearmap_reason(
-        res, db_backed=True
-    ):
-        return False
-    return True
 
 
 def naip_age_blocks_early_stop(

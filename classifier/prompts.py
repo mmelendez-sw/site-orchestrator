@@ -22,7 +22,6 @@ CELL_GEAR_KIND_VALUES: tuple[str, ...] = (
     "none",
     "unclear",
 )
-TOWER_SUBTYPE_SCHEMA_VALUES = list(TOWER_SUBTYPE_VALUES)
 
 # --------------------------------- schemas ----------------------------------
 
@@ -109,8 +108,6 @@ def scan_schema(*, gemini: bool) -> dict[str, Any]:
     }
 
 
-RESPONSE_SCHEMA = classify_schema(gemini=False)
-GEMINI_RESPONSE_SCHEMA = classify_schema(gemini=True)
 SCAN_SCHEMA = scan_schema(gemini=False)
 GEMINI_SCAN_SCHEMA = scan_schema(gemini=True)
 

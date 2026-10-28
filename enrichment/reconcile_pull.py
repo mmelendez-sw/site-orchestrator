@@ -21,10 +21,11 @@ import collections
 import csv
 import os
 import sys
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any
 
 from dotenv import load_dotenv
 

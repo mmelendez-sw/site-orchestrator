@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import csv
 import re
+from collections.abc import Iterable, Sequence
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any
 
 _RUN_DATE_PREFIX = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 

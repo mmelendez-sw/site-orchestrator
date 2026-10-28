@@ -1,4 +1,4 @@
-"""Supplemental (street-level / state ortho) labels never pass as Nearmap evidence."""
+"""Supplemental street-level labels never pass as Nearmap evidence."""
 
 from __future__ import annotations
 
@@ -10,7 +10,6 @@ from PIL import Image
 
 from classifier.views import (
     is_oblique_label,
-    is_state_ortho_label,
     is_street_level_label,
     is_top_down_label,
     trim_views_for_model,
@@ -24,7 +23,6 @@ from enrichment.bucketing import (
 )
 
 STREET = "Street-level photo (Mapillary 2024-05, 38 m south of site, facing north)"
-ORTHO = "State orthoimagery top-down (NY 2024, ~15 cm)"
 
 
 def _img():
@@ -37,12 +35,6 @@ class LabelTests(unittest.TestCase):
         self.assertFalse(is_oblique_label(STREET))
         self.assertFalse(is_top_down_label(STREET))
 
-    def test_state_ortho_is_top_down_but_not_nearmap(self):
-        self.assertTrue(is_state_ortho_label(ORTHO))
-        self.assertTrue(is_top_down_label(ORTHO))
-        self.assertFalse(is_oblique_label(ORTHO))
-        self.assertFalse(_asset_view_is_nearmap_vert({"asset_view": ORTHO}))
-
     def test_nearmap_labels_unchanged(self):
         self.assertTrue(is_oblique_label("Nearmap oblique (North)"))
         self.assertTrue(_asset_view_is_nearmap_vert({"asset_view": "Nearmap top-down"}))
@@ -52,12 +44,11 @@ class TrimTests(unittest.TestCase):
     def _labels(self, views):
         return [label for label, _img in trim_views_for_model(views)]
 
-    def test_top_down_preference_nearmap_then_ortho_then_naip(self):
+    def test_top_down_preference_nearmap_then_naip(self):
         self.assertEqual(
-            self._labels([("NAIP top-down", _img()), (ORTHO, _img()), ("Nearmap top-down", _img())]),
+            self._labels([("NAIP top-down", _img()), ("Nearmap top-down", _img())]),
             ["Nearmap top-down"],
         )
-        self.assertEqual(self._labels([("NAIP top-down", _img()), (ORTHO, _img())]), [ORTHO])
         self.assertEqual(self._labels([("NAIP top-down", _img())]), ["NAIP top-down"])
 
     def test_street_views_kept_and_capped(self):

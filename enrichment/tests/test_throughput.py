@@ -11,6 +11,7 @@ import tempfile
 import threading
 import time
 import unittest
+from datetime import UTC
 from pathlib import Path
 from unittest.mock import patch
 
@@ -322,8 +323,8 @@ def _rooftop_ok():
 
 class _RunHarness(unittest.TestCase):
     def _run(self, sites, classify, *, workers, apply=True, env=None):
-        from enrichment.pipeline import run_enrichment
         import enrichment.metrics as metrics_mod
+        from enrichment.pipeline import run_enrichment
 
         client = _BatchClient()
         tmp = tempfile.TemporaryDirectory()
@@ -544,7 +545,7 @@ class NearmapBudgetPipelineTests(_RunHarness):
 
 class NearmapUsageLedgerTests(unittest.TestCase):
     def test_month_to_date_sums_only_this_month(self):
-        from datetime import datetime, timezone
+        from datetime import datetime
 
         from enrichment.metrics import (
             NEARMAP_USAGE_JSONL,
@@ -559,7 +560,7 @@ class NearmapUsageLedgerTests(unittest.TestCase):
                 {"at": "2026-09-01T00:01:00Z", "bytes": 7},
                 {"at": "2026-09-24T12:00:00Z", "bytes": 11},
             ])
-            now = datetime(2026, 9, 24, tzinfo=timezone.utc)
+            now = datetime(2026, 9, 24, tzinfo=UTC)
             self.assertEqual(month_to_date_nearmap_bytes(now=now, root=root), 18)
 
 

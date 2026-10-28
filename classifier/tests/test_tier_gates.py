@@ -3,18 +3,17 @@
 from __future__ import annotations
 
 import unittest
-
 from unittest.mock import patch
 
 from classifier.asset_classifier import (
-    _gemini_thinking_budget,
-    _gemini_thinking_level,
-    _gemini_generate_config,
-    confident_no_asset,
-    confirm_rooftop_cell_with_claude,
-    cheap_second_opinion_disagrees,
     CLAUDE_CROP_MODEL,
     CLAUDE_ESCALATION_MODEL,
+    _gemini_generate_config,
+    _gemini_thinking_budget,
+    _gemini_thinking_level,
+    cheap_second_opinion_disagrees,
+    confident_no_asset,
+    confirm_rooftop_cell_with_claude,
     db_backed_naip_tower_skip_nearmap_reason,
     escalation_reason,
     gate_weak_stealth_tower_claim,
@@ -24,14 +23,13 @@ from classifier.asset_classifier import (
     needs_flash_confirm,
     needs_naip_rescue,
     rooftop_naip_cell_skip_nearmap_reason,
-    scout_result_wins,
-    should_attempt_claude_escalation,
-    skip_nearmap_after_naip_reason,
     rooftop_requires_nearmap_tiers,
+    scout_result_wins,
     select_zoom_candidates,
+    should_attempt_claude_escalation,
     should_skip_claude_for_gemini_tower,
+    skip_nearmap_after_naip_reason,
     tier_confident_stop,
-    tower_cell_requires_nearmap_obliques,
 )
 from classifier.imagery import nearmap_point_coverage
 from classifier.views import trim_views_for_model
@@ -109,48 +107,6 @@ class TierConfidentStopTests(unittest.TestCase):
         self.assertFalse(
             rooftop_requires_nearmap_tiers(
                 {"site_type": "tower", "site_confidence": 0.9, "cell_equipment": True}
-            )
-        )
-
-
-class TowerObliqueFetchTests(unittest.TestCase):
-    _locked = {
-        "site_type": "tower",
-        "site_confidence": 0.9,
-        "cell_equipment": True,
-    }
-
-    def test_imagery_only_tower_cell_requires_obliques(self):
-        self.assertTrue(
-            tower_cell_requires_nearmap_obliques(self._locked, db_backed=False)
-        )
-
-    def test_db_hit_gemini_lock_skips_obliques(self):
-        self.assertFalse(
-            tower_cell_requires_nearmap_obliques(self._locked, db_backed=True)
-        )
-
-    def test_db_hit_medium_tower_skips_obliques(self):
-        self.assertFalse(
-            tower_cell_requires_nearmap_obliques(
-                {
-                    "site_type": "tower",
-                    "site_confidence": 0.85,
-                    "cell_equipment": True,
-                },
-                db_backed=True,
-            )
-        )
-
-    def test_tower_cell_false_does_not_require_obliques(self):
-        self.assertFalse(
-            tower_cell_requires_nearmap_obliques(
-                {
-                    "site_type": "tower",
-                    "site_confidence": 0.9,
-                    "cell_equipment": False,
-                },
-                db_backed=False,
             )
         )
 
@@ -1199,6 +1155,7 @@ class NearmapAlwaysTests(unittest.TestCase):
     def test_nearmap_always_disables_naip_skips(self):
         import os
         from unittest.mock import patch
+
         from classifier import asset_classifier as ac
 
         res = {"site_type": "other", "site_confidence": 0.95}
@@ -1213,6 +1170,7 @@ class NaipRooftopSkipTests(unittest.TestCase):
     def test_naip_rooftop_lock_no_longer_skips_nearmap_by_default(self):
         import os
         from unittest.mock import patch
+
         from classifier import asset_classifier as ac
 
         res = {"site_type": "rooftop", "site_confidence": 0.95, "cell_equipment": True,

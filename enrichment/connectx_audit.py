@@ -27,21 +27,20 @@ from __future__ import annotations
 import csv
 import json
 import os
+from collections.abc import Sequence
 from datetime import date
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
 from classifier.evidence import evidence_text, has_any, has_stealth_form
-from envutil import env_float
-
 from enrichment.bucketing import imagery_bucket
 from enrichment.coerce import lower_text, to_bool, to_float
 from enrichment.constants import (
     AUDIT_UNQUALIFIED_REASON,
     AUDIT_UNQUALIFIED_STAGE,
     BUCKET_AUDIT_HOLDOUT,
-    BUCKET_OTHER,
     BUCKET_AUDIT_UNQUALIFY,
+    BUCKET_OTHER,
     BUCKET_POTENTIAL_UPDATE,
     CONNECTX_AUDIT_STAGE_FILTER,
     DETAIL_CSV,
@@ -50,6 +49,7 @@ from enrichment.constants import (
     SF_QUERY_FIELDS,
     SITE_ACQ_TEAM_OWNER_ID,
 )
+from envutil import env_float
 
 VERDICT_CONFIRMED = "confirmed"
 VERDICT_NO_ASSET = "no_asset"

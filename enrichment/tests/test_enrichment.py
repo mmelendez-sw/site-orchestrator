@@ -9,10 +9,6 @@ import unittest
 from pathlib import Path
 
 from enrichment.bucketing import bucket_classification, naip_rooftop_confirm_decision
-from enrichment.naip_classify import (
-    ROOFTOP_PRESENCE_PROMPT,
-    classification_prompt_for_run,
-)
 from enrichment.constants import (
     BUCKET_OTHER,
     BUCKET_POTENTIAL_UPDATE,
@@ -24,6 +20,10 @@ from enrichment.constants import (
 from enrichment.mssql import (
     fcc_coordinates,
     find_proximity_hit,
+)
+from enrichment.naip_classify import (
+    ROOFTOP_PRESENCE_PROMPT,
+    classification_prompt_for_run,
 )
 from enrichment.sf_ops import (
     build_blank_site_type_query,
@@ -1464,7 +1464,7 @@ class GoldenRegressionTests(unittest.TestCase):
 
 class CostPolicyTests(unittest.TestCase):
     def test_auto_skip_unique_close_hit(self):
-        from enrichment.cost_policy import should_auto_skip_classify
+        from enrichment.cost_policy import auto_skip_classify_reason
         from enrichment.mssql import ProximityHit
 
         hit = ProximityHit(
@@ -1475,10 +1475,10 @@ class CostPolicyTests(unittest.TestCase):
             candidate_count=1,
             runner_up_gap_m=None,
         )
-        self.assertTrue(should_auto_skip_classify(hit))
+        self.assertTrue(auto_skip_classify_reason(hit) is not None)
 
     def test_auto_skip_rejects_ambiguous_cluster(self):
-        from enrichment.cost_policy import should_auto_skip_classify
+        from enrichment.cost_policy import auto_skip_classify_reason
         from enrichment.mssql import ProximityHit
 
         hit = ProximityHit(
@@ -1489,10 +1489,10 @@ class CostPolicyTests(unittest.TestCase):
             candidate_count=3,
             runner_up_gap_m=8.0,
         )
-        self.assertFalse(should_auto_skip_classify(hit))
+        self.assertFalse(auto_skip_classify_reason(hit) is not None)
 
     def test_auto_skip_rejects_far_unique_hit(self):
-        from enrichment.cost_policy import should_auto_skip_classify
+        from enrichment.cost_policy import auto_skip_classify_reason
         from enrichment.mssql import ProximityHit
 
         hit = ProximityHit(
@@ -1502,13 +1502,10 @@ class CostPolicyTests(unittest.TestCase):
             longitude=-89.0,
             candidate_count=1,
         )
-        self.assertFalse(should_auto_skip_classify(hit))
+        self.assertFalse(auto_skip_classify_reason(hit) is not None)
 
     def test_auto_skip_on_structure_collocation(self):
-        from enrichment.cost_policy import (
-            auto_skip_classify_reason,
-            should_auto_skip_classify,
-        )
+        from enrichment.cost_policy import auto_skip_classify_reason
         from enrichment.mssql import ProximityHit
 
         hit = ProximityHit(
@@ -1520,11 +1517,11 @@ class CostPolicyTests(unittest.TestCase):
             candidate_count=3,
             runner_up_gap_m=0.0,
         )
-        self.assertTrue(should_auto_skip_classify(hit))
+        self.assertTrue(auto_skip_classify_reason(hit) is not None)
         self.assertIn("on-structure", auto_skip_classify_reason(hit) or "")
 
     def test_auto_skip_on_structure_ignores_nearby_other_tower(self):
-        from enrichment.cost_policy import should_auto_skip_classify
+        from enrichment.cost_policy import auto_skip_classify_reason
         from enrichment.mssql import ProximityHit
 
         hit = ProximityHit(
@@ -1536,7 +1533,7 @@ class CostPolicyTests(unittest.TestCase):
             candidate_count=2,
             runner_up_gap_m=8.0,
         )
-        self.assertTrue(should_auto_skip_classify(hit))
+        self.assertTrue(auto_skip_classify_reason(hit) is not None)
 
     def test_cluster_match_within_50m(self):
         from enrichment.cost_policy import find_cluster_match
@@ -1903,7 +1900,7 @@ class CostPolicyTests(unittest.TestCase):
         self.assertEqual(kpis["tower_sf_writes"], 1)
 
     def test_record_run_apply_zero_skips_unique_sites(self):
-        from enrichment.metrics import KPIS_JSON, SITES_JSONL, record_run, _rewrite_jsonl
+        from enrichment.metrics import KPIS_JSON, SITES_JSONL, _rewrite_jsonl, record_run
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1957,8 +1954,8 @@ class CostPolicyTests(unittest.TestCase):
             KPIS_JSON,
             RUNS_JSONL,
             SITES_JSONL,
-            drop_runs_from_ledger,
             _rewrite_jsonl,
+            drop_runs_from_ledger,
         )
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -2009,21 +2006,6 @@ class CostPolicyTests(unittest.TestCase):
 
 
 class SimpleClassifyStampTests(unittest.TestCase):
-    def test_stamp_gemini_tower_solo_at_high_conf(self):
-        from enrichment.classify_simple import stamp_gemini_tower_solo
-
-        stamped = stamp_gemini_tower_solo(
-            {
-                "site_type": "tower",
-                "tower_subtype": "monopole",
-                "site_confidence": 0.92,
-                "cell_equipment": True,
-                "cell_equipment_confidence": 0.9,
-            }
-        )
-        self.assertEqual(stamped["dual_model_resolution"], "gemini_strong_solo")
-        self.assertTrue(stamped["cell_models_agree"])
-
     def test_rooftop_cell_certain_helper(self):
         from enrichment.bucketing import _rooftop_cell_certain
 
@@ -2039,25 +2021,6 @@ class SimpleClassifyStampTests(unittest.TestCase):
         self.assertFalse(
             _rooftop_cell_certain(_rooftop_ok(site_confidence=0.9))
         )
-        from enrichment.classify_simple import stamp_gemini_tower_solo
-
-        roof = stamp_gemini_tower_solo(
-            {
-                "site_type": "rooftop",
-                "site_confidence": 0.95,
-                "cell_equipment": True,
-            }
-        )
-        self.assertNotEqual(roof.get("dual_model_resolution"), "gemini_strong_solo")
-
-        weak = stamp_gemini_tower_solo(
-            {
-                "site_type": "tower",
-                "site_confidence": 0.7,
-                "cell_equipment": True,
-            }
-        )
-        self.assertNotEqual(weak.get("dual_model_resolution"), "gemini_strong_solo")
 
     def test_unstamped_naip_db_tower_at_high_conf_is_ready(self):
         """Barebones Gemini path may omit dual_model_resolution; solo bar still writes."""
@@ -2345,8 +2308,8 @@ class SqlReconnectTests(unittest.TestCase):
 
 class HoldoutRerunTests(unittest.TestCase):
     def test_holdout_ids_from_run_folder(self):
-        from enrichment.outputs import holdout_ids_from_run_specs, write_csv
         from enrichment.constants import HOLDOUT_CSV
+        from enrichment.outputs import holdout_ids_from_run_specs, write_csv
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2366,8 +2329,8 @@ class HoldoutRerunTests(unittest.TestCase):
 
     def test_site_ids_from_run_date_prefix(self):
         from enrichment.constants import DETAIL_CSV
-        from enrichment.outputs import site_ids_from_run_specs, write_csv
         from enrichment.naip_classify import resolve_reuse_chips_dirs
+        from enrichment.outputs import site_ids_from_run_specs, write_csv
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2772,10 +2735,10 @@ class ConfirmRooftopTests(unittest.TestCase):
         self.assertNotIn("Site_Latitude__c", payload)
 
     def test_apply_paused_run_pushes_pending_confirms_only(self):
+        import enrichment.metrics as metrics_mod
         from enrichment.constants import DETAIL_CSV
         from enrichment.outputs import DETAIL_COLUMNS, write_csv
         from enrichment.pipeline import apply_paused_run
-        import enrichment.metrics as metrics_mod
 
         site = _FakeSiteSObject()
         with tempfile.TemporaryDirectory() as tmp:
@@ -2831,8 +2794,8 @@ class ConfirmRooftopTests(unittest.TestCase):
         self.assertEqual(summary["apply"]["failed"], 0)
 
     def test_run_enrichment_applies_salesforce_after_each_site(self):
-        from enrichment.pipeline import run_enrichment
         import enrichment.metrics as metrics_mod
+        from enrichment.pipeline import run_enrichment
 
         site = _FakeSiteSObject()
         applied_before_second: list[int] = []

@@ -26,12 +26,13 @@ import os
 import queue
 import threading
 import time
+from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any
 
 from enrichment import progress
 from enrichment.bucketing import (
@@ -42,6 +43,11 @@ from enrichment.bucketing import (
     verified_source_for_match,
 )
 from enrichment.coerce import to_float
+from enrichment.connectx_audit import (
+    query_connectx_audit_sites,
+    site_acq_owner_id,
+    stamp_audit_verdict,
+)
 from enrichment.constants import (
     APPLY_LOG_CSV,
     BUCKET_AUDIT_HOLDOUT,
@@ -56,11 +62,6 @@ from enrichment.constants import (
     HOLDOUT_CSV,
     MATCH_SOURCE_NONE,
     PROXIMITY_MAX_M,
-)
-from enrichment.connectx_audit import (
-    query_connectx_audit_sites,
-    site_acq_owner_id,
-    stamp_audit_verdict,
 )
 from enrichment.cost_policy import (
     auto_skip_classify_reason,
@@ -79,8 +80,8 @@ from enrichment.geo import (
 from enrichment.metrics import (
     RUN_METRIC_KEYS,
     month_to_date_nearmap_bytes,
-    record_nearmap_usage,
     outcome_class,
+    record_nearmap_usage,
     record_run,
     site_record,
     stamp_statuses_from_apply_log,
@@ -108,8 +109,8 @@ from enrichment.sf_ops import (
     apply_updates_batch,
     parse_sf_lat_lng,
     query_blank_site_type_sites,
-    status_from_entry,
     query_sites_by_ids,
+    status_from_entry,
 )
 from envutil import env_flag, env_float, env_int
 from paths import runs_dir
@@ -1713,9 +1714,8 @@ def run_enrichment(
     workers = classify_workers() if workers is None else max(1, int(workers))
     from classifier import imagery
 
-    # Ledger bytes this month, plus any use it cannot see (spend before
-    # metering shipped); ICEMAN is not metered, so size the budget to this
-    # pipeline's share.
+    # Ledger bytes this month, plus Nearmap use the ledger cannot see
+    # (NEARMAP_PRIOR_USE_MB: spend before metering shipped or outside ICEMAN).
     imagery.BUDGET.seed(
         month_to_date_nearmap_bytes() + int(env_float("NEARMAP_PRIOR_USE_MB", 0) * 1024 * 1024)
     )

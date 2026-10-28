@@ -18,7 +18,7 @@ import argparse
 import json
 import sys
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -51,7 +51,7 @@ def budget_report(*, month: str | None = None, root: Path | None = None) -> dict
     NEARMAP_PRIOR_USE_MB, which the pipeline adds for the current month.
     """
     root = root or metrics.metrics_dir()
-    month = month or datetime.now(timezone.utc).strftime("%Y-%m")
+    month = month or datetime.now(UTC).strftime("%Y-%m")
     purchases = [
         rec for rec in metrics.read_nearmap_purchases(root=root)
         if str(rec.get("at") or "")[:7] == month

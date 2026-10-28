@@ -4,16 +4,17 @@ from __future__ import annotations
 
 import math
 import threading
-from typing import Any, Sequence
+from collections.abc import Sequence
+from typing import Any
 
 from enrichment.coerce import to_float
-from enrichment.geo import haversine_meters
 from enrichment.constants import (
     AUTO_SKIP_ON_STRUCTURE_M,
     NEARMAP_EMPTY_LOCK_CONF,
     PROXIMITY_AMBIGUITY_GAP_M,
     PROXIMITY_CONFIDENT_M,
 )
+from enrichment.geo import haversine_meters
 from enrichment.mssql import ProximityHit
 from envutil import env_flag, env_float
 
@@ -58,25 +59,6 @@ def auto_skip_classify_reason(
     if gap is not None and float(gap) >= float(ambiguity_gap_m):
         return f"unique DB hit ≤{float(confident_m):g} m"
     return None
-
-
-def should_auto_skip_classify(
-    hit: ProximityHit | None,
-    *,
-    confident_m: float = PROXIMITY_CONFIDENT_M,
-    on_structure_m: float = AUTO_SKIP_ON_STRUCTURE_M,
-    ambiguity_gap_m: float = PROXIMITY_AMBIGUITY_GAP_M,
-) -> bool:
-    """True when a unique or on-structure FCC/TowerSource hit can skip imagery."""
-    return (
-        auto_skip_classify_reason(
-            hit,
-            confident_m=confident_m,
-            on_structure_m=on_structure_m,
-            ambiguity_gap_m=ambiguity_gap_m,
-        )
-        is not None
-    )
 
 
 def find_cluster_match(

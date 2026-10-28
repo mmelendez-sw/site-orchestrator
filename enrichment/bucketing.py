@@ -14,18 +14,11 @@ from classifier.evidence import (
     has_any,
 )
 from classifier.views import (
-    supplemental_can_confirm,
     is_oblique_label,
-    is_state_ortho_label,
     is_street_level_label,
     parse_box_2d,
+    supplemental_can_confirm,
 )
-from envutil import env_float
-from salesforce.site_type_mapping import (
-    cell_equipment_confirmed,
-    map_site_type_for_upload,
-)
-
 from enrichment.constants import (
     ASSET_OFFSET_LEEWAY_M,
     BUCKET_OTHER,
@@ -33,21 +26,26 @@ from enrichment.constants import (
     BUCKET_ROOFTOP,
     BUCKET_SKIP,
     CELL_GEAR_KINDS,
+    DISCERNIBLE_CELL_GEAR_KINDS,
+    GEMINI_TOWER_SKIP_CLAUDE_CONF,
     MATCH_SOURCE_NONE,
     MATCH_SOURCE_TOWERSOURCE,
     MAX_ASSET_OFFSET_M,
-    GEMINI_TOWER_SKIP_CLAUDE_CONF,
     MIN_IMAGERY_ONLY_CELL_CONFIDENCE,
     MIN_IMAGERY_ONLY_SITE_CONFIDENCE,
     MIN_IMAGERY_ONLY_SITE_CONFIDENCE_AGREE,
     MIN_ROOFTOP_CELL_CONFIDENCE,
     MIN_UPDATE_CONFIDENCE,
+    ROOFTOP_CERTAIN_CONF,
     VERIFIED_SITE_SOURCE_FCC,
     VERIFIED_SITE_SOURCE_NAIP,
     VERIFIED_SITE_SOURCE_NEARMAP,
     VERIFIED_SITE_SOURCE_TOWERSOURCE,
-    ROOFTOP_CERTAIN_CONF,
-    DISCERNIBLE_CELL_GEAR_KINDS,
+)
+from envutil import env_float
+from salesforce.site_type_mapping import (
+    cell_equipment_confirmed,
+    map_site_type_for_upload,
 )
 
 
@@ -347,7 +345,7 @@ def _asset_view_is_nearmap_vert(classified: dict[str, Any]) -> bool:
     view = str(classified.get("asset_view") or "").strip().lower()
     if not view or "naip" in view:
         return False
-    if is_street_level_label(view) or is_state_ortho_label(view):
+    if is_street_level_label(view):
         return False
     if "oblique" in view:
         return False

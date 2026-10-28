@@ -33,7 +33,9 @@ jobs:
           sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends unixodbc
           pip install -r requirements-dev.txt
       - name: Lint
-        run: python -m pyflakes envutil.py paths.py classifier enrichment salesforce scripts
+        run: python -m ruff check .
+      - name: Configuration reference is current
+        run: python scripts/gen_config_reference.py --check
       - name: Unit tests (offline)
         env:
           # Keep imagery / geocode caches out of the checkout. The runner

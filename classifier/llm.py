@@ -192,10 +192,6 @@ class GeminiFallbackBreaker:
             self._probing.add(primary)
             return self.PROBE
 
-    def is_open(self, primary: str) -> bool:
-        with self._lock:
-            return primary in self._open_until
-
     def record_success(self, primary: str) -> None:
         with self._lock:
             was_open = primary in self._open_until

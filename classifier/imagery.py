@@ -25,11 +25,12 @@ import os
 import threading
 import time
 import uuid
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 import numpy as np
 import planetary_computer
@@ -582,7 +583,7 @@ class NearmapBudget:
         self.write_failures = 0
         self._root = Path(root) if root is not None else None
         self._clock = clock or time.monotonic
-        self._now = now or (lambda: datetime.now(timezone.utc))
+        self._now = now or (lambda: datetime.now(UTC))
         self._spent = 0
         self._lock = threading.Lock()
         # Shared-mode state (per "YYYY-MM").
@@ -596,7 +597,7 @@ class NearmapBudget:
         self._last_refresh: float | None = None
 
     @classmethod
-    def from_env(cls) -> "NearmapBudget":
+    def from_env(cls) -> NearmapBudget:
         return cls(
             env_float("NEARMAP_MONTHLY_BUDGET_MB", 1500),
             env_float("NEARMAP_BUDGET_SOFT_PCT", 90),

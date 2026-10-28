@@ -15,8 +15,9 @@ sites. ``record_run`` then reconciles the whole run at the end.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
-from typing import Any, Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
+from datetime import UTC, datetime
+from typing import Any
 
 from enrichment.coerce import is_true, text_or_none, to_float, to_int
 from enrichment.metrics_ddl import ddl_statements
@@ -33,7 +34,7 @@ def metrics_sql_enabled() -> bool:
 
 def _naive_utc(dt: datetime) -> datetime:
     if dt.tzinfo is not None:
-        return dt.astimezone(timezone.utc).replace(tzinfo=None)
+        return dt.astimezone(UTC).replace(tzinfo=None)
     return dt
 
 
@@ -46,7 +47,7 @@ def _dt(value: Any) -> datetime:
             return datetime.strptime(text.replace("Z", ""), "%Y-%m-%dT%H:%M:%S")
         except ValueError:
             pass
-    return _naive_utc(datetime.now(timezone.utc))
+    return _naive_utc(datetime.now(UTC))
 
 
 def _text(max_len: int) -> Converter:

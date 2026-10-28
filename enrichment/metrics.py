@@ -19,10 +19,11 @@ import os
 import threading
 import time
 from collections import Counter
+from collections.abc import Iterable
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 from enrichment.coerce import is_true, lower_text, text_or_none, to_float
 from enrichment.constants import (
@@ -291,7 +292,7 @@ def snapshot_run(
     apply = apply_summary or {}
     snap: dict[str, Any] = {
         "run_id": run_id,
-        "recorded_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "recorded_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "sites": len(sites),
     }
     snap.update({key: by_outcome.get(key, 0) for key in OUTCOMES if key != "error"})
@@ -381,12 +382,8 @@ def rollup_kpis(site_rows: list[dict[str, Any]]) -> dict[str, Any]:
     )
     kpis["errors"] = kpis.pop("error")
     kpis["outcomes"] = dict(by_outcome)
-    kpis["updated_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    kpis["updated_at"] = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     return kpis
-
-
-def rec_true(value: Any) -> bool:
-    return is_true(value)
 
 
 RUN_METRIC_KEYS: tuple[str, ...] = (
@@ -574,7 +571,7 @@ USAGE_IN_PURCHASES_KEY = "in_purchases_ledger"
 
 
 def _utc_stamp(now: datetime | None = None) -> str:
-    return (now or datetime.now(timezone.utc)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return (now or datetime.now(UTC)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _month_of(rec: dict[str, Any]) -> str:
@@ -610,7 +607,7 @@ def month_to_date_nearmap_bytes(*, now: datetime | None = None, root: Path | Non
     Per-site reporting figure (written when a site finishes). The budget uses
     ``shared_month_to_date_nearmap_bytes`` (per-purchase, all lanes).
     """
-    month = (now or datetime.now(timezone.utc)).strftime("%Y-%m")
+    month = (now or datetime.now(UTC)).strftime("%Y-%m")
     return sum(
         _int_or_zero(rec.get("bytes"))
         for rec in _read_jsonl((root or metrics_dir()) / NEARMAP_USAGE_JSONL)
@@ -780,7 +777,7 @@ def month_to_date_nearmap_purchase_bytes(
     *, now: datetime | None = None, root: Path | None = None
 ) -> int:
     """Billed Nearmap bytes this month (UTC) from the per-purchase ledger."""
-    month = (now or datetime.now(timezone.utc)).strftime("%Y-%m")
+    month = (now or datetime.now(UTC)).strftime("%Y-%m")
     return sum(
         _int_or_zero(rec.get("bytes"))
         for rec in read_nearmap_purchases(root=root)
@@ -792,7 +789,7 @@ def legacy_month_to_date_nearmap_bytes(
     *, now: datetime | None = None, root: Path | None = None
 ) -> int:
     """This month's usage-ledger bytes the purchases ledger does not cover."""
-    month = (now or datetime.now(timezone.utc)).strftime("%Y-%m")
+    month = (now or datetime.now(UTC)).strftime("%Y-%m")
     return sum(
         _int_or_zero(rec.get("bytes"))
         for rec in _read_jsonl((root or metrics_dir()) / NEARMAP_USAGE_JSONL)

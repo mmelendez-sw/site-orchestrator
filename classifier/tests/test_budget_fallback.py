@@ -9,7 +9,7 @@ import sys
 import tempfile
 import threading
 import unittest
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
 
@@ -38,7 +38,7 @@ def _budget(root, *, limit_mb=10, soft_pct=50, clock=None, now=None, refresh_s=5
 
     return imagery.NearmapBudget(
         limit_mb, soft_pct, shared=True, root=root, refresh_s=refresh_s,
-        clock=clock or _Clock(), now=now or _Now(datetime(2026, 10, 7, 12, tzinfo=timezone.utc)),
+        clock=clock or _Clock(), now=now or _Now(datetime(2026, 10, 7, 12, tzinfo=UTC)),
     )
 
 
@@ -94,7 +94,7 @@ class SharedBudgetTests(unittest.TestCase):
         metrics._append_jsonl(self.root / metrics.NEARMAP_USAGE_JSONL,
                               [{"at": "2026-10-07T11:00:00Z", "bytes": 4 * MB}])
         self.assertEqual(a.refresh(), 1 * MB + 2 * MB + 4 * MB)
-        now = datetime(2026, 10, 7, 12, tzinfo=timezone.utc)
+        now = datetime(2026, 10, 7, 12, tzinfo=UTC)
         self.assertEqual(metrics.shared_month_to_date_nearmap_bytes(now=now, root=self.root), 7 * MB)
         # Reporting figure keeps its meaning (all usage rows this month).
         self.assertEqual(metrics.month_to_date_nearmap_bytes(now=now, root=self.root), 7 * MB)
@@ -109,7 +109,7 @@ class SharedBudgetTests(unittest.TestCase):
         metrics._rewrite_jsonl(self.root / metrics.NEARMAP_PURCHASES_JSONL, [
             {"at": "2026-10-03T09:59:00Z", "proc": "other", "bytes": 2 * MB, "purpose": "pack"},
         ])
-        now = datetime(2026, 10, 7, 12, tzinfo=timezone.utc)
+        now = datetime(2026, 10, 7, 12, tzinfo=UTC)
         a = _budget(self.root)
         # pipeline.py: seed(month_to_date_nearmap_bytes() + NEARMAP_PRIOR_USE_MB)
         a.seed(metrics.month_to_date_nearmap_bytes(now=now, root=self.root) + 50 * MB)
@@ -118,13 +118,13 @@ class SharedBudgetTests(unittest.TestCase):
         self.assertEqual(a.spent, 3 * MB)
 
     def test_month_rollover(self):
-        now = _Now(datetime(2026, 10, 31, 23, 59, tzinfo=timezone.utc))
+        now = _Now(datetime(2026, 10, 31, 23, 59, tzinfo=UTC))
         clock = _Clock()
         a = _budget(self.root, now=now, clock=clock)
         a.seed(7 * MB)                      # prior use belongs to October only
         a.add(2 * MB)
         self.assertEqual(a.spent, 9 * MB)
-        now.when = datetime(2026, 11, 1, 0, 1, tzinfo=timezone.utc)
+        now.when = datetime(2026, 11, 1, 0, 1, tzinfo=UTC)
         self.assertEqual(a.spent, 0)
         a.add(1 * MB)
         clock.t += 10

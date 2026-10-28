@@ -1,0 +1,23 @@
+# Tool configuration only. ICEMAN is an application run from the repo root, not an
+# installable package: runtime pins are in requirements.txt, dev tools in
+# requirements-dev.txt, and the supported Python is 3.13 (CI).
+
+[tool.pytest.ini_options]
+testpaths = ["classifier", "enrichment", "salesforce", "scripts"]
+filterwarnings = [
+    # planetary_computer still uses a pydantic v1-style config class.
+    "ignore:Support for class-based `config` is deprecated:DeprecationWarning",
+]
+
+[tool.ruff]
+target-version = "py313"
+line-length = 120
+extend-exclude = [".cursor"]
+
+[tool.ruff.lint]
+# F: real errors (undefined names, unused imports). E9: syntax errors.
+# I: import order. UP: modern syntax for the target Python.
+select = ["F", "E9", "I", "UP"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["classifier", "enrichment", "salesforce", "envutil", "paths"]

@@ -21,25 +21,24 @@ import os
 import re
 import threading
 import time
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 import requests
-from PIL import Image, ImageStat
+from PIL import Image
 
 from envutil import env_flag, env_float
 
 logger = logging.getLogger("classifier.sources")
 
-SUPPORTED_SOURCES: tuple[str, ...] = ("state_ortho", "mapillary")
+SUPPORTED_SOURCES: tuple[str, ...] = ("mapillary",)
 
-# Mean Earth radius (m) for haversine; Web Mercator uses the WGS84 major axis.
+# Mean Earth radius (m) for haversine.
 EARTH_RADIUS_M = 6_371_008.8
-MERCATOR_R = 6_378_137.0
-MERCATOR_MAX_LAT = 85.05112878
 
 
 @dataclass
@@ -142,19 +141,13 @@ def record_views(source: str, count: int) -> None:
 # --------------------------------- logging ----------------------------------
 
 # Env vars whose values are secrets; their values are scrubbed from any text
-# passed through ``redact``. Sources add per-config token env names at runtime.
+# passed through ``redact``.
 _SECRET_ENV_NAMES: set[str] = {"MAPILLARY_ACCESS_TOKEN"}
 _secret_lock = threading.Lock()
 _SECRET_PARAM_RE = re.compile(
     r"(?i)\b(access_token|api_key|apikey|key|token|signature|client_secret)=([^&\s'\"<>]+)"
 )
 _AUTH_HEADER_RE = re.compile(r"(?i)\b(OAuth|Bearer|Apikey)\s+[A-Za-z0-9._|:\-]{6,}")
-
-
-def register_secret_env(name: str) -> None:
-    if name:
-        with _secret_lock:
-            _SECRET_ENV_NAMES.add(str(name))
 
 
 def redact(text: Any) -> str:
@@ -240,23 +233,6 @@ def compass_abbrev(bearing_deg: float) -> str:
     return _COMPASS_8[int(((float(bearing_deg) % 360.0) + 22.5) // 45.0) % 8]
 
 
-def lonlat_to_mercator(lon: float, lat: float) -> tuple[float, float]:
-    lat = max(-MERCATOR_MAX_LAT, min(MERCATOR_MAX_LAT, float(lat)))
-    x = MERCATOR_R * math.radians(float(lon))
-    y = MERCATOR_R * math.log(math.tan(math.pi / 4.0 + math.radians(lat) / 2.0))
-    return x, y
-
-
-def mercator_bbox(lat: float, lon: float, chip_m: float) -> tuple[float, float, float, float]:
-    """Square EPSG:3857 bbox (minx, miny, maxx, maxy) covering ``chip_m`` of
-    ground around the point. Mercator units are stretched by 1/cos(lat), so the
-    half side in projected metres is ``chip_m / 2 / cos(lat)``."""
-    x, y = lonlat_to_mercator(lon, lat)
-    cos_lat = max(1e-6, math.cos(math.radians(lat)))
-    half = float(chip_m) / 2.0 / cos_lat
-    return x - half, y - half, x + half, y + half
-
-
 def lonlat_bbox(lat: float, lon: float, half_m: float) -> tuple[float, float, float, float]:
     """(minlon, minlat, maxlon, maxlat) square of ``half_m`` metres each side."""
     dlat = half_m / 111_320.0
@@ -312,15 +288,6 @@ def cache_write(path: Path | None, data: bytes) -> None:
         atomic_write(path, data)
     except OSError as exc:
         logger.info("Supplemental cache write skipped (%s): %s", path.name, exc)
-
-
-def cache_delete(path: Path | None) -> None:
-    if path is None:
-        return
-    try:
-        path.unlink()
-    except OSError:
-        pass
 
 
 # ----------------------------------- HTTP -----------------------------------
@@ -381,21 +348,6 @@ def decode_image(data: bytes | None, content_type: str | None = None) -> Image.I
         return None
 
 
-def is_blank_image(img: Image.Image, *, uniform_frac: float = 0.95, min_stddev: float = 2.0) -> bool:
-    """True when the image is (near) one colour: no coverage, nodata fill, or
-    a placeholder tile."""
-    rgb = img.convert("RGB")
-    stddev = ImageStat.Stat(rgb).stddev
-    if max(stddev) < min_stddev:
-        return True
-    small = rgb.resize((64, 64), Image.Resampling.NEAREST)
-    colors = small.getcolors(64 * 64) or []
-    if not colors:
-        return False
-    top = max(count for count, _color in colors)
-    return top / float(64 * 64) >= uniform_frac
-
-
 def to_jpeg_bytes(img: Image.Image, quality: int = 90) -> bytes:
     buf = io.BytesIO()
     img.convert("RGB").save(buf, format="JPEG", quality=quality)
@@ -409,4 +361,4 @@ def iso_date_from_epoch_ms(value: Any) -> str | None:
         return None
     if ms <= 0:
         return None
-    return datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc).date().isoformat()
+    return datetime.fromtimestamp(ms / 1000.0, tz=UTC).date().isoformat()

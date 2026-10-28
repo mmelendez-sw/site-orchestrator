@@ -219,8 +219,8 @@ def _build_clients(ac: Any, primary_provider: str, allow_claude: bool) -> dict[s
 
 
 def _new_clients(primary_provider: str, allow_claude: bool) -> dict[str, object]:
-    from google import genai
     from anthropic import Anthropic
+    from google import genai
 
     clients: dict[str, object] = {}
     if primary_provider == "gemini" or allow_claude:
@@ -292,7 +292,7 @@ def _supplemental_for_site(
     state: str | None,
     verbose: bool,
 ) -> list:
-    """Street-level / state-ortho views for this site (SUPPLEMENTAL_IMAGERY)."""
+    """Street-level views for this site (SUPPLEMENTAL_IMAGERY)."""
     from classifier.sources import enabled_sources, fetch_supplemental_views
 
     sources = enabled_sources()
@@ -372,10 +372,10 @@ def _classify_site_imagery(
     point if the first pack is empty, an unlocked rooftop, or the pin and
     Census disagree (first pack may be the wrong building).
     """
-    from enrichment import progress
     from classifier import asset_classifier as ac
     from classifier import imagery
     from classifier.views import has_obliques, nearmap_tier_for
+    from enrichment import progress
 
     _refresh_classifier_flags(ac)
     ac.QUIET = True
@@ -562,7 +562,7 @@ def _classify_site_imagery(
         img_date = (naip_meta or {}).get("image_date")
         naip_chip_m = (naip_meta or {}).get("naip_chip_m") or ac.CHIP_SIZE_M
 
-    # Supplemental views (state ortho, street-level) for the chosen anchor.
+    # Supplemental street-level views for the chosen anchor.
     # Without SUPPLEMENTAL_CAN_CONFIRM they only join calls that already carry
     # Nearmap views, so the buy-Nearmap decision is unchanged (evidence only).
     supplemental_views: list = []

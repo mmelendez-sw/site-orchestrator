@@ -10,9 +10,10 @@ from __future__ import annotations
 import sys
 import threading
 import time
+from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 _run_t0: float | None = None
 _local = threading.local()

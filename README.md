@@ -1,256 +1,183 @@
-# Site Orchestrator
+# ICEMAN
 
-Salesforce enrichment: pull blank `Site_Type__c` sites, snap to FCC/TowerSource, classify from NAIP + optional Nearmap with Gemini/Claude (OSM prefilter before paid imagery), then write each qualifying site back to Salesforce as soon as it finishes. An end-of-run sweep applies anything still pending.
+ICEMAN decides whether a Salesforce `Site__c` record has cellular equipment and what structure hosts it (tower subtype, rooftop, stealth, water tower…), then writes the result back to Salesforce. It works through an evidence cascade, from cheapest to most expensive, and stops as soon as the evidence is strong enough:
 
-There is no upload-template or CSV-import step. Run CSVs under `../site-orchestrator-data/runs/` are an audit log.
+1. **FCC / TowerSource** registry match (Azure SQL). A unique hit within 25 m writes `Site_Type`, coordinates and `Verified_Site_Source` with no imagery at all.
+2. **Free evidence:** Overture building footprints (pin check), NAIP aerials, Mapillary street photos, FCC ULS microwave and OpenCelliD signals, and Nearmap imagery an earlier run already bought.
+3. **Gemini** classifies the views; **Claude** independently confirms cellular gear (dual-model agreement).
+4. **Nearmap** Vert + obliques (paid, metered against a monthly budget) only for sites that still need high-resolution sides.
 
-```
-python -m enrichment
-```
+Every decision passes the write gates in [enrichment/bucketing.py](enrichment/bucketing.py) before anything reaches Salesforce. Sites that cannot be decided are held out (`LLM_Holdout__c = true`) for human review rather than guessed.
 
-Set `APPLY=0` to classify and write CSVs without Salesforce updates. Optional env: `STATES`, `STAGES`, `LIMIT`, `OFFSET`, `SKIP_FROM`, `IDS`, `CARRIER_LIKE`, `METRO_CLASSIFICATION`, `LLM_CLASSIFIED`, `RUN_DIR`, `VERBOSE`, `METRICS_SQL`, `DEQUEUE_HOLDOUTS`, `DB_ONLY`, `CONFIRM_ROOFTOP`, `CLASSIFY_WORKERS`, `APPLY_BATCH_SIZE`. `SKIP_FROM=sql` skips every Id a live run already recorded in Azure SQL (combine with run folders / dates by comma). The queue defaults to `Stage__c = 'Outreach - Verified'` with no `LIMIT`. Set `STAGES` to a comma-separated picklist list to widen it.
-
-`CARRIER_LIKE` is the `Carrier_Leasing_Source__c` LIKE needle (unset = no carrier filter). Set `CARRIER_LIKE=NFL` to restrict to NFL sources. `METRO_CLASSIFICATION` is an exact `Metro_Classification__c` match (unset = no metro filter; e.g. `Major NFL Metro`). `OWNERS` is a comma list for `Owner__c IN (...)` (unset = any owner). Enrichment does not write those fields. The queue defaults to `LLM_Classified__c = false`; set `LLM_CLASSIFIED=1` only to re-pull already-flagged rows.
-
-**DB-only (no Nearmap):** `DB_ONLY=1` walks blank-`Site_Type` sites in **New/Unreviewed, Enhanced/Unreviewed, Outreach, Outreach - Verified, Marketing**, any owner. Successful writes are `LLM_Classified=true` (no `LLM_Holdout`). Unique FCC/TowerSource hits also write site type and coords. Misses stay blank type and classified true until you flip them (`LLM_CLASSIFIED=1`, then set classified false). If a Salesforce update fails (duplicates, API errors), the apply retries once with `LLM_Classified=false` and `LLM_Holdout=true` so the site leaves the queue. `SKIP_FROM` still skips Ids already in prior run CSVs. Change stages with `STAGES` or `LEAD_STAGES`.
-
-```powershell
-$env:DB_ONLY="1"
-$env:METRO_CLASSIFICATION="none"
-$env:STAGES="New/Unreviewed,Enhanced/Unreviewed,Outreach,Outreach - Verified,Marketing"
-$env:LIMIT="200"
-$env:SKIP_FROM="2026-09-09"
-$env:APPLY="0"
-$env:VERBOSE="1"
-python -m enrichment
-```
-
-Then set `APPLY=1` for live Salesforce writes. `Working-Connected` / `Qualified (Converted)` stay excluded unless listed in `STAGES`.
-
-Leadership KPIs land in Azure SQL (`dbo.EnrichmentRun` / `dbo.EnrichmentSiteOutcome`) during `APPLY=1` runs: the run header at start, each site row as that site finishes, and a full reconcile at the end. **UniqueSites** is every distinct Salesforce Id a live run processed — applied, held out, DB-only miss, failed apply, or error. **WrittenSites** is the subset Salesforce accepted a site-type/coords write for (`sf_update_status=updated`, including rooftop-confirm applies). Retries of the same Id count once (latest outcome wins). `APPLY=0` dry-runs never touch the cumulative KPIs or `kpis.json`. Details: [docs/enrichment-metrics.md](docs/enrichment-metrics.md).
-
-**NAIP rooftop confirm:** `CONFIRM_ROOFTOP=1` pulls existing `Site_Type=Rooftop` (not blank type), classifies NAIP + Gemini for **building-roof presence** (not cellular gear), and writes `Site_Type` + `LLM_Classified=true` when NAIP labels rooftop. HVAC-only or empty roofs still confirm. Inconclusive rows are left unchanged. No Nearmap, no Claude, no cell-gear bar. Successful applies count as rooftop SF writes / UniqueSites. Default stages include Working-Connected; set `CARRIER_LIKE` as needed. Uncomment `LIMIT` in `.env` only to cap a slice. Dry-run with `APPLY=0` first.
-
-```powershell
-$env:CONFIRM_ROOFTOP="1"
-$env:CARRIER_LIKE="ConnectX"
-$env:METRO_CLASSIFICATION="none"
-$env:OWNERS="none"
-$env:APPLY="0"
-$env:VERBOSE="1"
-python -m enrichment
-```
-
-Salesforce apply is stage 4/4. If you Ctrl+C during classify, push the paused CSV (no Gemini rerun):
-
-```powershell
-$env:CONFIRM_ROOFTOP="1"
-$env:APPLY="1"
-$env:APPLY_EXISTING="1"
-$env:RUN_DIR="C:\Users\Mmelendez\Codebases\site-orchestrator-data\runs\2026-09-17_130656_sf_enrichment"
-$env:VERBOSE="1"
-python -m enrichment
-```
-
-**ConnectX rooftop audit:** `CONNECTX_AUDIT=1` re-checks ConnectX rooftops that are still owned by an individual rep. These are `Site_Type=Rooftop` rows whose `OwnerId` is not the Site Acquisition Team (`0053l00000G05h9AAB`) and whose stage is New/Unreviewed, Enhanced/Unreviewed, Outreach or Outreach - Verified. The `LLM_Classified` flag is ignored. These sites run the full FCC/TowerSource → NAIP → Nearmap Vert + obliques → Claude path, and each finished site gets one verdict:
-
-| Verdict | When | Salesforce write |
-|---|---|---|
-| `confirmed` | Normal write gates passed (unique FCC/TowerSource hit, or Nearmap obliques + dual-model cell) | Usual Site_Type / coords / Verified_Site_Source. Owner and stage stay the same. |
-| `no_asset` | Nearmap obliques reviewed, no model saw gear, confident and unhedged call, no stealth host (steeple, chimney, screen wall…), no FCC/TowerSource record within `AUDIT_DB_VETO_M` (100 m) | `OwnerId` = Site Acquisition Team, `Stage__c` = Unqualified, `Unqualified_Reason__c` = No Site/Decommissioned, `Other_Unqualified_Reason__c` = audit note, `Unqualified_Date__c` = today |
-| `inconclusive` | Anything else: NAIP only, no Nearmap coverage, budget stop, gear claimed but disputed, weak call | None. The site stays with its rep. |
-
-The detail CSV columns `audit_verdict` and `audit_reason` record each call. Live runs write to `runs/<stamp>_connectx_audit`, and `APPLY=0` runs write to `_connectx_audit_dryrun`. Each new audit skips Ids an earlier live audit already decided. Set `AUDIT_RETRY_INCONCLUSIVE=1` to retry inconclusive sites; budget stops and errors are always retried. Scope a night with `OWNERS` (rep names), `STATES` or `LIMIT`. Owner override: `SITE_ACQ_OWNER_ID`. The audit uses roughly 1.1 MB of Nearmap per site, so check `NEARMAP_MONTHLY_BUDGET_MB` before a large slice.
-
-```powershell
-$env:CONNECTX_AUDIT="1"
-$env:OWNERS="Jeremy Scott"   # optional: one rep per night
-$env:LIMIT="200"
-$env:APPLY="0"               # dry run first; review audit_verdict in the detail CSV
-$env:VERBOSE="1"
-python -m enrichment
-```
-
-To push a reviewed dry run without re-buying imagery, set `APPLY=1`, `APPLY_EXISTING=1`, `CONNECTX_AUDIT=1` and `RUN_DIR` to the `_connectx_audit_dryrun` folder.
-
-### ConnectX reconciliation (pool audit → rep audit → hot swap)
-
-1. **Verify the pool.** `CONNECTX_AUDIT=1 AUDIT_POOL=1` audits ConnectX rooftops owned by the Site Acquisition Team. Confirmed rooftops get the NearMap verification and stay in the pool. No-asset sites are set to Unqualified and stay in the pool.
-2. **Verify rep books (not worked only).** `CONNECTX_AUDIT=1 STAGES=New/Unreviewed AUDIT_UNQUALIFY_OWNER=0056O00000EpUOgQAN` audits rep-owned New/Unreviewed rooftops. No-asset sites are set to Unqualified and reassigned to Matt Melendez. Confirmed sites stay with the rep.
-3. **Hot swap.** `python -m enrichment.reconcile_swaps` gives each rep one verified pool rooftop for every site step 2 took away, preferring the same state and falling back to any state. It re-checks the live Salesforce state first. Without `SWAP_APPLY=1` it only writes a plan. A swap sets `OwnerId` to the rep and `Site_Assignment_Date__c` to today, and `swaps/swap_ledger.csv` keeps any site from being used twice. Optional: `SWAP_LIMIT`, `SWAP_REPS`.
-
-```powershell
-# 1. pool
-$env:CONNECTX_AUDIT="1"; $env:AUDIT_POOL="1"; $env:LIMIT="200"; python -m enrichment
-# 2. reps (new terminal, or clear AUDIT_POOL first)
-$env:CONNECTX_AUDIT="1"; $env:STAGES="New/Unreviewed"; $env:AUDIT_UNQUALIFY_OWNER="0056O00000EpUOgQAN"; $env:LIMIT="200"; python -m enrichment
-# 3. swaps: review the plan, then apply
-python -m enrichment.reconcile_swaps
-$env:SWAP_APPLY="1"; python -m enrichment.reconcile_swaps
-```
-
-### Multi-source evidence (all off by default)
-
-The design and rollout plan are in [docs/adr/0001-multi-source-evidence-cascade.md](docs/adr/0001-multi-source-evidence-cascade.md). Every new source adds evidence only. The existing write gates still decide what reaches Salesforce.
-
-**Cheap signals.** Set `SIGNALS=1` (choose sources with `SIGNALS_SOURCES=uls,opencellid,osm`). This stamps `uls_*`, `opencellid_*`, `osm_antenna_count` and `signal_strength` on each detail row. A `strong` signal (a licensed microwave dish or tagged telecom antenna within 30 m) blocks an audit unqualify.
-- **FCC ULS microwave locations:** load them weekly into Azure SQL with `python scripts/load_fcc_uls_microwave.py --dry-run`, then run it again without `--dry-run`. The DDL is in `sql/fcc_uls_microwave.sql`.
-- **OpenCelliD:** needs `OPENCELLID_API_KEY` (1,000 requests per day). It's a weak signal only.
-
-**Supplemental imagery.** Set `SUPPLEMENTAL_IMAGERY=state_ortho,mapillary`, in priority order.
-
-| Source | Needs | Notes |
-|---|---|---|
-| `state_ortho` | `STATE_ORTHO_SOURCES=<json>` | State or county ArcGIS / WMS orthoimagery. See `docs/state_ortho_sources.example.json`. Preferred over NAIP when there's no Nearmap top-down view. |
-| `mapillary` | `MAPILLARY_ACCESS_TOKEN` | Free street-level photos facing the site (CC BY-SA). Searches `MAPILLARY_RADIUS_M` (default 100 m) and retries an empty search once. Photos within `STREET_CONFIRM_MAX_AGE_YEARS` rank first, and each photo is cropped toward the site bearing and to its upper part (`MAPILLARY_CROP=0` turns that off; `MAPILLARY_HFOV`, `MAPILLARY_CROP_WIDTH`, `MAPILLARY_CROP_TOP`) so distant rooftop gear survives the model downscale. |
-
-- **Evidence-only by default.** Without `SUPPLEMENTAL_CAN_CONFIRM`, supplemental views only join model calls that already carry Nearmap, so Nearmap purchasing is unchanged.
-- **`SUPPLEMENTAL_CAN_CONFIRM=1`** lets a boxed street-level view stand in for a Nearmap oblique in the rooftop and tower confirm gates, and tells the models they may box gear on street photos. Mapillary confirmations write `Verified_Site_Source = Google Map`. A street confirm needs all of:
-  - Claude's own box on the photo (`agree_localize`), not a yes/no on Gemini's crop. Crop checks accepted ornate cornices as "parapet masts".
-  - Cell confidence of at least 0.9 and evidence without hedges ("consistent with", "appears", "resembles", ...).
-  - A photo no older than `STREET_CONFIRM_MAX_AGE_YEARS` (default 5).
-  - Towers too: no Gemini-only tower lock on a street photo.
-- **Metering:** each detail row gets `supplemental_*` columns (sources, requests, billable requests, cache hits).
-
-**Saved Nearmap chips.** `SAVED_NEARMAP_CHIPS=1` classifies a site on the Nearmap JPEGs any earlier run already bought for it (newest run first, at no new cost). NAIP is fetched fresh when the saved pack has none, and supplemental views still apply. Sites with no saved Nearmap keep the normal path, so with `NAIP_ONLY=1` they never buy Nearmap. Add `NEARMAP_CACHE_ONLY=1` to also stitch views from tiles cached for neighbouring sites (never a Nearmap call; a view is used only when every tile is cached).
-
-**Building footprints (pin check before imagery).** `scripts/load_overture_buildings.py` loads Overture Maps building outlines within 100 m of every Site__c pin into `dbo.OvertureBuilding` (about 1.5M rows; only the matching Overture row groups are downloaded). Re-run all four steps after a new Overture release (each release stays online ~60 days):
-
-```powershell
-python scripts/load_overture_buildings.py sites     # Site__c pins (read-only SOQL)
-python scripts/load_overture_buildings.py plan      # row groups near sites (metadata only)
-python scripts/load_overture_buildings.py extract   # resumable download + 100 m filter
-python scripts/load_overture_buildings.py load      # stage + swap into dbo.OvertureBuilding
-```
-
-`FOOTPRINT_PIN_CHECK=1` then checks each pin before NAIP/Mapillary/Nearmap: on a building it stays; off a building it snaps to the nearest building within `FOOTPRINT_SNAP_MAX_M` (60 m), or for imprecise pins (<= 3 decimals) to the building the Census address is in. A snap never moves the imagery center more than `FOOTPRINT_MAX_SHIFT_M` (30 m), so a tower at the pin stays in a ~100 m Nearmap chip. `no_building` is recorded but never skips Nearmap: on the pool audit most such pins were real monopoles or stealth sites, which have no footprint. FCC/TowerSource tower matches skip the check. Detail rows get `footprint_*` columns. Data: Overture Maps Foundation (ODbL).
-
-**Nearmap priority list.** `python scripts/build_nearmap_priority.py --runs <folders or YYYY-MM-DD> --out priority.csv` ranks undecided sites (1 gear seen without obliques, 2 rooftop/tower host, 3 other, 6 already had obliques, 9 imprecise pin) for `python -m enrichment.lanes --priority-csv priority.csv`, so a Nearmap budget buys the likeliest confirms first.
-
-**On by default in every run** (set the variable to 0 / none to turn one off): building-footprint pin check (`FOOTPRINT_PIN_CHECK`), saved and tile-cached Nearmap reuse (`SAVED_NEARMAP_CHIPS`, `NEARMAP_CACHE_ONLY`; an incomplete saved pack still buys the missing oblique), the consistency re-check on single-model confirms (`CONFIRM_CONSISTENCY`), Mapillary street photos that may confirm (`SUPPLEMENTAL_IMAGERY=mapillary`, `SUPPLEMENTAL_CAN_CONFIRM`, 3 views) and ULS + OpenCelliD signals (`SIGNALS`, OSM only when named in `SIGNALS_SOURCES`). A pin with a building 30-60 m away keeps its imagery centre and the building becomes the second-pack point; pins with no building within 60 m go to `review_queue.csv`. `--profile free` adds `NAIP_ONLY=1` (no new Nearmap); any `--env` overrides it. Unit tests stay offline through `conftest.py`. When Gemini sees gear and Claude does not, the site buys the oblique directions it has not been seen from (missing North/East first, then South/West, also on reused saved packs) and Claude searches only the new views (`DISPUTE_EXTRA_OBLIQUES=0` turns this off). A Gemini-only tower lock also needs gear confidence >= `GEMINI_TOWER_LOCK_CELL_CONF` (0.80). `CONFIRM_CONSISTENCY=1` re-classifies each imagery-only confirm on its saved chips (no Nearmap purchase) and writes only when both passes confirm the same Site_Type; a disagreement is held out as `consistency_disagree`.
-
-**Audit holdout instead of unqualify.** `AUDIT_HOLDOUT_OWNER=<User Id>` with `CONNECTX_AUDIT=1` replaces the unqualify step. Every no-asset and inconclusive site gets only `LLM_Holdout__c=true` and `OwnerId=<User Id>`; Stage and the Unqualified fields are untouched. Errored sites are skipped so a later run retries them. Confirmed sites write as usual.
-
-Zero-Nearmap audit of the Site Acquisition Team's ConnectX rooftops (drop `APPLY=0` to write):
-
-```powershell
-python -m enrichment.lanes --pool-audit --profile free --lanes 5 --batch 10 --stop-at-mb <current MTD MB + 1> `
-  --env APPLY=0 --env AUDIT_HOLDOUT_OWNER=0056O00000EpUOgQAN
-```
-
-**Model resilience.** `GEMINI_FALLBACK_MODEL=<GA model>` retries Gemini 429/503 failures on that model. After `GEMINI_FALLBACK_AFTER` consecutive failures (default 2), a circuit breaker sends calls straight to the fallback for `GEMINI_FALLBACK_COOLDOWN_S` (default 300). `classify_site` now honours `GEMINI_RETRIES`.
-
-**Shared Nearmap budget.** Every purchase is appended to `metrics/nearmap_purchases.jsonl`, and each process re-reads it every `NEARMAP_BUDGET_REFRESH_S` (default 5). Parallel processes therefore enforce one `NEARMAP_MONTHLY_BUDGET_MB` together. `python -m enrichment.budget` prints the month-to-date total with breakdowns by day, run and purpose.
-
-### Parallel lanes and evaluation
-
-`python -m enrichment.lanes` replaces running several terminals by hand. It splits the queue into lanes and batches, divides `GEMINI_RPM` / `CLAUDE_RPM` across lanes, prints and writes `status.json`, and stops by itself:
-- **Budget stop:** `--stop-at-mb` stops new batches; running ones finish.
-- **Coverage stop:** `--stop-when-covered` stops once confirmed pool rooftops cover what reps are owed.
-- **Flush:** at the end it pushes any finished sites that weren't sent to Salesforce.
-
-```powershell
-python -m enrichment.lanes --pool-audit --lanes 5 --batch 75 --stop-when-covered --stop-at-mb 2700 --dry-run
-python -m enrichment.lanes --ids-file ids.txt --env CONNECTX_AUDIT=1 --gemini-rpm-total 40 --claude-rpm-total 40
-```
-
-To measure accuracy before tuning, build a labelled set from Salesforce outcomes. Working - Connected and Qualified count as positive; Unqualified "No Site" and "Not a Cellular tower" count as negative. Then score the run folders against it:
-
-```powershell
-python scripts/build_eval_set.py --carrier-like ConnectX --site-type Rooftop
-python scripts/eval_report.py --eval <data>/eval/eval_set_<date>.csv --runs "2026-10-*"
-```
-
-## Layout
-
-```
-site-orchestrator/
-├── enrichment/     # queue → prepare (geocode + bulk proximity) → classify → apply → metrics
-├── classifier/     # decision gates (asset_classifier), prompts, imagery, llm, views, evidence
-├── salesforce/     # auth + Site_Type picklist mapping
-├── sql/            # enrichment metrics DDL (Symphony_dev)
-├── scripts/        # metrics loader/backfill, decision replay
-├── docs/           # metrics schema and queries
-├── envutil.py      # typed env readers
-├── paths.py        # sibling data folder
-└── requirements.txt
-```
-
-CSVs, `runs/`, and `chips/` live in **`../site-orchestrator-data`** (not in git). Override with `SITE_ORCHESTRATOR_DATA`.
+Design background: [docs/adr/0001-multi-source-evidence-cascade.md](docs/adr/0001-multi-source-evidence-cascade.md). Every setting: [docs/configuration.md](docs/configuration.md). KPIs: [docs/enrichment-metrics.md](docs/enrichment-metrics.md). Contributing: [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Setup
 
 ```powershell
 python -m venv .venv
 .venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-copy .env.example .env   # fill in credentials
+pip install -r requirements-dev.txt
+copy .env.example .env      # fill in Salesforce, Gemini, Anthropic, Nearmap, Azure SQL, Mapillary
+az login                    # Azure SQL uses Entra token auth
 ```
 
-Also install the ODBC Driver 18 for SQL Server. For tests and lint: `pip install -r requirements-dev.txt`, then `python -m pytest -q` (offline — no paid APIs, Salesforce, or SQL). CI runs the same on every push (`.github/workflows/tests.yml`). Azure SQL uses Entra token auth (`az login`); `pyodbc` and `azure-identity` are in `requirements.txt`.
+Also install the **ODBC Driver 18 for SQL Server**. Run folders, chips, caches and metrics live in `../site-orchestrator-data` (override with `SITE_ORCHESTRATOR_DATA`), never in git.
 
-## Classify path
+Check the install offline (no paid APIs, Salesforce or SQL):
 
-1. **NAIP + Gemini** — always, unless a unique FCC/TowerSource hit ≤ 25 m skips imagery.
-2. **OSM Overpass** — cheap prefilter before Nearmap when the NAIP pass is inconclusive.
-3. **Nearmap** vert + obliques — rooftops and towers that still need high-res sides.
-4. **Claude** — dual-model cell confirm (skipped for high-conf Gemini towers ≥ 0.85, and below 0.7 site confidence).
+```powershell
+python -m pytest -q
+python -m ruff check .
+```
 
-### Throughput and pacing
+## Operating ICEMAN
 
-One process classifies `CLASSIFY_WORKERS` sites at once (default 10). Pins within `PIN_CLUSTER_M` of each other stay in one worker so nearby-pin reuse still saves imagery. Every Gemini / Claude call waits on a shared limiter — `GEMINI_RPM` (default 120) and `CLAUDE_RPM` (default 50) — and a 429/503 pauses all workers together. This replaces the old fixed `GEMINI_DELAY_S` sleep after each site (`GEMINI_DELAY_S` / `CLAUDE_DELAY_S` are ignored now). Run **one** terminal and raise `CLASSIFY_WORKERS` instead of opening more; separate processes do not share the limiter. Every 429 prints a `WARNING Gemini 429 … all workers pause` line; if those repeat, lower `GEMINI_RPM` (e.g. 90 or 60).
+### Ground rules
 
-With `VERBOSE=1` and more than one worker, each site's steps print as one block when that site finishes (tagged `[index/total Id]`), followed by its result line. `CLASSIFY_WORKERS=1` restores live step-by-step output.
+- **Dry run first.** `APPLY=0` (`--env APPLY=0` on lanes) classifies and writes CSVs without touching Salesforce. Review the detail CSV, then run with `APPLY=1`. Lanes `--dry-run` only prints the batch plan.
+- **Check the Nearmap budget before any run that can buy imagery:** `python -m enrichment.budget`. Use `--profile free` when no new Nearmap should be bought.
+- **One launcher.** Use `python -m enrichment.lanes` for anything bigger than a few dozen sites. It shares the model rate limits and the Nearmap budget across batches; separate terminals do not share the rate limits.
+- Salesforce writes are batched and logged per run (`sf_update_apply_log.csv`). Every finished site is in `enrichment_detail.csv` before its batch is sent, so nothing finished is lost on a crash.
 
-Scaling: `CLASSIFY_WORKERS` goes up to 32, but the ceiling is model pacing — roughly `GEMINI_RPM` ÷ Gemini calls per site (typically 2–5) sites per minute. More workers only help once `GEMINI_RPM` is raised to match, up to your Gemini project quota. Each worker also opens up to `NEARMAP_TILE_WORKERS` tile downloads at once (default 4, so 40 concurrent at 10 workers).
+### Standard run (lanes)
 
-Before classifying, the run geocodes the whole queue in Census batch requests (cached in `../site-orchestrator-data/cache/census_geocode.jsonl`) and looks up FCC/TowerSource for all pins in a few temp-table joins instead of two to four queries per site. If the bulk lookup fails, sites fall back to per-site queries automatically.
+```powershell
+# Zero new Nearmap spend; holdouts go to the given owner. Plan only:
+python -m enrichment.lanes --ids-file ids.txt --profile free --lanes 10 --batch 25 `
+  --env CONNECTX_AUDIT=1 --env AUDIT_HOLDOUT_OWNER=<User Id> --run-name holdouts --dry-run
 
-Salesforce writes, Azure SQL, and the detail CSV all stay on the main thread. The first Ctrl+C finishes in-flight sites and flushes pending writes; a second aborts. Salesforce writes go out in sObject Collections batches of `APPLY_BATCH_SIZE` (default 25, max 200) or after `APPLY_FLUSH_S` (default 60 s), whichever comes first; `APPLY_BATCH_SIZE=1` writes each site as it finishes. Every finished site is in `enrichment_detail.csv` (status `pending`) before its batch is sent, so after a hard crash `APPLY_EXISTING=1` with that `RUN_DIR` pushes whatever had not gone out.
+# Live (drop --dry-run); cap Nearmap at the month-to-date MB you are willing to reach:
+python -m enrichment.lanes --pool-audit --lanes 5 --batch 75 --stop-at-mb 2400 --stop-when-covered
+```
 
-Imagery is cached under `../site-orchestrator-data/cache/`: NAIP chips per STAC item + point, Nearmap tiles per survey capture date (a new survey refetches). Reruns, wide AOIs, re-centers, and neighbors reuse pixels instead of re-downloading. Set `IMAGERY_CACHE=0` to disable; check your Nearmap agreement on how long tiles may be retained. Do not run `load_enrichment_metrics.py` during a classify run. Set `METRICS_SQL=0` if Azure SQL is dropping; reload KPIs later.
+| Option | Meaning |
+|---|---|
+| `--ids-file` / `--pool-audit` | Queue: one Salesforce Id per line, or the Site Acquisition Team's ConnectX rooftops in New/Unreviewed minus Ids an earlier live audit already decided |
+| `--priority-csv` | `Id,tier` CSV from `scripts/build_nearmap_priority.py`; lower tiers run first so the budget buys the likeliest confirms |
+| `--profile free` | `NAIP_ONLY=1` plus every free source: no new Nearmap (saved and tile-cached Nearmap are still used) |
+| `--stop-at-mb` | Stop launching batches at this month-to-date Nearmap MB; running batches finish |
+| `--stop-when-covered` | Stop once confirmed pool rooftops cover the open rep slots |
+| `--env KEY=VALUE` | Passed to every batch (repeatable) |
 
-### Nearmap spend (4 GB/month shared with ICEMAN)
+Each batch gets its own run folder `runs/<stamp>_<name>_L<lane>_C<chunk>_…`; the lanes folder `runs/<stamp>_lanes_<name>/` holds `plan.json`, `status.json`, `events.log` and one log per batch. Every stop ends with a flush that pushes any finished-but-unsent sites to Salesforce.
 
-Every Nearmap tile is metered: billed bytes, tiles, cache hits, and the stage that bought it (`pack`, `oblique_extra`, `wide`, `second`, `recenter`). Per site it lands in `enrichment_detail.csv` (`nearmap_bytes`, `nearmap_spend`) and Azure SQL (`NearmapBytes`); per run and cumulatively as `nearmap_mb` / `nearmap_mb_per_enriched` (`NearmapMB`, `NearmapMBPerEnriched` in `vEnrichmentKpis`).
+### Monitoring
 
-Purchase rules that keep bytes down:
+```powershell
+python scripts/run_status.py <run-name> --date 2026-10-28   # batches, verdicts, SF writes, Nearmap MB
+python -m enrichment.budget                                  # month-to-date Nearmap by day, run and purpose
+```
+
+### Recovery
+
+- **Crash or Ctrl+C during classify:** re-push what finished, without re-classifying (add the same mode flags the run used, e.g. `CONNECTX_AUDIT`):
+  ```powershell
+  $env:APPLY="1"; $env:APPLY_EXISTING="1"; $env:RUN_DIR="<run folder>"; python -m enrichment
+  ```
+- **Salesforce rejects a write** (duplicate rule, validation): the site falls back to `LLM_Classified=false`, `LLM_Holdout=true` so it leaves the queue; the error is in `sf_update_apply_log.csv`.
+- **Gemini 429/503:** all workers pause together. If `WARNING Gemini 429` repeats, lower `GEMINI_RPM`. `GEMINI_FALLBACK_MODEL` retries on a GA model and opens a circuit breaker after `GEMINI_FALLBACK_AFTER` failures.
+
+## Run modes
+
+All modes run through `python -m enrichment` (one process) or `python -m enrichment.lanes` (many). Every mode honours `APPLY`, `LIMIT`, `IDS`, `STATES`, `STAGES`, `OWNERS`, `CARRIER_LIKE`, `METRO_CLASSIFICATION`, `SKIP_FROM` and `RUN_DIR`.
+
+| Mode | Set | Queue | Writes |
+|---|---|---|---|
+| Blank-type enrichment (default) | — | `Site_Type` blank, `LLM_Classified=false`, `Stage = Outreach - Verified` unless `STAGES` is set | `Site_Type`, coords, `Verified_Site_Source`, `LLM_Classified`; undecided sites held out |
+| ConnectX audit | `CONNECTX_AUDIT=1` | Rep-owned ConnectX rooftops (`AUDIT_POOL=1`: the Site Acquisition Team's pool) | See verdict table below |
+| Registry only | `DB_ONLY=1` | Blank type across lead stages, any owner | FCC/TowerSource hits only; no imagery or models |
+| NAIP rooftop confirm | `CONFIRM_ROOFTOP=1` | Existing `Site_Type=Rooftop` | Confirms a building roof from NAIP + Gemini; no Nearmap or Claude |
+| Holdout re-score | `RERUN_HOLDOUTS_FROM=<date>`, `REUSE_CHIPS_FROM=<date>` | Earlier holdouts | Re-classifies on already-bought chips (`error=no_saved_chips` when none) |
+
+ConnectX audit verdicts:
+
+| Verdict | When | Salesforce write |
+|---|---|---|
+| `confirmed` | Normal write gates passed | Usual `Site_Type` / coords / `Verified_Site_Source`; owner and stage unchanged |
+| `no_asset` | Nearmap obliques reviewed, no model saw gear, confident unhedged call, no stealth host, no registry record within `AUDIT_DB_VETO_M` (100 m), no strong ULS/OSM signal | Owner → Site Acquisition Team (or `AUDIT_UNQUALIFY_OWNER`), `Stage = Unqualified`, reason `No Site/Decommissioned` |
+| `inconclusive` | Anything else (NAIP only, budget stop, disputed gear, weak call) | None; stays with its rep |
+
+With `AUDIT_HOLDOUT_OWNER=<User Id>` the unqualify step is replaced: every `no_asset` and `inconclusive` site gets only `LLM_Holdout__c=true` and that owner. `AUDIT_RETRY_INCONCLUSIVE=1` retries inconclusive sites (budget stops and errors are always retried) and requires a second passing review before any imagery confirm.
+
+**ConnectX pull and hot swap.** `python -m enrichment.reconcile_pull` moves not-worked ConnectX rooftops from rep books back to the Site Acquisition Team (sites a rep touched since assignment stay) and records each rep's "owed" count in `swaps/pull_ledger.csv`. After the pool audit, `python -m enrichment.reconcile_swaps` gives each rep one verified pool rooftop per owed site (same state first); `swaps/swap_ledger.csv` keeps a site from being used twice. Both only write a plan unless `PULL_APPLY=1` / `SWAP_APPLY=1`.
+
+## What ICEMAN writes
+
+- **Registry hit:** unique FCC/TowerSource match ≤ 25 m (or the pin on the structure ≤ 5 m) writes type and coordinates with no imagery.
+- **Towers:** Gemini tower + cell at site confidence ≥ 0.85 and gear confidence ≥ `GEMINI_TOWER_LOCK_CELL_CONF` (0.80) auto-apply; Claude can confirm weaker towers.
+- **Rooftops:** Nearmap obliques + dual-model agreement, or NAIP-only when site and cell confidence ≥ 0.95 with named gear, unhedged evidence and an asset box. A Mapillary photo may stand in for an oblique only with Claude's own box, cell confidence ≥ 0.9, no hedged wording and a photo ≤ `STREET_CONFIRM_MAX_AGE_YEARS` (5) old; those write `Verified_Site_Source = Google Map`.
+- **Consistency re-check** (`CONFIRM_CONSISTENCY`, on): each imagery-only confirm is re-classified on its saved chips and written only when both passes agree; a disagreement holds out as `consistency_disagree`.
+- **Everything else** holds out (`LLM_Classified=false`, `LLM_Holdout=true`) with a `holdout_reason` in the detail CSV.
+
+## Evidence sources (on by default)
+
+Each can be turned off with `0` / `none`. Full list of knobs: [docs/configuration.md](docs/configuration.md).
+
+| Source | Setting | Notes |
+|---|---|---|
+| Building-footprint pin check | `FOOTPRINT_PIN_CHECK` | Overture outlines in `dbo.OvertureBuilding`. Off-building pins snap to a building within 60 m (imagery centre moves ≤ 30 m); pins with no building within 60 m go to `review_queue.csv` but still get imagery (monopoles have no footprint) |
+| Saved Nearmap reuse | `SAVED_NEARMAP_CHIPS`, `NEARMAP_CACHE_ONLY` | Classify on Nearmap any earlier run bought, and stitch views from tiles cached for neighbours; never a new Nearmap call |
+| Mapillary street photos | `SUPPLEMENTAL_IMAGERY=mapillary`, `SUPPLEMENTAL_CAN_CONFIRM` | Needs `MAPILLARY_ACCESS_TOKEN`. Up to 3 views facing the site, cropped toward the bearing |
+| Cheap signals | `SIGNALS`, `SIGNALS_SOURCES=uls,opencellid[,osm]` | FCC ULS microwave (Azure SQL) and OpenCelliD (`OPENCELLID_API_KEY`, 1,000 requests/day). A strong signal within 30 m blocks an audit unqualify |
+| Disputed-site obliques | `DISPUTE_EXTRA_OBLIQUES` | When Gemini sees gear and Claude does not, buy the oblique directions not yet seen |
+| OSM prefilter | `OSM_PREFILTER` | Overpass check before Nearmap when NAIP is inconclusive |
+
+`FORCE_ROOF_SCOUT=1` (off) always buys the wide scout for large roofs such as arenas.
+
+## Nearmap spend
+
+Every tile is metered: bytes, tiles, cache hits and the purchase stage (`pack`, `oblique_extra`, `wide`, `second`, `recenter`). Per site it lands in `enrichment_detail.csv` and Azure SQL; every purchase is appended to `metrics/nearmap_purchases.jsonl`, which every process re-reads every `NEARMAP_BUDGET_REFRESH_S` (5 s), so parallel lanes enforce one budget.
 
 | Purchase | Tiles | When |
 |---|---|---|
 | Vert + first oblique (100 m, z20) | ~40 | Sites that need Nearmap |
-| Remaining obliques | ~20 each | Only when Vert + first oblique did not lock the call (`NEARMAP_STAGGER_OBLIQUES=1`) |
-| Wide host scout (250 m, **z19 Vert only**) | ~25 | Rooftop with cell unconfirmed (was ~270 for the full 250 m pack; `NEARMAP_WIDE_SCOUT=full` restores it) |
+| Remaining obliques | ~20 each | Only when Vert + first oblique did not lock the call |
+| Wide host scout (250 m, z19 Vert) | ~25 | Rooftop with cell unconfirmed |
 | Re-center pack (100 m) | ~60 | Scout found a candidate off the pin |
 | Second pack at the Census point | ~60 | Pin and address disagree |
 
-The monthly guard (`NEARMAP_MONTHLY_BUDGET_MB`, default 1500) sums this month's bytes from `metrics/nearmap_usage.jsonl` (dry runs included) plus `NEARMAP_PRIOR_USE_MB`. At `NEARMAP_BUDGET_SOFT_PCT` (90%) the optional buys stop; at 100% all Nearmap stops and sites that needed it hold out as `nearmap_budget` — never dequeued, so the next month's run picks them up. The start banner prints `Nearmap budget: N of M MB used this month`. ICEMAN usage is not visible here: size the budget to this pipeline's share.
+`NEARMAP_MONTHLY_BUDGET_MB` (default 1500) is compared with this month's ledger plus `NEARMAP_PRIOR_USE_MB` (use the ledger cannot see). At `NEARMAP_BUDGET_SOFT_PCT` (90%) optional buys stop; at 100% all Nearmap stops and those sites hold out as `nearmap_budget` without being dequeued, so next month's run picks them up. The ledger counts bytes differently from the Nearmap portal; reconcile against the portal's tile count before changing the budget.
 
-### Checking a rule change
+## Throughput
 
-Before shipping a threshold or gate change, replay recent classifications through the new rules (no imagery, models, or Salesforce):
+One process classifies `CLASSIFY_WORKERS` sites at once (default 10, max 32). Pins within `PIN_CLUSTER_M` stay in one worker so nearby pins share imagery. Model calls share one limiter per process (`GEMINI_RPM` 120, `CLAUDE_RPM` 50). Lanes split `--gemini-rpm-total` (default `GEMINI_RPM` or 60) and `--claude-rpm-total` (default `CLAUDE_RPM` or 50) across lanes. The ceiling is roughly `GEMINI_RPM` ÷ 2–5 Gemini calls per site, per minute.
 
-```powershell
-python scripts/replay_decisions.py 2026-09
+Before classifying, the run geocodes the whole queue in Census batches (cached) and looks up FCC/TowerSource for all pins in a few joins. Salesforce writes go out in sObject Collections batches of `APPLY_BATCH_SIZE` (25; lanes use 10) or every `APPLY_FLUSH_S` (60 s). Imagery is cached under `../site-orchestrator-data/cache/` (`IMAGERY_CACHE=0` disables it; check the Nearmap agreement on tile retention).
+
+## Changing decision rules
+
+1. **Replay** recent decisions through the new rules (no imagery, models or Salesforce). It prints every site whose bucket, holdout reason or `Site_Type` would change and exits 1 if any did:
+   ```powershell
+   python scripts/replay_decisions.py 2026-10
+   ```
+2. **Score accuracy** against Salesforce outcomes (Working - Connected / Qualified = positive; Unqualified "No Site" / "Not a Cellular tower" = negative):
+   ```powershell
+   python scripts/build_eval_set.py --carrier-like ConnectX --site-type Rooftop
+   python scripts/eval_report.py --eval <data>/eval/eval_set_<date>.csv --runs "2026-10-*"
+   ```
+3. Dry-run a small live slice (`$env:LIMIT="50"; $env:APPLY="0"`) before a full run.
+
+## Data loaders
+
+| Script | Loads | Cadence |
+|---|---|---|
+| `scripts/load_fcc_uls_microwave.py` | FCC ULS microwave locations → Azure SQL (`sql/fcc_uls_microwave.sql`) | Weekly; `--dry-run` first |
+| `scripts/load_overture_buildings.py sites\|plan\|extract\|load` | Overture building outlines within 100 m of every pin → `dbo.OvertureBuilding` (`sql/overture_buildings.sql`) | After each Overture release (~60-day retention) |
+| `scripts/load_enrichment_metrics.py` | Rebuilds / backfills the KPI tables (`sql/enrichment_metrics.sql`) | As needed; never during a classify run |
+| `scripts/build_nearmap_priority.py` | Priority CSV for `--priority-csv` from earlier run folders | Before a budgeted Nearmap run |
+
+KPIs land in Azure SQL (`dbo.EnrichmentRun`, `dbo.EnrichmentSiteOutcome`, `vEnrichmentKpis`) during `APPLY=1` runs; `METRICS_SQL=0` skips them when SQL is unavailable. Details: [docs/enrichment-metrics.md](docs/enrichment-metrics.md).
+
+## Layout
+
 ```
-
-It prints every site whose bucket / holdout reason / Site_Type would change and exits 1 if any did.
-
-Re-score holdouts on already-purchased Nearmap JPEGs (no new Nearmap fetch; Gemini and Claude still run). Dry-run a slice first:
-
-```powershell
-$env:RERUN_HOLDOUTS_FROM="2026-09-03"
-$env:REUSE_CHIPS_FROM="2026-09-03"
-$env:LIMIT="50"
-$env:APPLY="0"
-$env:VERBOSE="1"
-python -m enrichment
+enrichment/   queue → prepare (geocode, registry, footprints) → classify → write gates → Salesforce apply → metrics
+              __main__ (single run), lanes (parallel runs), connectx_audit, bucketing (write gates),
+              naip_classify (imagery cascade), pipeline, sf_ops, budget, signals/
+classifier/   model prompts and calls (asset_classifier, llm, prompts), imagery (NAIP, Nearmap, budget),
+              views, evidence, sources/ (Mapillary)
+salesforce/   auth and Site_Type picklist mapping
+scripts/      loaders, eval and replay, run status, config reference generator
+sql/          Azure SQL DDL
+docs/         ADRs, configuration reference, metrics schema
 ```
-
-Sites with no saved chips return `error=no_saved_chips`. Then `APPLY=1` if the holdout mix looks right.
-
-## What it writes
-
-- **Towers:** Gemini tower + cell at site confidence ≥ 0.85 auto-apply (imagery-only allowed). Claude can confirm weaker towers.
-- **Rooftops:** Nearmap obliques + dual-model agreement, or NAIP-only when site and cell confidence ≥ 0.95 with named gear, unhedged evidence, and an asset box. Otherwise holdout and dequeue (`LLM_Classified=false`, `LLM_Holdout=true`).
-- Unique FCC/TowerSource hit ≤ 25 m skips imagery and still updates coords + verified source.

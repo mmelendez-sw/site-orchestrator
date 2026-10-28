@@ -2,11 +2,10 @@
 
 A "view" is ``(label, PIL.Image)``. Labels carry the imagery source:
 ``NAIP top-down``, ``Nearmap top-down``, ``Nearmap oblique (North)``,
-``zoom crop`` / ``cell crop`` variants, and supplemental sources
-(``State orthoimagery top-down (...)``, ``Street-level photo (...)``). Street
-labels name compass directions, so every Nearmap check must rule them out
-first. Boxes are ``[ymin, xmin, ymax, xmax]``
-integers in 0-1000 normalized image space.
+``zoom crop`` / ``cell crop`` variants, and supplemental street-level
+photos (``Street-level photo (...)``). Street labels name compass
+directions, so every Nearmap check must rule them out first. Boxes are
+``[ymin, xmin, ymax, xmax]`` integers in 0-1000 normalized image space.
 """
 
 from __future__ import annotations
@@ -43,7 +42,6 @@ ASSET_BOX_MAX_SIDE = 500   # reject whole-roof / whole-scene boxes
 NAIP_VIEW_LABEL = "NAIP top-down"
 NEARMAP_VERT_LABEL = "Nearmap top-down"
 STREET_LEVEL_PREFIX = "street-level"
-STATE_ORTHO_MARK = "state orthoimagery"
 _DIRECTIONS = ("north", "east", "south", "west")
 
 # ------------------------------- view labels --------------------------------
@@ -80,19 +78,10 @@ def _street_views_only(views: list) -> list:
     return [(label, img) for label, img in views if is_street_level_label(label)]
 
 
-def is_state_ortho_label(label: Any) -> bool:
-    """True for a supplemental state/county orthoimagery top-down view."""
-    return STATE_ORTHO_MARK in str(label or "").lower()
-
-
-def is_supplemental_label(label: Any) -> bool:
-    return is_street_level_label(label) or is_state_ortho_label(label)
-
-
 def is_oblique_label(label: Any) -> bool:
-    """True for a Nearmap oblique label (never NAIP or supplemental)."""
+    """True for a Nearmap oblique label (never NAIP or street-level)."""
     view = str(label or "").strip().lower()
-    if not view or "naip" in view or is_supplemental_label(view):
+    if not view or "naip" in view or is_street_level_label(view):
         return False
     return "oblique" in view or any(d in view for d in _DIRECTIONS)
 
@@ -139,11 +128,7 @@ def pick_view_for_asset_box(
         if is_oblique_label(label):
             return label, img
     for label, img in views:
-        if (
-            is_top_down_label(label)
-            and "naip" not in str(label).lower()
-            and not is_state_ortho_label(label)
-        ):
+        if is_top_down_label(label) and "naip" not in str(label).lower():
             return label, img
     return None
 
@@ -167,8 +152,8 @@ def trim_views_for_model(
 ) -> list:
     """Keep one top-down + a few obliques, street views, crops; downscale for the API.
 
-    Top-down preference: Nearmap Vert, then state orthoimagery (3-15 cm), then
-    NAIP (60 cm). Street-level photos are capped at MODEL_MAX_STREET_VIEWS.
+    Top-down preference: Nearmap Vert, then NAIP (60 cm). Street-level photos
+    are capped at MODEL_MAX_STREET_VIEWS.
     """
     if not views:
         return views
@@ -190,12 +175,8 @@ def trim_views_for_model(
             top.append((label, img))
         else:
             other.append((label, img))
-    nearmap_vert = [
-        item for item in top
-        if "naip" not in str(item[0]).lower() and not is_state_ortho_label(item[0])
-    ]
-    ortho = [item for item in top if is_state_ortho_label(item[0])]
-    chosen_top = (nearmap_vert or ortho or top)[:1]
+    nearmap_vert = [item for item in top if "naip" not in str(item[0]).lower()]
+    chosen_top = (nearmap_vert or top)[:1]
     selected = (
         chosen_top
         + obliques[: max(0, max_obliques)]
