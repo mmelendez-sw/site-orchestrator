@@ -1,0 +1,178 @@
+"""Constants for FCC / TowerSource / NAIP enrichment."""
+
+from __future__ import annotations
+
+from classifier.prompts import CELL_GEAR_KIND_VALUES
+from envutil import env_float
+
+PROXIMITY_MAX_M = env_float("PROXIMITY_MAX_M", 500)
+
+# Hits within this of the SF pin (or geocoded address) are accepted without
+# uniqueness checks — same spirit as the old 25 m default.
+PROXIMITY_CONFIDENT_M = env_float("PROXIMITY_CONFIDENT_M", 25)
+
+# Pin is on the structure: skip imagery even when other FCC/TowerSource rows
+# sit on the same pad (collocation). 10–25 m clusters still need the 75 m gap.
+AUTO_SKIP_ON_STRUCTURE_M = env_float("AUTO_SKIP_ON_STRUCTURE_M", 5)
+
+# Extended-range (confident..max) hits must beat the runner-up by this gap, or
+# sit within ADDRESS_AFFINITY_M of the geocoded address, to avoid wrong neighbors.
+PROXIMITY_AMBIGUITY_GAP_M = env_float("PROXIMITY_AMBIGUITY_GAP_M", 60)
+PROXIMITY_ADDRESS_AFFINITY_M = env_float("PROXIMITY_ADDRESS_AFFINITY_M", 100)
+
+# Imagery asset-box snap radius from the SF/classify pin. Effective max is
+# MAX_ASSET_OFFSET_M + ASSET_OFFSET_LEEWAY_M. Beyond that: rooftops hold out;
+# imagery-only towers hold out (DB hits may still update). Independent of
+# PROXIMITY_MAX_M.
+MAX_ASSET_OFFSET_M = 75.0
+ASSET_OFFSET_LEEWAY_M = env_float("ASSET_OFFSET_LEEWAY_M", 25)
+
+# SF pin vs Census. ≥75 m is a far coerce (CSV flag). Rooftop host compare
+# starts earlier: a parking-lot pin still needs the roof.
+PIN_ADDRESS_MISMATCH_M = env_float("PIN_ADDRESS_MISMATCH_M", 75)
+ROOFTOP_HOST_OFFSET_M = env_float("ROOFTOP_HOST_OFFSET_M", 15)
+
+# Degrees buffer used for SQL bbox prefilter (~25–30 m at mid-latitudes).
+# Actual fetch buffer scales with PROXIMITY_MAX_M in mssql._buffer_deg_for_radius.
+BBOX_BUFFER_DEG = 0.0003
+
+FCC_TABLE = "dbo.FCCTowerData"
+TOWERSOURCE_TABLE = "dbo.TowerSourceASRTowers"
+
+SF_QUERY_FIELDS = (
+    "Id",
+    "Site_Latitude__c",
+    "Site_Longitude__c",
+    "Site_Street__c",
+    "Site_City__c",
+    "Site_State__c",
+    "Site_Zip_Code__c",
+    "Site_Type__c",
+    "Carrier_Leasing_Source__c",
+    "Metro_Classification__c",
+    "Stage__c",
+    "Owner__c",
+    "OwnerId",
+    "Verified_Site__c",
+    "Verified_Site_Source__c",
+    "LLM_Classified__c",
+    "LLM_Holdout__c",
+)
+
+DEFAULT_STAGE_FILTER = (
+    "Outreach - Verified",
+)
+
+# DB-only queue (no imagery). Override per run with STAGES or LEAD_STAGES.
+DB_ONLY_STAGE_FILTER = (
+    "New/Unreviewed",
+    "Enhanced/Unreviewed",
+    "Outreach",
+    "Outreach - Verified",
+    "Marketing",
+    "Unqualified"
+)
+
+# NAIP rooftop confirm: already Site_Type=Rooftop. Override with STAGES.
+CONFIRM_ROOFTOP_STAGE_FILTER = (
+    "New/Unreviewed",
+    "Enhanced/Unreviewed",
+    "Outreach",
+    "Outreach - Verified",
+    "Marketing",
+    "Working-Connected",
+    "Working - Connected",
+)
+
+# CONNECTX_AUDIT: open ConnectX rooftops still on a rep. Override with STAGES.
+CONNECTX_AUDIT_STAGE_FILTER = (
+    "New/Unreviewed",
+    "Enhanced/Unreviewed",
+    "Outreach",
+    "Outreach - Verified",
+)
+
+# Hard exclusion unless the caller explicitly lists the stage in STAGES.
+EXCLUDED_STAGE_FILTER = (
+    "Working-Connected",
+    "Working - Connected",
+    "Qualified (Converted)",
+)
+
+# Classifier source trust: an asset is expected at the pin.
+HIGH_INPUT_CONFIDENCE_STAGES = frozenset(
+    {
+        *DEFAULT_STAGE_FILTER,
+        "Working-Connected",
+        "Working - Connected",
+    }
+)
+
+DEFAULT_OWNER_FILTER = (
+    "Site Acquisition Team",
+    "Marketing Campaign",
+)
+
+MATCH_SOURCE_FCC = "FCC"
+MATCH_SOURCE_TOWERSOURCE = "TowerSource"
+MATCH_SOURCE_NONE = "none"
+
+VERIFIED_SITE_SOURCE_FCC = "FCC"
+VERIFIED_SITE_SOURCE_TOWERSOURCE = "TowerSource"
+VERIFIED_SITE_SOURCE_NAIP = "NAIP"
+VERIFIED_SITE_SOURCE_NEARMAP = "NearMap"
+
+BUCKET_POTENTIAL_UPDATE = "potential_update"
+BUCKET_ROOFTOP = "potential_rooftop"
+BUCKET_OTHER = "other_or_else"
+BUCKET_SKIP = "skip"
+# CONNECTX_AUDIT: Nearmap obliques show no telecom gear → unqualify + reassign.
+BUCKET_AUDIT_UNQUALIFY = "audit_unqualify"
+# CONNECTX_AUDIT + AUDIT_HOLDOUT_OWNER: unconfirmed sites → LLM_Holdout + reassign
+# (replaces the unqualify step).
+BUCKET_AUDIT_HOLDOUT = "audit_holdout"
+
+# General-pool owner for unqualified ConnectX audit sites (User, not a queue).
+SITE_ACQ_TEAM_OWNER_ID = "0053l00000G05h9AAB"
+AUDIT_UNQUALIFIED_STAGE = "Unqualified"
+AUDIT_UNQUALIFIED_REASON = "No Site/Decommissioned"
+
+CANDIDATE_CSV = "potential_sf_updates.csv"
+HOLDOUT_CSV = "holdout_rooftop_other.csv"
+DETAIL_CSV = "enrichment_detail.csv"
+APPLY_LOG_CSV = "sf_update_apply_log.csv"
+
+# Medium/high confidence required for automatic update candidacy (DB hits).
+MIN_UPDATE_CONFIDENCE = 0.6
+
+# Rooftop cell gear must clear this bar (explicit confidence required).
+MIN_ROOFTOP_CELL_CONFIDENCE = 0.75
+
+# Stricter bars when there is no FCC/TowerSource proximity hit.
+# 0.70 default; 0.65 when Gemini+Claude already agree on crop/localize.
+# 0.80 cell bar was dropping real towers.
+MIN_IMAGERY_ONLY_SITE_CONFIDENCE = env_float("MIN_IMAGERY_ONLY_SITE_CONFIDENCE", 0.70)
+MIN_IMAGERY_ONLY_SITE_CONFIDENCE_AGREE = env_float("MIN_IMAGERY_ONLY_SITE_CONFIDENCE_AGREE", 0.65)
+MIN_IMAGERY_ONLY_CELL_CONFIDENCE = env_float("MIN_IMAGERY_ONLY_CELL_CONFIDENCE", 0.80)
+
+# Skip dual-model for towers when Gemini site_confidence is at/above this.
+# Must match classifier.asset_classifier.GEMINI_SOLO_CELL_CONF default.
+GEMINI_TOWER_SKIP_CLAUDE_CONF = env_float("GEMINI_SOLO_CELL_CONF", 0.85)
+
+# Full Nearmap other/unclear lock (second pack / KPI). Keep above Gemini solo.
+NEARMAP_EMPTY_LOCK_CONF = env_float("NEARMAP_EMPTY_LOCK_CONF", 0.90)
+
+# NAIP rooftop auto-apply: both site and cell confidence must clear this, plus
+# a named telecom gear kind, unhedged evidence, and an asset box.
+ROOFTOP_CERTAIN_CONF = env_float("ROOFTOP_CERTAIN_CONF", 0.95)
+
+DISCERNIBLE_CELL_GEAR_KINDS = (
+    "sector_panel",
+    "facade_mount",
+    "microwave",
+    "rru",
+    "parapet_mast",
+)
+
+# Structured gear kinds the vision schema allows (single definition).
+CELL_GEAR_KINDS = CELL_GEAR_KIND_VALUES

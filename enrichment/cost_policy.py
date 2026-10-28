@@ -1,0 +1,201 @@
+"""Queue-level cost gates: unique DB skip-classify and nearby-pin reuse."""
+
+from __future__ import annotations
+
+import math
+import threading
+from collections.abc import Sequence
+from typing import Any
+
+from enrichment.coerce import to_float
+from enrichment.constants import (
+    AUTO_SKIP_ON_STRUCTURE_M,
+    NEARMAP_EMPTY_LOCK_CONF,
+    PROXIMITY_AMBIGUITY_GAP_M,
+    PROXIMITY_CONFIDENT_M,
+)
+from enrichment.geo import haversine_meters
+from enrichment.mssql import ProximityHit
+from envutil import env_flag, env_float
+
+PIN_CLUSTER_M = env_float("PIN_CLUSTER_M", 25)
+_CLUSTER_LOCK = threading.Lock()
+
+
+def _hit_pin_distance_m(hit: ProximityHit) -> float:
+    if hit.distance_to_pin_m is not None:
+        return float(hit.distance_to_pin_m)
+    return float(hit.distance_m)
+
+
+def auto_skip_classify_reason(
+    hit: ProximityHit | None,
+    *,
+    confident_m: float = PROXIMITY_CONFIDENT_M,
+    on_structure_m: float = AUTO_SKIP_ON_STRUCTURE_M,
+    ambiguity_gap_m: float = PROXIMITY_AMBIGUITY_GAP_M,
+    force: bool = False,
+) -> str | None:
+    """Operator label when imagery can be skipped, else None.
+
+    Unique ≤25 m still skips. A pin on the structure (≤5 m) also skips when
+    extra FCC/TowerSource rows share the pad — that is collocation, not a
+    wrong-neighbor choice. 10–25 m clusters still need the ambiguity gap.
+    """
+    if hit is None:
+        return None
+    if not force and not env_flag("AUTO_SKIP_CLASSIFY", True):
+        return None
+    dist = float(hit.distance_m)
+    if dist > float(confident_m):
+        return None
+    pin_dist = _hit_pin_distance_m(hit)
+    if pin_dist <= float(on_structure_m):
+        return f"DB hit on-structure ≤{float(on_structure_m):g} m"
+    n = hit.candidate_count
+    if n is None or n <= 1:
+        return f"unique DB hit ≤{float(confident_m):g} m"
+    gap = hit.runner_up_gap_m
+    if gap is not None and float(gap) >= float(ambiguity_gap_m):
+        return f"unique DB hit ≤{float(confident_m):g} m"
+    return None
+
+
+def find_cluster_match(
+    cache: Sequence[dict[str, Any]],
+    lat: float,
+    lon: float,
+    *,
+    max_m: float = PIN_CLUSTER_M,
+) -> dict[str, Any] | None:
+    """Return a prior imagery result within max_m, if any (thread-safe)."""
+    with _CLUSTER_LOCK:
+        entries = list(cache)
+    for entry in entries:
+        try:
+            elat = float(entry["lat"])
+            elon = float(entry["lon"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if haversine_meters(lat, lon, elat, elon) <= max_m:
+            classified = entry.get("classified")
+            if isinstance(classified, dict) and not classified.get("error"):
+                return entry
+    return None
+
+
+def remember_cluster_result(
+    cache: list[dict[str, Any]], lat: float, lon: float, classified: dict[str, Any]
+) -> None:
+    """Record an imagery result so a later pin within PIN_CLUSTER_M can reuse it."""
+    with _CLUSTER_LOCK:
+        cache.append({"lat": float(lat), "lon": float(lon), "classified": classified})
+
+
+def cluster_groups(
+    points: Sequence[tuple[float, float]], *, max_m: float = PIN_CLUSTER_M
+) -> list[list[int]]:
+    """Single-linkage groups of point indexes within ``max_m`` of each other.
+
+    Parallel classify runs each group in one worker, in queue order, so the
+    nearby-pin reuse above still sees earlier results. Groups keep the order
+    of their first member; indexes inside a group stay ascending.
+    """
+    parent = list(range(len(points)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    cell_deg = max(float(max_m), 1.0) / 111_320.0
+    grid: dict[tuple[int, int], list[int]] = {}
+    for index, (lat, lon) in enumerate(points):
+        cos_lat = max(0.2, abs(math.cos(math.radians(lat))))
+        cell = (int(lat // cell_deg), int(lon * cos_lat // cell_deg))
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                for other in grid.get((cell[0] + dy, cell[1] + dx), ()):
+                    olat, olon = points[other]
+                    if haversine_meters(lat, lon, olat, olon) <= max_m:
+                        parent[find(index)] = find(other)
+        grid.setdefault(cell, []).append(index)
+    groups: dict[int, list[int]] = {}
+    for index in range(len(points)):
+        groups.setdefault(find(index), []).append(index)
+    return sorted(groups.values(), key=lambda members: members[0])
+
+
+def nearmap_empty_is_locked(
+    site_type: Any,
+    site_confidence: Any,
+    nearmap_tier: Any,
+    *,
+    lock_conf: float = NEARMAP_EMPTY_LOCK_CONF,
+) -> bool:
+    """True when full Nearmap+obliques already locked an empty claimed site."""
+    if str(nearmap_tier or "").strip().lower() != "full":
+        return False
+    if str(site_type or "").strip().lower() not in {"other", "unclear"}:
+        return False
+    conf = to_float(site_confidence)
+    return conf is not None and conf >= float(lock_conf)
+
+
+def nearmap_empty_without_cell(
+    site_type: Any,
+    nearmap_tier: Any,
+    cell_equipment: Any,
+) -> bool:
+    """Full Nearmap other/unclear with no confirmed cell gear.
+
+    Claude and a second Nearmap pack do not recover these — skip both.
+    ``cell_equipment`` False or null both count as unconfirmed.
+    """
+    if str(nearmap_tier or "").strip().lower() != "full":
+        return False
+    if str(site_type or "").strip().lower() not in {"other", "unclear"}:
+        return False
+    return cell_equipment is not True
+
+
+def should_spend_second_nearmap(
+    *,
+    unused_point: tuple[float, float] | None,
+    skip_paid_imagery: bool,
+    has_nearmap_key: bool,
+    site_type: Any,
+    site_confidence: Any,
+    nearmap_tier: Any,
+    rooftop_unlocked: bool,
+    cell_equipment: Any = None,
+    pin_address_mismatch: bool = False,
+) -> bool:
+    """One extra Nearmap pack at the unused pin/Census point.
+
+    Skip when the first full+oblique pack is already empty with no cell
+    (other/unclear and cell is not True), including the 0.90 lock — unless
+    the SF pin and Census disagree, in which case the first pack may be
+    the wrong building.
+    Still spend on no-coverage probes, unlocked rooftops, and a first pack
+    that still looks like a positive site_type.
+    """
+    if unused_point is None or skip_paid_imagery or not has_nearmap_key:
+        return False
+    tier = str(nearmap_tier or "").strip().lower()
+    if tier not in {"full", "vert_only", "no_coverage"}:
+        return False
+    if tier == "no_coverage":
+        return True
+    if rooftop_unlocked:
+        return True
+    if pin_address_mismatch:
+        return True
+    if str(site_type or "").strip().lower() not in {"other", "unclear"}:
+        return False
+    if nearmap_empty_is_locked(site_type, site_confidence, tier):
+        return False
+    if nearmap_empty_without_cell(site_type, tier, cell_equipment):
+        return False
+    return True

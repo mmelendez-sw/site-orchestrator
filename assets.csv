@@ -1,8 +1,0 @@
-id,lat,lon,label,input_confidence
-asset_001,40.49594,-74.4445,JP,high
-asset_002,40.7963,-74.4299,JP,high
-asset_003,40.58682,-104.732,W/C,medium
-asset_004,48.22936,-116.526,W/C,medium
-asset_005,44.09285,-121.207,W/C,medium
-asset_006,29.5592822,-95.59304818,W/C,medium
-asset_007,44.775,-117.83,stealth,high

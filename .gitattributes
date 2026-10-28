@@ -1,0 +1,5 @@
+# Store text with LF in the repo; Windows checkouts may still use CRLF.
+* text=auto eol=lf
+*.ps1 text eol=crlf
+*.png binary
+*.jpg binary

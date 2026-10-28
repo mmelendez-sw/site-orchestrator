@@ -1,0 +1,44 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+# CI only reads the repo; do not hand the job a write-scoped token.
+permissions:
+  contents: read
+
+# A newer push to the same branch / PR supersedes an in-flight run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      # Never call paid APIs or write metrics to Azure SQL from CI.
+      METRICS_SQL: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements*.txt
+      - name: Install
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends unixodbc
+          pip install -r requirements-dev.txt
+      - name: Lint
+        run: python -m ruff check .
+      - name: Configuration reference is current
+        run: python scripts/gen_config_reference.py --check
+      - name: Unit tests (offline)
+        env:
+          # Keep imagery / geocode caches out of the checkout. The runner
+          # context is only available at step level, not in job-level env.
+          SITE_ORCHESTRATOR_DATA: ${{ runner.temp }}/site-orchestrator-data
+        run: python -m pytest -q

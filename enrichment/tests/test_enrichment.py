@@ -1,0 +1,2958 @@
+"""Unit tests for enrichment proximity + bucketing (no network / paid APIs)."""
+
+from __future__ import annotations
+
+import json
+import os
+import tempfile
+import unittest
+from pathlib import Path
+
+from enrichment.bucketing import bucket_classification, naip_rooftop_confirm_decision
+from enrichment.constants import (
+    BUCKET_OTHER,
+    BUCKET_POTENTIAL_UPDATE,
+    BUCKET_ROOFTOP,
+    MATCH_SOURCE_FCC,
+    MATCH_SOURCE_NONE,
+    MATCH_SOURCE_TOWERSOURCE,
+)
+from enrichment.mssql import (
+    fcc_coordinates,
+    find_proximity_hit,
+)
+from enrichment.naip_classify import (
+    ROOFTOP_PRESENCE_PROMPT,
+    classification_prompt_for_run,
+)
+from enrichment.sf_ops import (
+    build_blank_site_type_query,
+    build_sites_by_ids_query,
+    build_update_payload,
+    parse_carrier_like,
+    parse_metro_classification,
+    parse_site_type,
+)
+
+
+def _rooftop_ok(**overrides):
+    base = {
+        "site_type": "rooftop",
+        "site_confidence": 0.9,
+        "cell_equipment": True,
+        "cell_equipment_confidence": 0.9,
+        "cell_equipment_evidence": "North oblique shows sector panel antennas",
+        "cell_gear_kind": "sector_panel",
+        "cell_models_agree": True,
+        "dual_model_resolution": "agree_crop",
+        "escalation_model": "claude",
+        "asset_lat": 43.0005,
+        "asset_lon": -89.0005,
+        "asset_offset_m": 20.0,
+        "asset_box_2d": "[220, 310, 360, 420]",
+        "asset_view": "Nearmap oblique (North)",
+        "nearmap_tier": "full",
+        "nearmap_views": "Vert,North,East,South,West",
+    }
+    base.update(overrides)
+    return base
+
+
+class FakeCursor:
+    def __init__(self, fcc_rows=None, ts_rows=None):
+        self.fcc_rows = fcc_rows or []
+        self.ts_rows = ts_rows or []
+        self.description = []
+        self._pending = []
+
+    def execute(self, sql, *params):
+        text = " ".join(sql.split()).lower()
+        if "fcctowerdata" in text:
+            self.description = [
+                ("ID",),
+                ("ASR_Number",),
+                ("Latitude_Decimal",),
+                ("Longitude_Decimal",),
+                ("Latitude_Calculated",),
+                ("Longitude_Calculated",),
+                ("Registration_Type",),
+                ("Record_Type",),
+                ("Entity_Name",),
+            ]
+            self._pending = [
+                (
+                    r.get("ID"),
+                    r.get("ASR_Number"),
+                    r.get("Latitude_Decimal"),
+                    r.get("Longitude_Decimal"),
+                    r.get("Latitude_Calculated"),
+                    r.get("Longitude_Calculated"),
+                    r.get("Registration_Type"),
+                    r.get("Record_Type"),
+                    r.get("Entity_Name"),
+                )
+                for r in self.fcc_rows
+            ]
+        else:
+            self.description = [
+                ("operator_site_identifier",),
+                ("asset_name",),
+                ("asset_type",),
+                ("asset_category",),
+                ("latitude",),
+                ("longitude",),
+                ("fcc_asr_number",),
+                ("street1",),
+                ("city",),
+                ("state",),
+                ("postal_code",),
+            ]
+            self._pending = [
+                (
+                    r.get("operator_site_identifier"),
+                    r.get("asset_name"),
+                    r.get("asset_type"),
+                    r.get("asset_category"),
+                    r.get("latitude"),
+                    r.get("longitude"),
+                    r.get("fcc_asr_number"),
+                    r.get("street1"),
+                    r.get("city"),
+                    r.get("state"),
+                    r.get("postal_code"),
+                )
+                for r in self.ts_rows
+            ]
+
+    def fetchall(self):
+        return list(self._pending)
+
+
+class MssqlHelperTests(unittest.TestCase):
+    def test_fcc_prefers_decimal_over_calculated(self):
+        coords = fcc_coordinates(
+            {
+                "Latitude_Decimal": 43.1,
+                "Longitude_Decimal": -89.2,
+                "Latitude_Calculated": 40.0,
+                "Longitude_Calculated": -80.0,
+            }
+        )
+        self.assertEqual(coords, (43.1, -89.2))
+
+    def test_fcc_falls_back_to_calculated(self):
+        coords = fcc_coordinates(
+            {
+                "Latitude_Decimal": None,
+                "Longitude_Decimal": None,
+                "Latitude_Calculated": 41.5,
+                "Longitude_Calculated": -81.0,
+            }
+        )
+        self.assertEqual(coords, (41.5, -81.0))
+
+    def test_find_proximity_hit_returns_closest_within_radius(self):
+        cursor = FakeCursor(
+            fcc_rows=[
+                {
+                    "ID": 1,
+                    "ASR_Number": "A",
+                    "Latitude_Decimal": 43.001,
+                    "Longitude_Decimal": -89.0,
+                },
+                {
+                    "ID": 2,
+                    "ASR_Number": "B",
+                    "Latitude_Decimal": 43.0001,
+                    "Longitude_Decimal": -89.0,
+                },
+            ]
+        )
+        hit = find_proximity_hit(cursor, 43.0, -89.0, max_m=200)
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit.asr_number, "B")
+        self.assertEqual(hit.selection_reason, "confident_pin")
+
+    def test_extended_unique_nearest_accepted(self):
+        """Sunset-style: lone tower ~350 m away is OK; cluster is not."""
+        from enrichment.mssql import ProximityHit, select_proximity_hit
+
+        lone = select_proximity_hit(
+            [
+                ProximityHit(
+                    source=MATCH_SOURCE_TOWERSOURCE,
+                    distance_m=386.0,
+                    latitude=36.06019,
+                    longitude=-115.04861,
+                    record_id="880978",
+                    distance_to_pin_m=386.0,
+                )
+            ],
+            confident_m=25,
+            ambiguity_gap_m=75,
+        )
+        self.assertIsNotNone(lone)
+        self.assertEqual(lone.selection_reason, "unique_nearest_extended")
+
+        ambiguous = select_proximity_hit(
+            [
+                ProximityHit(
+                    source=MATCH_SOURCE_TOWERSOURCE,
+                    distance_m=200.0,
+                    latitude=36.06,
+                    longitude=-115.05,
+                    record_id="1",
+                    distance_to_pin_m=200.0,
+                ),
+                ProximityHit(
+                    source=MATCH_SOURCE_FCC,
+                    distance_m=220.0,
+                    latitude=36.061,
+                    longitude=-115.05,
+                    record_id="2",
+                    distance_to_pin_m=220.0,
+                ),
+            ],
+            confident_m=25,
+            ambiguity_gap_m=75,
+        )
+        self.assertIsNone(ambiguous)
+
+    def test_address_affinity_prefers_tower_near_geocode(self):
+        from enrichment.mssql import ProximityHit, select_proximity_hit
+
+        hit = select_proximity_hit(
+            [
+                ProximityHit(
+                    source=MATCH_SOURCE_TOWERSOURCE,
+                    distance_m=40.0,
+                    latitude=36.06,
+                    longitude=-115.05,
+                    record_id="near_addr",
+                    distance_to_pin_m=120.0,
+                    distance_to_address_m=40.0,
+                ),
+                ProximityHit(
+                    source=MATCH_SOURCE_FCC,
+                    distance_m=90.0,
+                    latitude=36.061,
+                    longitude=-115.051,
+                    record_id="near_pin",
+                    distance_to_pin_m=90.0,
+                    distance_to_address_m=150.0,
+                ),
+            ],
+            confident_m=25,
+            ambiguity_gap_m=75,
+            address_affinity_m=80,
+        )
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit.record_id, "near_addr")
+        self.assertEqual(hit.selection_reason, "address_affinity")
+
+
+class BucketTests(unittest.TestCase):
+    def test_rooftop_without_cell_equipment_holdout(self):
+        decision = bucket_classification(
+            match_source=MATCH_SOURCE_FCC,
+            classified={
+                "site_type": "rooftop",
+                "site_confidence": 0.9,
+                "cell_equipment": False,
+                "nearmap_tier": "full",
+                "nearmap_views": "Vert,North,East,South,West",
+            },
+            db_lat=43.0,
+            db_lng=-89.0,
+            sf_lat=43.0,
+            sf_lng=-89.0,
+        )
+        self.assertEqual(decision["bucket"], BUCKET_ROOFTOP)
+        self.assertEqual(decision["holdout_reason"], "rooftop_no_cell_equipment")
+
+    def test_rooftop_with_cell_equipment_is_candidate(self):
+        decision = bucket_classification(
+            match_source=MATCH_SOURCE_FCC,
+            classified=_rooftop_ok(),
+            db_lat=43.01,
+            db_lng=-89.01,
+            sf_lat=43.0,
+            sf_lng=-89.0,
+        )
+        self.assertEqual(decision["bucket"], BUCKET_POTENTIAL_UPDATE)
+        self.assertEqual(decision["update_site_type"], "Rooftop")
+        self.assertEqual(decision["update_verified_site_source"], "FCC")
+
+    def test_rooftop_vert_only_is_held_out(self):
+        decision = bucket_classification(
+            match_source=MATCH_SOURCE_NONE,
+            classified=_rooftop_ok(
+                nearmap_tier="vert_only",
+                nearmap_views="Vert",
+                site_confidence=0.9,
+                cell_equipment_confidence=0.9,
+            ),
+            db_lat=None,
+            db_lng=None,
+            sf_lat=43.0,
+            sf_lng=-89.0,
+        )
+        self.assertEqual(decision["bucket"], BUCKET_ROOFTOP)
+        self.assertEqual(decision["holdout_reason"], "rooftop_needs_nearmap_obliques")
+
+    def test_rooftop_needs_dual_model(self):
+        decision = bucket_classification(
+            match_source=MATCH_SOURCE_NONE,
+            classified=_rooftop_ok(cell_models_agree=False, escalation_model=""),
+            db_lat=None,
+            db_lng=None,
+            sf_lat=43.0,
+            sf_lng=-89.0,
+        )
+        self.assertEqual(decision["holdout_reason"], "rooftop_needs_dual_model_cell")
+
+    def test_rooftop_needs_asset_box(self):
+        decision = bucket_classification(
+            match_source=MATCH_SOURCE_NONE,
+            classified=_rooftop_ok(asset_lat="", asset_lon="", asset_box_2d=""),
+            db_lat=None,
+            db_lng=None,
+            sf_lat=43.0,
+            sf_lng=-89.0,
+        )
+        self.assertEqual(decision["holdout_reason"], "rooftop_needs_asset_box")
+
+    def test_rooftop_nearmap_box_pin_is_candidate(self):
+        decision = bucket_classification(
+            match_source=MATCH_SOURCE_NONE,
+            classified=_rooftop_ok(
+                asset_lat="",
+                asset_lon="",
+                asset_box_2d="[220, 310, 360, 420]",
+                asset_view="Nearmap oblique (North)",
+            ),
+            db_lat=None,
+            db_lng=None,
+            sf_lat=43.0,
+            sf_lng=-89.0,
+        )
+        self.assertEqual(decision["bucket"], BUCKET_POTENTIAL_UPDATE)
+        self.assertEqual(decision["update_coord_source"], "nearmap_asset_box_pin")
+
+    def test_rooftop_oblique_geocode_updates_coords(self):
+        decision = bucket_classification(
+            match_source=MATCH_SOURCE_NONE,
+            classified=_rooftop_ok(
+                asset_lat=43.001,
+                asset_lon=-89.002,
+                asset_coord_source="nearmap_oblique_box",
+                asset_offset_m=35.0,
+                asset_box_2d="[220, 310, 360, 420]",
+                asset_view="Nearmap oblique (North)",
+            ),
+            db_lat=None,
+            db_lng=None,
+            sf_lat=43.0,
+            sf_lng=-89.0,
+        )
+        self.assertEqual(decision["bucket"], BUCKET_POTENTIAL_UPDATE)
+        self.assertEqual(decision["update_lat"], 43.001)
+        self.assertEqual(decision["update_lng"], -89.002)
+        self.assertEqual(decision["update_coord_source"], "nearmap_oblique_box")
+
+    def test_rooftop_naip_box_held_out(self):
+        decision = bucket_classification(
+            match_source=MATCH_SOURCE_NONE,
+            classified=_rooftop_ok(
+                asset_view="NAIP top-down",
+                cell_equipment_evidence="South oblique shows sector panels",
+            ),
+            db_lat=None,
+            db_lng=None,
+            sf_lat=43.0,
+            sf_lng=-89.0,
+        )
+        self.assertEqual(decision["holdout_reason"], "rooftop_needs_oblique_asset_box")
+
+    def test_rooftop_dual_agree_allows_vert_box_and_078_conf(self):
+        """Southeast Financial-style: crop agree + Vert box + conf 0.78."""
+        decision = bucket_classification(
+            match_source=MATCH_SOURCE_NONE,
+            classified=_rooftop_ok(
+                cell_equipment_confidence=0.78,
+                dual_model_resolution="agree_crop",
+                cell_models_agree=True,
+                asset_view="Nearmap top-down",
+                asset_box_2d="[476, 526, 632, 589]",
+                asset_lat=25.7722,
+                asset_lon=-80.1876,
+                asset_offset_m=7.9,
+                asset_coord_source="nearmap_vert_box",
+                cell_equipment_evidence=(
+                    "Nearmap top-down shows sector panels and microwave dishes "
+                    "on a rooftop telecom frame"
+                ),
+            ),
+            db_lat=None,
+            db_lng=None,
+            sf_lat=25.77225,
+            sf_lng=-80.18767,
+        )
+        self.assertEqual(decision["bucket"], BUCKET_POTENTIAL_UPDATE)
+        self.assertEqual(decision["update_site_type"], "Rooftop")
+
+    def test_imagery_only_bare_agree_held_out(self):
+        decision = bucket_classification(
+            match_source=MATCH_SOURCE_NONE,
+            classified=_rooftop_ok(dual_model_resolution="agree"),
+            db_lat=None,
+            db_lng=None,
+            sf_lat=43.0,
+            sf_lng=-89.0,
+        )
+        self.assertEqual(
+            decision["holdout_reason"],
+            "imagery_only_needs_crop_or_localize_agree",
+        )
+
+    def test_db_hit_bare_agree_uses_db_coords(self):
+        decision = bucket_classification(
+            match_source=MATCH_SOURCE_FCC,
+            classified=_rooftop_ok(dual_model_resolution="agree"),
+            db_lat=43.01,
+            db_lng=-89.01,
+            sf_lat=43.0,
+            sf_lng=-89.0,
+        )
+        self.assertEqual(decision["bucket"], BUCKET_POTENTIAL_UPDATE)
+        self.assertTrue(str(decision["update_coord_source"]).startswith("db:"))
+        self.assertEqual(decision["update_lat"], 43.01)
+
+    def test_rooftop_gemini_strong_solo_is_held_out_for_sf(self):
+        """Auto-apply airtight: Gemini solo skip is not enough for SF write."""
+        decision = bucket_classification(
+            match_source=MATCH_SOURCE_NONE,
+            classified=_rooftop_ok(
+                cell_equipment_confidence=0.92,
+                dual_model_resolution="gemini_strong_solo",
+                cell_models_agree=True,
+                escalation_model="gemini_strong_solo",
+                asset_view="Nearmap oblique (North)",
+                asset_box_2d="[220, 310, 360, 420]",
+            ),
+            db_lat=None,
+            db_lng=None,
+            sf_lat=43.0,
+            sf_lng=-89.0,
+        )
+        self.assertEqual(decision["holdout_reason"], "rooftop_needs_dual_model_cell")
+
+    def test_rooftop_soft_keep_is_held_out_for_sf(self):
+        """Auto-apply airtight: soft-keep Gemini never unlocks SF writes."""
+        decision = bucket_classification(
+            match_source=MATCH_SOURCE_NONE,
+            classified=_rooftop_ok(
+                cell_equipment_confidence=0.9,
+                dual_model_resolution="soft_keep_gemini",
+                cell_models_agree=True,
+                asset_view="Nearmap oblique (North)",
+                asset_box_2d="[220, 310, 360, 420]",
+                cell_equipment_evidence="Gemini claimed sector panels; Claude veto soft-kept",
+            ),
+            db_lat=None,
+            db_lng=None,
+            sf_lat=43.0,
+            sf_lng=-89.0,
+        )
+        self.assertEqual(decision["holdout_reason"], "rooftop_needs_dual_model_cell")
+
+    def test_rooftop_soft_keep_does_not_relax_vert_box(self):
+        decision = bucket_classification(
+            match_source=MATCH_SOURCE_NONE,
+            classified=_rooftop_ok(
+                cell_equipment_confidence=0.9,
+                dual_model_resolution="soft_keep_gemini",
+                cell_models_agree=True,
+                asset_view="Nearmap top-down",
+                asset_box_2d="[476, 526, 632, 589]",
+                cell_equipment_evidence="Gemini claimed sector panels on Vert",
+            ),
+            db_lat=None,
+            db_lng=None,
+            sf_lat=43.0,
+            sf_lng=-89.0,
+        )
+        # Soft-keep fails hard-agree before Vert-box localization is considered.
+        self.assertEqual(decision["holdout_reason"], "rooftop_needs_dual_model_cell")
+
+    def test_rooftop_disagree_stays_held_out(self):
+        decision = bucket_classification(
+            match_source=MATCH_SOURCE_NONE,
+            classified=_rooftop_ok(
+                cell_models_agree=False,
+                dual_model_resolution="claude_veto",
+                claude_cell_equipment=False,
+            ),
+            db_lat=None,
+            db_lng=None,
+            sf_lat=43.0,
+            sf_lng=-89.0,
+        )
+        self.assertEqual(decision["holdout_reason"], "rooftop_needs_dual_model_cell")
+
+
+    def test_rooftop_view_evidence_mismatch_held_out(self):
+        decision = bucket_classification(
+            match_source=MATCH_SOURCE_NONE,
+            classified=_rooftop_ok(
+                asset_view="Nearmap oblique (North)",
+                cell_equipment_evidence="South oblique shows sector panel antennas",
+            ),
+            db_lat=None,
+            db_lng=None,
+            sf_lat=43.0,
+            sf_lng=-89.0,
+        )
+        self.assertEqual(decision["holdout_reason"], "rooftop_view_evidence_mismatch")
+
+    def test_rooftop_unclear_gear_with_cues_ok(self):
+        decision = bucket_classification(
+            match_source=MATCH_SOURCE_NONE,
+            classified=_rooftop_ok(cell_gear_kind="unclear"),
+            db_lat=None,
+            db_lng=None,
+            sf_lat=43.0,
+            sf_lng=-89.0,
+        )
+        self.assertEqual(decision["bucket"], BUCKET_POTENTIAL_UPDATE)
+
+    def test_rooftop_naip_uncertain_is_held_out(self):
+        decision = bucket_classification(
+            match_source=MATCH_SOURCE_NONE,
+            classified=_rooftop_ok(nearmap_tier="naip_only", nearmap_views=""),
+            db_lat=None,
+            db_lng=None,
+            sf_lat=43.0,
+            sf_lng=-89.0,
+        )
+        self.assertEqual(decision["holdout_reason"], "rooftop_not_certain_on_naip")
+
+    def test_rooftop_naip_certain_is_ready(self):
+        decision = bucket_classification(
+            match_source=MATCH_SOURCE_NONE,
+            classified=_rooftop_ok(
+                site_confidence=0.97,
+                cell_equipment_confidence=0.97,
+                nearmap_tier="naip_only",
+                nearmap_views="",
+                asset_view="NAIP top-down",
+                dual_model_resolution="",
+                escalation_model="",
+                cell_models_agree=False,
+                cell_equipment_evidence="NAIP top-down shows sector panel antennas on a rooftop frame",
+            ),
+            db_lat=None,
+            db_lng=None,
+            sf_lat=43.0,
+            sf_lng=-89.0,
+        )
+        self.assertEqual(decision["bucket"], BUCKET_POTENTIAL_UPDATE)
+        self.assertEqual(decision["update_site_type"], "Rooftop")
+        self.assertEqual(decision["update_verified_site_source"], "NAIP")
+
+    def test_rooftop_naip_hedged_evidence_is_held_out(self):
+        decision = bucket_classification(
+            match_source=MATCH_SOURCE_NONE,
+            classified=_rooftop_ok(
+                site_confidence=0.97,
+                cell_equipment_confidence=0.97,
+                nearmap_tier="naip_only",
+                nearmap_views="",
+                asset_view="NAIP top-down",
+                cell_equipment_evidence="Roof objects likely include sector panels",
+            ),
+            db_lat=None,
+            db_lng=None,
+            sf_lat=43.0,
+            sf_lng=-89.0,
+        )
+        self.assertEqual(decision["holdout_reason"], "rooftop_not_certain_on_naip")
+
+    def test_rooftop_naip_unclear_gear_is_held_out(self):
+        decision = bucket_classification(
+            match_source=MATCH_SOURCE_NONE,
+            classified=_rooftop_ok(
+                site_confidence=0.97,
+                cell_equipment_confidence=0.97,
+                cell_gear_kind="unclear",
+                nearmap_tier="naip_only",
+                nearmap_views="",
+                asset_view="NAIP top-down",
+            ),
+            db_lat=None,
+            db_lng=None,
+            sf_lat=43.0,
+            sf_lng=-89.0,
+        )
+        self.assertEqual(decision["holdout_reason"], "rooftop_not_certain_on_naip")
+
+    def test_imagery_only_naip_tower_is_ready(self):
+        decision = bucket_classification(
+            match_source=MATCH_SOURCE_NONE,
+            classified={
+                "site_type": "tower",
+                "tower_subtype": "monopole",
+                "site_confidence": 0.9,
+                "cell_equipment": True,
+                "nearmap_tier": "naip_only",
+            },
+            db_lat=None,
+            db_lng=None,
+            sf_lat=43.0,
+            sf_lng=-89.0,
+        )
+        self.assertEqual(decision["bucket"], BUCKET_POTENTIAL_UPDATE)
+
+    def test_db_tower_naip_gemini_solo_is_ready(self):
+        """DB-hit Gemini >= 0.9 may write from NAIP without Nearmap."""
+        from enrichment.tests.golden_cases import _tower
+
+        decision = bucket_classification(
+            match_source=MATCH_SOURCE_FCC,
+            classified=_tower(
+                dual_model_resolution="gemini_strong_solo",
+                escalation_model="gemini_strong_solo",
+                nearmap_tier="naip_only",
+                nearmap_views="",
+                asset_view="NAIP top-down",
+            ),
+            db_lat=36.0256,
+            db_lng=-115.0853,
+            sf_lat=36.0255,
+            sf_lng=-115.0852,
+        )
+        self.assertEqual(decision["bucket"], BUCKET_POTENTIAL_UPDATE)
+
+    def test_db_tower_naip_without_gemini_lock_still_forbidden(self):
+        from enrichment.tests.golden_cases import _tower
+
+        decision = bucket_classification(
+            match_source=MATCH_SOURCE_FCC,
+            classified=_tower(
+                dual_model_resolution="agree_crop",
+                escalation_model="claude",
+                nearmap_tier="naip_only",
+                nearmap_views="",
+            ),
+            db_lat=36.0256,
+            db_lng=-115.0853,
+            sf_lat=36.0255,
+            sf_lng=-115.0852,
+        )
+        self.assertEqual(decision["holdout_reason"], "tower_naip_only_forbidden")
+
+    def test_db_tower_vert_gemini_solo_is_ready(self):
+        """DB-hit Gemini >= 0.9 may write from Vert without obliques."""
+        from enrichment.tests.golden_cases import _tower
+
+        decision = bucket_classification(
+            match_source=MATCH_SOURCE_FCC,
+            classified=_tower(
+                dual_model_resolution="gemini_strong_solo",
+                escalation_model="gemini_strong_solo",
+                nearmap_tier="vert_only",
+                nearmap_views="Vert",
+                asset_view="Nearmap top-down",
+            ),
+            db_lat=36.0256,
+            db_lng=-115.0853,
+            sf_lat=36.0255,
+            sf_lng=-115.0852,
+        )
+        self.assertEqual(decision["bucket"], BUCKET_POTENTIAL_UPDATE)
+
+    def test_imagery_only_tower_vert_gemini_solo_is_ready(self):
+        from enrichment.tests.golden_cases import _tower
+
+        decision = bucket_classification(
+            match_source=MATCH_SOURCE_NONE,
+            classified=_tower(
+                dual_model_resolution="gemini_strong_solo",
+                escalation_model="gemini_strong_solo",
+                nearmap_tier="vert_only",
+                nearmap_views="Vert",
+                asset_view="Nearmap top-down",
+            ),
+            db_lat=None,
+            db_lng=None,
+            sf_lat=36.0255,
+            sf_lng=-115.0852,
+        )
+        self.assertEqual(decision["bucket"], BUCKET_POTENTIAL_UPDATE)
+
+    def test_imagery_only_tower_vert_only_is_ready(self):
+        """Imagery-only Gemini tower at >= 0.9 may write without Nearmap obliques."""
+        decision = bucket_classification(
+            match_source=MATCH_SOURCE_NONE,
+            classified={
+                "site_type": "tower",
+                "tower_subtype": "monopole",
+                "site_confidence": 0.9,
+                "cell_equipment": True,
+                "cell_equipment_confidence": 0.8,
+                "cell_equipment_evidence": "Nearmap top-down shows triangular platform",
+                "nearmap_tier": "vert_only",
+                "nearmap_views": "Vert",
+                "asset_box_2d": "[188, 151, 584, 442]",
+                "asset_view": "Nearmap top-down",
+                "cell_models_agree": False,
+            },
+            db_lat=None,
+            db_lng=None,
+            sf_lat=36.0255,
+            sf_lng=-115.0852,
+        )
+        self.assertEqual(decision["bucket"], BUCKET_POTENTIAL_UPDATE)
+
+    def test_imagery_only_tower_below_gemini_lock_needs_dual_model(self):
+        decision = bucket_classification(
+            match_source=MATCH_SOURCE_NONE,
+            classified={
+                "site_type": "tower",
+                "tower_subtype": "monopole",
+                "site_confidence": 0.84,
+                "cell_equipment": True,
+                "cell_equipment_confidence": 0.9,
+                "cell_equipment_evidence": "North oblique shows sector panels on monopole",
+                "nearmap_tier": "full",
+                "nearmap_views": "Vert,North,East,South,West",
+                "asset_box_2d": "[220, 310, 360, 420]",
+                "asset_view": "Nearmap oblique (North)",
+                "cell_models_agree": False,
+                "escalation_model": "",
+            },
+            db_lat=None,
+            db_lng=None,
+            sf_lat=36.0255,
+            sf_lng=-115.0852,
+        )
+        self.assertEqual(decision["holdout_reason"], "tower_needs_dual_model_cell")
+
+    def test_claimed_site_keep_gemini_stealth_writes(self):
+        decision = bucket_classification(
+            match_source=MATCH_SOURCE_NONE,
+            classified={
+                "site_type": "tower",
+                "tower_subtype": "stealth",
+                "site_confidence": 0.8,
+                "cell_equipment": True,
+                "cell_equipment_confidence": 0.85,
+                "cell_equipment_evidence": (
+                    "Canister shroud at the mast top. | claimed-site keep Gemini"
+                ),
+                "site_evidence": (
+                    "A slim flagpole-style tower with a canister shroud "
+                    "in the vacant lot."
+                ),
+                "nearmap_tier": "full",
+                "nearmap_views": "Vert,North,East",
+                "cell_models_agree": False,
+                "dual_model_resolution": "claimed_site_keep_gemini",
+                "escalation_model": "claude",
+            },
+            db_lat=None,
+            db_lng=None,
+            sf_lat=33.974293,
+            sf_lng=-118.311989,
+        )
+        self.assertEqual(decision["bucket"], BUCKET_POTENTIAL_UPDATE)
+        self.assertEqual(decision["update_site_type"], "Stealth")
+
+    def test_tower_gemini_high_conf_solo_is_ready(self):
+        """Gemini tower at >= GEMINI_SOLO skips Claude and can write (DB or imagery)."""
+        from enrichment.tests.golden_cases import _tower
+
+        classified = _tower(
+            dual_model_resolution="gemini_strong_solo",
+            escalation_model="gemini_strong_solo",
+        )
+        db = bucket_classification(
+            match_source=MATCH_SOURCE_FCC,
+            classified=classified,
+            db_lat=36.0256,
+            db_lng=-115.0853,
+            sf_lat=36.0255,
+            sf_lng=-115.0852,
+        )
+        self.assertEqual(db["bucket"], BUCKET_POTENTIAL_UPDATE)
+        imagery = bucket_classification(
+            match_source=MATCH_SOURCE_NONE,
+            classified=classified,
+            db_lat=None,
+            db_lng=None,
+            sf_lat=36.0255,
+            sf_lng=-115.0852,
+        )
+        self.assertEqual(imagery["bucket"], BUCKET_POTENTIAL_UPDATE)
+
+    def test_tower_gemini_solo_below_high_conf_held_out(self):
+        from enrichment.tests.golden_cases import _tower
+
+        decision = bucket_classification(
+            match_source=MATCH_SOURCE_FCC,
+            classified=_tower(
+                site_confidence=0.84,
+                dual_model_resolution="gemini_strong_solo",
+                escalation_model="gemini_strong_solo",
+            ),
+            db_lat=36.0256,
+            db_lng=-115.0853,
+            sf_lat=36.0255,
+            sf_lng=-115.0852,
+        )
+        self.assertEqual(decision["holdout_reason"], "tower_needs_dual_model_cell")
+
+    def test_tower_without_cell_equipment_is_held_out(self):
+        decision = bucket_classification(
+            match_source=MATCH_SOURCE_NONE,
+            classified={
+                "site_type": "tower",
+                "tower_subtype": "monopole",
+                "site_confidence": 1.0,
+                "cell_equipment": False,
+                "nearmap_tier": "full",
+                "nearmap_views": "Vert,North,East,South,West",
+            },
+            db_lat=None,
+            db_lng=None,
+            sf_lat=43.0,
+            sf_lng=-89.0,
+        )
+        self.assertEqual(decision["holdout_reason"], "tower_no_cell_equipment")
+
+    def test_tower_db_hit_is_candidate(self):
+        decision = bucket_classification(
+            match_source=MATCH_SOURCE_FCC,
+            classified={
+                "site_type": "tower",
+                "tower_subtype": "monopole",
+                "site_confidence": 0.85,
+                "cell_equipment": True,
+                "cell_equipment_confidence": 0.9,
+                "cell_equipment_evidence": "North oblique shows sector panels on monopole",
+                "nearmap_tier": "full",
+                "nearmap_views": "Vert,North,East,South,West",
+                "asset_box_2d": "[220, 310, 360, 420]",
+                "asset_view": "Nearmap oblique (North)",
+                "cell_models_agree": True,
+                "dual_model_resolution": "agree",
+                "escalation_model": "claude",
+            },
+            db_lat=43.01,
+            db_lng=-89.01,
+            sf_lat=43.0,
+            sf_lng=-89.0,
+        )
+        self.assertEqual(decision["bucket"], BUCKET_POTENTIAL_UPDATE)
+        self.assertEqual(decision["update_site_type"], "Monopole")
+
+    def test_nearmap_imagery_sets_verified_nearmap(self):
+        decision = bucket_classification(
+            match_source=MATCH_SOURCE_NONE,
+            classified=_rooftop_ok(),
+            db_lat=None,
+            db_lng=None,
+            sf_lat=43.0,
+            sf_lng=-89.0,
+        )
+        self.assertEqual(decision["bucket"], BUCKET_POTENTIAL_UPDATE)
+        self.assertEqual(decision["update_verified_site_source"], "NearMap")
+
+    def test_distant_rooftop_asset_box_is_held_out(self):
+        decision = bucket_classification(
+            match_source=MATCH_SOURCE_NONE,
+            classified=_rooftop_ok(asset_offset_m=117.5),
+            db_lat=None,
+            db_lng=None,
+            sf_lat=43.0,
+            sf_lng=-89.0,
+        )
+        self.assertEqual(decision["bucket"], BUCKET_ROOFTOP)
+        self.assertIn("asset_offset_117.5m_exceeds_100m", decision["holdout_reason"])
+
+    def test_imagery_only_asset_within_leeway_applies(self):
+        decision = bucket_classification(
+            match_source=MATCH_SOURCE_NONE,
+            classified=_rooftop_ok(asset_offset_m=95.0),
+            db_lat=None,
+            db_lng=None,
+            sf_lat=43.0,
+            sf_lng=-89.0,
+        )
+        self.assertEqual(decision["bucket"], BUCKET_POTENTIAL_UPDATE)
+
+    def test_imagery_only_low_site_conf_held_out(self):
+        decision = bucket_classification(
+            match_source=MATCH_SOURCE_NONE,
+            classified=_rooftop_ok(site_confidence=0.69, dual_model_resolution="agree"),
+            db_lat=None,
+            db_lng=None,
+            sf_lat=43.0,
+            sf_lng=-89.0,
+        )
+        self.assertEqual(decision["holdout_reason"], "low_confidence_imagery_only")
+
+    def test_imagery_only_localized_agree_allows_lower_site_conf(self):
+        decision = bucket_classification(
+            match_source=MATCH_SOURCE_NONE,
+            classified=_rooftop_ok(site_confidence=0.66),
+            db_lat=None,
+            db_lng=None,
+            sf_lat=43.0,
+            sf_lng=-89.0,
+        )
+        self.assertEqual(decision["bucket"], BUCKET_POTENTIAL_UPDATE)
+
+
+class SoqlTests(unittest.TestCase):
+    def test_blank_site_type_query_contains_metro_and_coords(self):
+        soql = build_blank_site_type_query()
+        self.assertNotIn("Carrier_Leasing_Source__c LIKE", soql)
+        self.assertIn("Metro_Classification__c = 'Major NFL Metro'", soql)
+        self.assertIn("Stage__c IN ('Outreach - Verified')", soql)
+        self.assertIn("Owner__c IN ('Site Acquisition Team', 'Marketing Campaign')", soql)
+        self.assertIn("Site_Latitude__c != null", soql)
+        self.assertIn("LLM_Classified__c = false", soql)
+        self.assertIn("(LLM_Holdout__c = false OR LLM_Holdout__c = null)", soql)
+        self.assertIn("Metro_Classification__c", soql.split(" FROM ")[0])
+        self.assertTrue(soql.rstrip().endswith("ORDER BY Id"))
+
+    def test_rooftop_confirm_query_selects_existing_rooftop(self):
+        soql = build_blank_site_type_query(
+            site_type="Rooftop",
+            stages=("New/Unreviewed", "Working-Connected"),
+            owners=None,
+            metro_classification=None,
+            carrier_like="ConnectX",
+        )
+        self.assertIn("Site_Type__c = 'Rooftop'", soql)
+        self.assertNotIn("Site_Type__c = null", soql)
+        self.assertIn("Carrier_Leasing_Source__c LIKE '%ConnectX%'", soql)
+        self.assertIn("Working-Connected", soql)
+        self.assertNotIn("Owner__c IN", soql)
+        self.assertNotIn("Metro_Classification__c =", soql)
+        self.assertIn("LLM_Classified__c = false", soql)
+
+    def test_confirm_query_can_omit_site_type(self):
+        soql = build_blank_site_type_query(
+            site_type="any",
+            stages=("New/Unreviewed", "Working-Connected"),
+            owners=None,
+            metro_classification=None,
+            carrier_like="ConnectX",
+        )
+        self.assertNotIn("Site_Type__c =", soql)
+        self.assertNotIn("Site_Type__c = null", soql)
+        self.assertIn("Carrier_Leasing_Source__c LIKE '%ConnectX%'", soql)
+        self.assertIn("LLM_Classified__c = false", soql)
+
+    def test_parse_site_type_env(self):
+        self.assertIsNone(parse_site_type(None))
+        self.assertIsNone(parse_site_type(""))
+        self.assertEqual(parse_site_type("Rooftop"), "Rooftop")
+        self.assertEqual(parse_site_type("any"), "any")
+        self.assertEqual(parse_site_type("none"), "any")
+        self.assertEqual(parse_site_type(None, default="any"), "any")
+
+    def test_blank_site_type_query_can_override_stages(self):
+        soql = build_blank_site_type_query(
+            stages=("Outreach", "Outreach - Verified"),
+        )
+        self.assertIn("Stage__c IN ('Outreach', 'Outreach - Verified')", soql)
+        self.assertNotIn("Enhanced/Unreviewed", soql)
+        self.assertIn("Working-Connected", soql)
+        self.assertIn("Qualified (Converted)", soql)
+
+    def test_blank_site_type_query_can_omit_owner(self):
+        soql = build_blank_site_type_query(owners=None)
+        self.assertNotIn("Owner__c IN", soql)
+        self.assertNotIn("Owner__c NOT IN", soql)
+
+    def test_blank_site_type_query_can_exclude_owners(self):
+        soql = build_blank_site_type_query(
+            owners=None,
+            exclude_owners=("Site Acquisition Team", "Marketing Campaign"),
+            metro_classification=None,
+        )
+        self.assertNotIn("Owner__c IN ('Site Acquisition Team'", soql)
+        self.assertIn(
+            "(Owner__c = null OR Owner__c = '' OR "
+            "Owner__c NOT IN ('Site Acquisition Team', 'Marketing Campaign'))",
+            soql,
+        )
+
+    def test_terminal_limit_wins_over_dotenv(self):
+        from enrichment.__main__ import limit_source
+
+        self.assertEqual(limit_source({"LIMIT": "500"}, {"LIMIT": "50"}), "terminal")
+        self.assertEqual(limit_source({"LIMIT": "500"}, {}), ".env")
+        self.assertEqual(limit_source({}, {"LIMIT": " "}), "none")
+
+    def test_db_only_default_stages_any_owner(self):
+        from enrichment.constants import DB_ONLY_STAGE_FILTER
+
+        soql = build_blank_site_type_query(
+            stages=DB_ONLY_STAGE_FILTER,
+            owners=None,
+            metro_classification=None,
+        )
+        self.assertIn("New/Unreviewed", soql)
+        self.assertIn("Enhanced/Unreviewed", soql)
+        self.assertIn("Outreach - Verified", soql)
+        self.assertIn("Marketing", soql)
+        self.assertNotIn("Owner__c IN", soql)
+        self.assertNotIn("Metro_Classification__c =", soql)
+
+    def test_blank_site_type_query_excludes_working_connected_by_default(self):
+        soql = build_blank_site_type_query()
+        self.assertIn(
+            "Stage__c NOT IN ('Working-Connected', 'Working - Connected', "
+            "'Qualified (Converted)')",
+            soql,
+        )
+
+    def test_blank_site_type_query_can_opt_into_working_connected(self):
+        soql = build_blank_site_type_query(
+            stages=("Working-Connected", "Working - Connected"),
+            metro_classification=None,
+        )
+        self.assertIn(
+            "Stage__c IN ('Working-Connected', 'Working - Connected')",
+            soql,
+        )
+        self.assertIn("Stage__c NOT IN ('Qualified (Converted)')", soql)
+        self.assertNotIn("Working-Connected'", soql.split("NOT IN", 1)[-1])
+        self.assertNotIn("Metro_Classification__c =", soql)
+        self.assertIn("Owner__c IN ('Site Acquisition Team', 'Marketing Campaign')", soql)
+
+    def test_blank_site_type_query_can_select_already_classified(self):
+        soql = build_blank_site_type_query(
+            carrier_like="PermittingSites",
+            llm_classified=True,
+        )
+        self.assertIn("LLM_Classified__c = true", soql)
+        self.assertNotIn("LLM_Classified__c = false", soql)
+        self.assertIn("Carrier_Leasing_Source__c LIKE '%PermittingSites%'", soql)
+
+    def test_blank_site_type_query_metro_comma_list_uses_in(self):
+        soql = build_blank_site_type_query(
+            metro_classification="Major NFL Metro, Tier 2 Target Metro"
+        )
+        self.assertIn(
+            "Metro_Classification__c IN ('Major NFL Metro', 'Tier 2 Target Metro')", soql
+        )
+        self.assertNotIn("Metro_Classification__c =", soql)
+
+    def test_blank_site_type_query_can_omit_carrier(self):
+        soql = build_blank_site_type_query(carrier_like=None)
+        self.assertNotIn("Carrier_Leasing_Source__c LIKE", soql)
+        self.assertIn("Metro_Classification__c = 'Major NFL Metro'", soql)
+        self.assertIn("LLM_Classified__c = false", soql)
+        self.assertIn("LLM_Holdout__c", soql)
+
+    def test_blank_site_type_query_can_omit_metro(self):
+        soql = build_blank_site_type_query(metro_classification=None)
+        self.assertNotIn("Metro_Classification__c =", soql)
+        self.assertNotIn("Carrier_Leasing_Source__c LIKE", soql)
+
+    def test_blank_site_type_query_can_add_carrier(self):
+        soql = build_blank_site_type_query(carrier_like="NFL")
+        self.assertIn("Carrier_Leasing_Source__c LIKE '%NFL%'", soql)
+
+    def test_parse_carrier_like_env(self):
+        self.assertIsNone(parse_carrier_like(None))
+        self.assertIsNone(parse_carrier_like(""))
+        self.assertEqual(parse_carrier_like("PermittingSites"), "PermittingSites")
+        self.assertEqual(parse_carrier_like("NFL"), "NFL")
+        self.assertIsNone(parse_carrier_like("none"))
+        self.assertIsNone(parse_carrier_like("ALL"))
+
+    def test_parse_metro_classification_env(self):
+        self.assertEqual(parse_metro_classification(None), "Major NFL Metro")
+        self.assertEqual(parse_metro_classification(""), "Major NFL Metro")
+        self.assertEqual(parse_metro_classification("Secondary Metro"), "Secondary Metro")
+        self.assertIsNone(parse_metro_classification("none"))
+        self.assertIsNone(parse_metro_classification("ALL"))
+
+    def test_sites_by_ids_query(self):
+        soql = build_sites_by_ids_query(["a0Z1", "a0Z2"])
+        self.assertIn("Id IN ('a0Z1', 'a0Z2')", soql)
+        self.assertNotIn("Carrier_Leasing_Source__c LIKE", soql)
+        self.assertNotIn("LLM_Classified__c =", soql)
+
+    def test_blank_site_type_query_states_filter(self):
+        soql = build_blank_site_type_query(states=["CA", "fl", "NV", "MA"])
+        self.assertIn("Site_State__c IN ('CA', 'FL', 'NV', 'MA')", soql)
+        self.assertNotIn("Carrier_Leasing_Source__c LIKE", soql)
+        self.assertTrue(soql.rstrip().endswith("ORDER BY Id"))
+
+
+class QueueWindowTests(unittest.TestCase):
+    def test_limit_takes_prefix_skip_and_offset_page_past_attempts(self):
+        from enrichment.pipeline import apply_queue_window
+
+        sites = [{"Id": f"a0Z{i:03d}"} for i in range(6)]
+        self.assertEqual(
+            [r["Id"] for r in apply_queue_window(sites, limit=3)],
+            ["a0Z000", "a0Z001", "a0Z002"],
+        )
+        self.assertEqual(
+            [r["Id"] for r in apply_queue_window(sites, offset=3, limit=2)],
+            ["a0Z003", "a0Z004"],
+        )
+        self.assertEqual(
+            [r["Id"] for r in apply_queue_window(
+                sites, skip_ids=["a0Z000", "a0Z002"], limit=3
+            )],
+            ["a0Z001", "a0Z003", "a0Z004"],
+        )
+
+
+class PayloadTests(unittest.TestCase):
+    def test_build_update_payload_sets_expected_fields(self):
+        payload = build_update_payload(
+            latitude=1.0,
+            longitude=2.0,
+            site_type="Rooftop",
+            verified_site=True,
+            verified_site_source="NearMap",
+            llm_classified=True,
+            llm_holdout=False,
+        )
+        self.assertEqual(payload["Site_Latitude__c"], 1.0)
+        self.assertEqual(payload["Site_Type__c"], "Rooftop")
+        self.assertTrue(payload["Verified_Site__c"])
+        self.assertEqual(payload["Verified_Site_Source__c"], "NearMap")
+        self.assertTrue(payload["LLM_Classified__c"])
+        self.assertFalse(payload["LLM_Holdout__c"])
+
+
+class _FakeSiteSObject:
+    def __init__(self, fail_payloads_containing=None):
+        self.calls: list[tuple[str, dict]] = []
+        self._fail_if = fail_payloads_containing or []
+
+    def update(self, record_id, payload):
+        self.calls.append((record_id, dict(payload)))
+        for needle in self._fail_if:
+            if needle in payload:
+                raise RuntimeError(
+                    "[{'errorCode': 'DUPLICATES_DETECTED', "
+                    "'message': 'Same site address exists in the system.'}]"
+                )
+        return 204
+
+
+class _FakeSF:
+    def __init__(self, site_sobject):
+        self.Site__c = site_sobject
+
+
+class _FakeClient:
+    def __init__(self, site_sobject):
+        self.sf = _FakeSF(site_sobject)
+
+
+class DuplicateFallbackTests(unittest.TestCase):
+    def test_enrichment_duplicate_retries_holdout(self):
+        from enrichment.sf_ops import apply_one_update
+
+        site = _FakeSiteSObject(fail_payloads_containing=["Site_Type__c"])
+        client = _FakeClient(site)
+        row = {
+            "Id": "a0ZTEST000000001",
+            "naip_site_type": "tower",
+            "payload": {
+                "Site_Latitude__c": 1.0,
+                "Site_Longitude__c": 2.0,
+                "Site_Type__c": "Monopole",
+                "Verified_Site__c": True,
+                "Verified_Site_Source__c": "FCC",
+                "LLM_Classified__c": True,
+            },
+        }
+        entry = apply_one_update(client, row, dry_run=False, verbose=False)
+        self.assertTrue(entry["success"])
+        self.assertEqual(entry["status"], "updated_holdout_after_error")
+        self.assertEqual(
+            entry["payload"],
+            {
+                "LLM_Classified__c": False,
+                "LLM_Holdout__c": True,
+            },
+        )
+        self.assertEqual(len(site.calls), 2)
+
+    def test_db_only_duplicate_still_holdouts(self):
+        from enrichment.sf_ops import apply_one_update
+
+        site = _FakeSiteSObject(fail_payloads_containing=["Site_Type__c"])
+        client = _FakeClient(site)
+        row = {
+            "Id": "a0ZTEST000000011",
+            "naip_site_type": "tower",
+            "holdout_reason": "skip_classify_db_hit",
+            "payload": {
+                "Site_Latitude__c": 1.0,
+                "Site_Longitude__c": 2.0,
+                "Site_Type__c": "Monopole",
+                "Verified_Site__c": True,
+                "Verified_Site_Source__c": "FCC",
+                "LLM_Classified__c": True,
+            },
+        }
+        entry = apply_one_update(
+            client, row, dry_run=False, verbose=False, write_holdout=False
+        )
+        self.assertTrue(entry["success"])
+        self.assertEqual(entry["status"], "updated_holdout_after_error")
+        self.assertEqual(
+            entry["payload"],
+            {"LLM_Classified__c": False, "LLM_Holdout__c": True},
+        )
+        self.assertEqual(len(site.calls), 2)
+
+    def test_generic_sf_error_holdouts(self):
+        from enrichment.sf_ops import apply_one_update
+
+        class BoomSite(_FakeSiteSObject):
+            def update(self, record_id, payload):
+                self.calls.append((record_id, dict(payload)))
+                if payload.get("LLM_Holdout__c") is True:
+                    return 204
+                raise RuntimeError("UNABLE_TO_LOCK_ROW")
+
+        site = BoomSite()
+        entry = apply_one_update(
+            _FakeClient(site),
+            {
+                "Id": "a0ZTEST000000012",
+                "naip_site_type": "tower",
+                "payload": {
+                    "Site_Type__c": "Monopole",
+                    "LLM_Classified__c": True,
+                },
+            },
+            dry_run=False,
+            verbose=False,
+        )
+        self.assertTrue(entry["success"])
+        self.assertEqual(entry["status"], "updated_holdout_after_error")
+        self.assertEqual(len(site.calls), 2)
+
+    def test_apply_error_skips_holdout_when_disabled(self):
+        from enrichment.sf_ops import apply_one_update
+
+        class BoomSite(_FakeSiteSObject):
+            def update(self, record_id, payload):
+                self.calls.append((record_id, dict(payload)))
+                raise RuntimeError("UNABLE_TO_LOCK_ROW")
+
+        site = BoomSite()
+        entry = apply_one_update(
+            _FakeClient(site),
+            {
+                "Id": "a0ZTEST000000013",
+                "naip_site_type": "rooftop",
+                "payload": {
+                    "Site_Type__c": "Rooftop",
+                    "LLM_Classified__c": True,
+                },
+            },
+            dry_run=False,
+            verbose=False,
+            write_holdout=False,
+            error_holdout=False,
+        )
+        self.assertFalse(entry["success"])
+        self.assertEqual(entry["status"], "failed")
+        self.assertEqual(len(site.calls), 1)
+
+    def test_holdout_dequeues_with_llm_classified_false(self):
+        from enrichment.sf_ops import apply_one_update
+
+        site = _FakeSiteSObject()
+        entry = apply_one_update(
+            _FakeClient(site),
+            {
+                "Id": "a0ZTEST000000004",
+                "naip_site_type": "rooftop",
+                "update_lat": "",
+                "update_lng": "",
+                "update_site_type": "",
+            },
+            dry_run=False,
+            verbose=False,
+        )
+        self.assertTrue(entry["success"])
+        self.assertEqual(
+            entry["payload"],
+            {"LLM_Classified__c": False, "LLM_Holdout__c": True},
+        )
+
+    def test_enrichment_write_clears_holdout_flag(self):
+        from enrichment.sf_ops import apply_one_update
+
+        site = _FakeSiteSObject()
+        entry = apply_one_update(
+            _FakeClient(site),
+            {
+                "Id": "a0ZTEST000000005",
+                "naip_site_type": "rooftop",
+                "update_lat": 43.0,
+                "update_lng": -89.0,
+                "update_site_type": "Rooftop",
+                "update_verified_site": True,
+                "update_verified_site_source": "NearMap",
+            },
+            dry_run=False,
+            verbose=False,
+        )
+        self.assertTrue(entry["success"])
+        self.assertTrue(entry["payload"]["LLM_Classified__c"])
+        self.assertFalse(entry["payload"]["LLM_Holdout__c"])
+        self.assertEqual(entry["payload"]["Site_Type__c"], "Rooftop")
+
+    def test_db_only_hit_sets_classified_without_holdout(self):
+        from enrichment.sf_ops import apply_one_update
+
+        site = _FakeSiteSObject()
+        entry = apply_one_update(
+            _FakeClient(site),
+            {
+                "Id": "a0ZTEST000000007",
+                "naip_site_type": "tower",
+                "holdout_reason": "skip_classify_db_hit",
+                "update_lat": 39.0,
+                "update_lng": -105.0,
+                "update_site_type": "Monopole",
+                "update_verified_site": True,
+                "update_verified_site_source": "FCC",
+            },
+            dry_run=False,
+            verbose=False,
+            write_holdout=False,
+        )
+        self.assertTrue(entry["success"])
+        self.assertTrue(entry["payload"]["LLM_Classified__c"])
+        self.assertNotIn("LLM_Holdout__c", entry["payload"])
+        self.assertEqual(entry["payload"]["Site_Type__c"], "Monopole")
+
+    def test_db_only_miss_sets_classified_without_site_type(self):
+        from enrichment.sf_ops import apply_one_update
+
+        site = _FakeSiteSObject()
+        entry = apply_one_update(
+            _FakeClient(site),
+            {
+                "Id": "a0ZTEST000000008",
+                "naip_site_type": "",
+                "holdout_reason": "db_only_no_unique_hit",
+            },
+            dry_run=False,
+            verbose=False,
+            write_holdout=False,
+        )
+        self.assertTrue(entry["success"])
+        self.assertEqual(
+            entry["payload"],
+            {"LLM_Classified__c": True},
+        )
+        self.assertNotIn("Site_Type__c", entry["payload"])
+
+    def test_db_skip_blank_naip_writes_site_type(self):
+        from enrichment.sf_ops import apply_one_update
+
+        site = _FakeSiteSObject()
+        entry = apply_one_update(
+            _FakeClient(site),
+            {
+                "Id": "a0ZTEST000000006",
+                "naip_site_type": "",
+                "holdout_reason": "skip_classify_db_hit",
+                "update_lat": 39.63517,
+                "update_lng": -105.01095,
+                "update_site_type": "Monopole",
+                "update_verified_site": True,
+                "update_verified_site_source": "TowerSource",
+            },
+            dry_run=False,
+            verbose=False,
+        )
+        self.assertTrue(entry["success"])
+        self.assertEqual(entry["payload"]["Site_Type__c"], "Monopole")
+
+    def test_db_skip_blank_naip_without_site_type_holdouts(self):
+        from enrichment.sf_ops import apply_one_update
+
+        entry = apply_one_update(
+            _FakeClient(_FakeSiteSObject()),
+            {
+                "Id": "a0ZTEST000000007",
+                "naip_site_type": "",
+                "holdout_reason": "skip_classify_db_hit",
+                "update_lat": 42.639722,
+                "update_lng": -71.336667,
+                "update_site_type": "",
+                "update_verified_site": True,
+                "update_verified_site_source": "FCC",
+            },
+            dry_run=False,
+            verbose=False,
+        )
+        self.assertTrue(entry["success"])
+        self.assertEqual(entry["status"], "updated_holdout_after_error")
+        self.assertEqual(
+            entry["payload"],
+            {"LLM_Classified__c": False, "LLM_Holdout__c": True},
+        )
+
+
+class GoldenRegressionTests(unittest.TestCase):
+    def test_all_golden_cases(self):
+        from enrichment.tests.golden_cases import GOLDEN_CASES
+
+        for (
+            name,
+            match_source,
+            classified,
+            db_lat,
+            db_lng,
+            sf_lat,
+            sf_lng,
+            expect,
+        ) in GOLDEN_CASES:
+            with self.subTest(name=name):
+                decision = bucket_classification(
+                    match_source=match_source,
+                    classified=classified,
+                    db_lat=db_lat,
+                    db_lng=db_lng,
+                    sf_lat=sf_lat,
+                    sf_lng=sf_lng,
+                )
+                if "bucket" in expect:
+                    self.assertEqual(decision["bucket"], expect["bucket"], name)
+                if "holdout_reason" in expect:
+                    self.assertEqual(
+                        decision["holdout_reason"], expect["holdout_reason"], name
+                    )
+                if "holdout_reason_contains" in expect:
+                    self.assertIn(
+                        expect["holdout_reason_contains"],
+                        str(decision.get("holdout_reason") or ""),
+                        name,
+                    )
+                if "coord_prefix" in expect:
+                    self.assertTrue(
+                        str(decision.get("update_coord_source") or "").startswith(
+                            expect["coord_prefix"]
+                        ),
+                        name,
+                    )
+
+
+class CostPolicyTests(unittest.TestCase):
+    def test_auto_skip_unique_close_hit(self):
+        from enrichment.cost_policy import auto_skip_classify_reason
+        from enrichment.mssql import ProximityHit
+
+        hit = ProximityHit(
+            source="FCC",
+            distance_m=12.0,
+            latitude=43.0,
+            longitude=-89.0,
+            candidate_count=1,
+            runner_up_gap_m=None,
+        )
+        self.assertTrue(auto_skip_classify_reason(hit) is not None)
+
+    def test_auto_skip_rejects_ambiguous_cluster(self):
+        from enrichment.cost_policy import auto_skip_classify_reason
+        from enrichment.mssql import ProximityHit
+
+        hit = ProximityHit(
+            source="FCC",
+            distance_m=10.0,
+            latitude=43.0,
+            longitude=-89.0,
+            candidate_count=3,
+            runner_up_gap_m=8.0,
+        )
+        self.assertFalse(auto_skip_classify_reason(hit) is not None)
+
+    def test_auto_skip_rejects_far_unique_hit(self):
+        from enrichment.cost_policy import auto_skip_classify_reason
+        from enrichment.mssql import ProximityHit
+
+        hit = ProximityHit(
+            source="FCC",
+            distance_m=80.0,
+            latitude=43.0,
+            longitude=-89.0,
+            candidate_count=1,
+        )
+        self.assertFalse(auto_skip_classify_reason(hit) is not None)
+
+    def test_auto_skip_on_structure_collocation(self):
+        from enrichment.cost_policy import auto_skip_classify_reason
+        from enrichment.mssql import ProximityHit
+
+        hit = ProximityHit(
+            source="TowerSource",
+            distance_m=0.3,
+            latitude=41.177783,
+            longitude=-75.278199,
+            distance_to_pin_m=0.3,
+            candidate_count=3,
+            runner_up_gap_m=0.0,
+        )
+        self.assertTrue(auto_skip_classify_reason(hit) is not None)
+        self.assertIn("on-structure", auto_skip_classify_reason(hit) or "")
+
+    def test_auto_skip_on_structure_ignores_nearby_other_tower(self):
+        from enrichment.cost_policy import auto_skip_classify_reason
+        from enrichment.mssql import ProximityHit
+
+        hit = ProximityHit(
+            source="TowerSource",
+            distance_m=0.3,
+            latitude=41.177783,
+            longitude=-75.278199,
+            distance_to_pin_m=0.3,
+            candidate_count=2,
+            runner_up_gap_m=8.0,
+        )
+        self.assertTrue(auto_skip_classify_reason(hit) is not None)
+
+    def test_cluster_match_within_50m(self):
+        from enrichment.cost_policy import find_cluster_match
+
+        cache = [
+            {
+                "lat": 43.0,
+                "lon": -89.0,
+                "classified": {"site_type": "other", "site_confidence": 0.8},
+            }
+        ]
+        # ~11 m north
+        match = find_cluster_match(cache, 43.0001, -89.0)
+        self.assertIsNotNone(match)
+        self.assertIsNone(find_cluster_match(cache, 43.01, -89.0))
+
+    def test_second_nearmap_skips_locked_empty(self):
+        from enrichment.cost_policy import should_spend_second_nearmap
+
+        unused = (39.0, -94.0)
+        kwargs = dict(
+            unused_point=unused,
+            skip_paid_imagery=False,
+            has_nearmap_key=True,
+            site_type="other",
+            site_confidence=0.9,
+            nearmap_tier="full",
+            rooftop_unlocked=False,
+            cell_equipment=False,
+        )
+        self.assertFalse(should_spend_second_nearmap(**kwargs))
+        kwargs["site_confidence"] = 0.8
+        self.assertFalse(should_spend_second_nearmap(**kwargs))
+        kwargs["cell_equipment"] = None
+        self.assertFalse(should_spend_second_nearmap(**kwargs))
+        kwargs["cell_equipment"] = True
+        self.assertTrue(should_spend_second_nearmap(**kwargs))
+        kwargs["cell_equipment"] = False
+        kwargs["site_confidence"] = 0.9
+        kwargs["nearmap_tier"] = "no_coverage"
+        self.assertTrue(should_spend_second_nearmap(**kwargs))
+        kwargs["nearmap_tier"] = "full"
+        kwargs["site_type"] = "rooftop"
+        kwargs["rooftop_unlocked"] = True
+        self.assertTrue(should_spend_second_nearmap(**kwargs))
+        kwargs["site_type"] = "other"
+        kwargs["rooftop_unlocked"] = False
+        kwargs["cell_equipment"] = False
+        kwargs["site_confidence"] = 0.9
+        kwargs["nearmap_tier"] = "full"
+        self.assertFalse(should_spend_second_nearmap(**kwargs))
+        kwargs["pin_address_mismatch"] = True
+        self.assertTrue(should_spend_second_nearmap(**kwargs))
+
+    def test_stamp_apply_status_before_metrics(self):
+        from enrichment.pipeline import stamp_apply_status
+        from enrichment.sf_ops import apply_queue_flags, build_update_payload
+
+        enrich = apply_queue_flags(
+            build_update_payload(
+                latitude=39.0,
+                longitude=-94.0,
+                site_type="Rooftop",
+                verified_site=True,
+                verified_site_source="LLM Imagery",
+            )
+        )
+        holdout = apply_queue_flags({})
+        classified_only = {"LLM_Classified__c": True}
+        rows = [
+            {"Id": "a", "sf_update_status": "pending", "sf_update_error": ""},
+            {"Id": "b", "sf_update_status": "pending", "sf_update_error": ""},
+            {"Id": "c", "sf_update_status": "pending", "sf_update_error": ""},
+            {"Id": "d", "sf_update_status": "skipped", "sf_update_error": ""},
+            {"Id": "e", "sf_update_status": "pending", "sf_update_error": ""},
+        ]
+        stamp_apply_status(
+            rows,
+            [
+                {"Id": "a", "success": True, "payload": enrich},
+                {"Id": "b", "success": True, "payload": holdout},
+                {
+                    "Id": "c",
+                    "success": False,
+                    "payload": enrich,
+                    "error": "DUPLICATES_DETECTED",
+                },
+                {"Id": "e", "success": True, "payload": classified_only},
+            ],
+        )
+        self.assertEqual(rows[0]["sf_update_status"], "updated")
+        self.assertEqual(rows[1]["sf_update_status"], "dequeued")
+        self.assertEqual(rows[2]["sf_update_status"], "failed")
+        self.assertEqual(rows[2]["sf_update_error"], "DUPLICATES_DETECTED")
+        self.assertEqual(rows[3]["sf_update_status"], "skipped")
+        self.assertEqual(rows[4]["sf_update_status"], "classified_only")
+
+    def test_metrics_empty_to_rooftop_funnel(self):
+        from enrichment.metrics import outcome_class, snapshot_run
+
+        rows = [
+            {
+                "Id": "a",
+                "naip_screen_site_type": "unclear",
+                "naip_site_type": "rooftop",
+                "naip_site_confidence": 0.8,
+                "nearmap_tier": "full",
+                "bucket": "potential_update",
+                "update_site_type": "Rooftop",
+                "escalation_model": "claude",
+            },
+            {
+                "Id": "b",
+                "naip_screen_site_type": "other",
+                "naip_site_type": "other",
+                "naip_site_confidence": 0.9,
+                "nearmap_tier": "full",
+                "bucket": "other_or_else",
+                "holdout_reason": "other",
+            },
+            {
+                "Id": "c",
+                "naip_screen_site_type": "rooftop",
+                "naip_site_type": "rooftop",
+                "naip_site_confidence": 0.45,
+                "nearmap_tier": "full",
+                "bucket": "potential_rooftop",
+                "holdout_reason": "low_confidence_imagery_only",
+                "escalation_model": "claude",
+            },
+        ]
+        self.assertEqual(outcome_class(rows[0]), "applied_rooftop")
+        self.assertEqual(outcome_class(rows[1]), "holdout_empty_confirmed")
+        self.assertEqual(outcome_class(rows[2]), "holdout_weak_rooftop")
+        snap = snapshot_run(rows, run_id="test")
+        self.assertEqual(snap["naip_empty_to_nearmap"], 2)
+        self.assertEqual(snap["naip_empty_to_rooftop_apply"], 1)
+        self.assertEqual(snap["empty_to_rooftop_apply_rate"], 0.5)
+        self.assertEqual(snap["applied_rooftop"], 1)
+
+    def test_metric_lines_match_ledger_keys(self):
+        from enrichment.metrics import (
+            RUN_METRIC_KEYS,
+            format_metric_value,
+            metric_lines,
+        )
+
+        self.assertEqual(format_metric_value("empty_to_rooftop_apply_rate", 0.333), "33.3%")
+        self.assertEqual(format_metric_value("applied_rooftop", 5), "5")
+        lines = metric_lines(
+            {"sites": 10, "applied_rooftop": 2, "empty_to_rooftop_apply_rate": 0.2},
+            RUN_METRIC_KEYS,
+        )
+        self.assertEqual(lines[0], "    sites: 10")
+        self.assertIn("    applied_rooftop: 2", lines)
+        self.assertIn("    empty_to_rooftop_apply_rate: 20.0%", lines)
+        spend = metric_lines(
+            {"nearmap_sites": 49, "claude_sites": 31},
+            RUN_METRIC_KEYS,
+        )
+        self.assertIn("    nearmap_imagery_ran: 49", spend)
+        self.assertIn("    claude_ai_ran: 31", spend)
+        self.assertFalse(any("nearmap_sites:" in line for line in spend))
+        self.assertFalse(any("claude_sites:" in line for line in spend))
+        self.assertFalse(any("holdout_rooftop" in line for line in lines))
+        self.assertFalse(any("gemini_sites" in line for line in lines))
+
+    def test_metrics_sql_row_mapping(self):
+        from enrichment.metrics_store import run_row, site_row
+
+        run = run_row(
+            {
+                "run_id": "2026-08-28_150606_sf_enrichment",
+                "recorded_at": "2026-08-28T19:17:07Z",
+                "sites": 8,
+                "applied_rooftop": 3,
+                "empty_to_rooftop_apply_rate": 0.333,
+            }
+        )
+        self.assertEqual(run[0], "2026-08-28_150606_sf_enrichment")
+        self.assertEqual(run[2], 8)
+        self.assertEqual(run[3], 3)
+        site = site_row(
+            {
+                "run_id": "r1",
+                "Id": "a0ZUq000004cJ72MAE",
+                "Site_State__c": "CO",
+                "Site_City__c": "DENVER",
+                "Carrier_Leasing_Source__c": "AR_TMO_jan2025",
+                "match_source": "none",
+                "nearmap_ran": True,
+                "empty_to_nearmap": 1,
+                "outcome": "applied_rooftop",
+            }
+        )
+        self.assertEqual(site[1], "a0ZUq000004cJ72MAE")
+        self.assertEqual(site[3], "CO")
+        self.assertEqual(site[6], "none")
+        self.assertEqual(site[13], 1)
+        self.assertEqual(site[24], "applied_rooftop")
+
+    def test_site_state_from_address(self):
+        from enrichment.metrics import site_state
+
+        self.assertEqual(
+            site_state({"address": "1598 Cleveland Place, DENVER, CO"}), "CO"
+        )
+        self.assertEqual(site_state({"Site_State__c": "ks"}), "KS")
+
+    def test_metrics_ddl_loads_sql_file(self):
+        from enrichment.metrics_ddl import ddl_statements
+
+        batches = ddl_statements()
+        joined = "\n".join(batches)
+        self.assertTrue(any("CREATE TABLE dbo.EnrichmentRun" in b for b in batches))
+        self.assertTrue(any("CREATE VIEW dbo.vEnrichmentKpisByState" in b for b in batches))
+        self.assertTrue(any("CREATE VIEW dbo.vEnrichmentSiteLatestWrite" in b for b in batches))
+        self.assertIn("SiteState", joined)
+        self.assertIn("vEnrichmentSiteLatestWrite", joined)
+
+    def test_metrics_rollup_last_id_wins(self):
+        from enrichment.metrics import rollup_kpis
+
+        kpis = rollup_kpis(
+            [
+                {"Id": "a", "outcome": "holdout_empty", "empty_to_nearmap": True},
+                {
+                    "Id": "a",
+                    "outcome": "applied_rooftop",
+                    "sf_update_status": "updated",
+                    "empty_to_nearmap": True,
+                    "empty_to_rooftop_apply": True,
+                    "nearmap_ran": True,
+                },
+                {"Id": "b", "outcome": "holdout_empty_confirmed", "nearmap_ran": True},
+                {
+                    "Id": "c",
+                    "outcome": "applied_tower",
+                    "sf_update_status": "updated",
+                },
+            ]
+        )
+        self.assertEqual(kpis["unique_sites"], 3)
+        self.assertEqual(kpis["written_sites"], 2)
+        self.assertEqual(kpis["rooftop_sf_writes"], 1)
+        self.assertEqual(kpis["tower_sf_writes"], 1)
+        self.assertEqual(kpis["holdout_empty_confirmed"], 1)
+        self.assertEqual(kpis["holdout_empty"], 0)
+        self.assertEqual(kpis["naip_empty_to_rooftop_apply"], 1)
+        # Mix is a share of enriched sites; yield is enriched / processed.
+        self.assertEqual(kpis["rooftop_write_rate"], 0.5)
+        self.assertEqual(kpis["tower_write_rate"], 0.5)
+        self.assertEqual(kpis["total_write_rate"], 0.667)
+
+    def test_rollup_counts_misses_and_failures_as_processed(self):
+        from enrichment.metrics import rollup_kpis, snapshot_run
+
+        kpis = rollup_kpis(
+            [
+                {"Id": "a", "outcome": "applied_rooftop", "sf_update_status": "updated"},
+                {
+                    "Id": "b",
+                    "outcome": "db_only_miss",
+                    "holdout_reason": "db_only_no_unique_hit",
+                    "db_only": True,
+                    "sf_update_status": "classified_only",
+                },
+                {
+                    "Id": "c",
+                    "outcome": "applied_db_skip",
+                    "db_only": True,
+                    "sf_update_status": "updated",
+                },
+                {
+                    "Id": "d",
+                    "outcome": "apply_failed",
+                    "db_only": True,
+                    "sf_update_status": "dequeued",
+                },
+                {
+                    "Id": "e",
+                    "outcome": "error",
+                    "holdout_reason": "sql_error",
+                    "sf_update_status": "skipped",
+                },
+            ]
+        )
+        self.assertEqual(kpis["unique_sites"], 5)
+        self.assertEqual(kpis["written_sites"], 2)
+        self.assertEqual(kpis["rooftop_sf_writes"], 1)
+        self.assertEqual(kpis["db_skip_sf_writes"], 1)
+        self.assertEqual(kpis["db_only_miss"], 1)
+        self.assertEqual(kpis["apply_failed"], 1)
+        self.assertEqual(kpis["errors"], 1)
+        self.assertEqual(kpis["total_write_rate"], 0.4)
+        snap = snapshot_run(
+            [
+                {
+                    "Id": "hit",
+                    "holdout_reason": "skip_classify_db_hit",
+                    "bucket": "potential_update",
+                    "update_site_type": "Monopole",
+                    "sf_update_status": "updated",
+                },
+                {
+                    "Id": "miss",
+                    "holdout_reason": "db_only_no_unique_hit",
+                    "bucket": "other_or_else",
+                    "sf_update_status": "classified_only",
+                },
+            ],
+            run_id="db-only-test",
+            db_only=True,
+        )
+        self.assertEqual(snap["sites"], 2)
+        self.assertEqual(snap["applied_db_skip"], 1)
+        self.assertEqual(snap["db_only_miss"], 1)
+        by_id = {r["Id"]: r for r in snap["site_records"]}
+        self.assertEqual(by_id["miss"]["outcome"], "db_only_miss")
+        self.assertEqual(rollup_kpis(snap["site_records"])["unique_sites"], 2)
+
+    def test_rollup_counts_retried_salesforce_id_once(self):
+        from enrichment.metrics import is_successful_sf_write, rollup_kpis
+
+        first = {
+            "Id": "a",
+            "outcome": "applied_db_skip",
+            "sf_update_status": "updated",
+        }
+        retry = {
+            "Id": "a",
+            "outcome": "applied_db_skip",
+            "sf_update_status": "updated",
+            "run_id": "later",
+        }
+        self.assertTrue(is_successful_sf_write(first))
+        kpis = rollup_kpis([first, retry])
+        self.assertEqual(kpis["unique_sites"], 1)
+        self.assertEqual(kpis["written_sites"], 1)
+
+    def test_dry_run_and_pending_are_not_writes(self):
+        from enrichment.metrics import is_successful_sf_write, rollup_kpis
+
+        pending = {
+            "Id": "a",
+            "outcome": "applied_rooftop",
+            "sf_update_status": "pending",
+        }
+        dry = {
+            "Id": "b",
+            "outcome": "applied_rooftop",
+            "sf_update_status": "dry_run",
+        }
+        live = {
+            "Id": "c",
+            "outcome": "applied_tower",
+            "sf_update_status": "updated",
+        }
+        self.assertFalse(is_successful_sf_write(pending))
+        self.assertFalse(is_successful_sf_write(dry))
+        self.assertTrue(is_successful_sf_write(live))
+        kpis = rollup_kpis([pending, dry, live])
+        self.assertEqual(kpis["written_sites"], 1)
+        self.assertEqual(kpis["tower_sf_writes"], 1)
+
+    def test_record_run_apply_zero_skips_unique_sites(self):
+        from enrichment.metrics import KPIS_JSON, SITES_JSONL, _rewrite_jsonl, record_run
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            prior = [
+                {
+                    "Id": "keep",
+                    "run_id": "prior",
+                    "outcome": "applied_tower",
+                    "sf_update_status": "updated",
+                }
+            ]
+            _rewrite_jsonl(root / SITES_JSONL, prior)
+            (root / KPIS_JSON).write_text(
+                '{"unique_sites": 1}', encoding="utf-8"
+            )
+            run_dir = root / "dry-run"
+            run_dir.mkdir()
+            import enrichment.metrics as metrics_mod
+
+            old_dir = metrics_mod.metrics_dir
+            metrics_mod.metrics_dir = lambda: root
+            try:
+                snap = record_run(
+                    run_dir=run_dir,
+                    detail_rows=[
+                        {
+                            "Id": "new",
+                            "bucket": "potential_update",
+                            "update_site_type": "Rooftop",
+                            "naip_site_type": "rooftop",
+                            "sf_update_status": "dry_run",
+                        }
+                    ],
+                    apply_summary=None,
+                    write_sql=False,
+                )
+            finally:
+                metrics_mod.metrics_dir = old_dir
+            self.assertIsNone(snap["kpis"])
+            sites = (root / SITES_JSONL).read_text(encoding="utf-8")
+            self.assertNotIn('"Id": "new"', sites)
+            self.assertEqual(
+                json.loads((root / KPIS_JSON).read_text(encoding="utf-8"))[
+                    "unique_sites"
+                ],
+                1,
+            )
+
+    def test_drop_runs_from_ledger_rewrites_kpis(self):
+        from enrichment.metrics import (
+            KPIS_JSON,
+            RUNS_JSONL,
+            SITES_JSONL,
+            _rewrite_jsonl,
+            drop_runs_from_ledger,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _rewrite_jsonl(
+                root / RUNS_JSONL,
+                [
+                    {"run_id": "keep", "sites": 1},
+                    {"run_id": "drop-me", "sites": 2},
+                ],
+            )
+            _rewrite_jsonl(
+                root / SITES_JSONL,
+                [
+                    {"Id": "a", "run_id": "keep", "outcome": "applied_rooftop", "sf_update_status": "updated"},
+                    {"Id": "b", "run_id": "drop-me", "outcome": "holdout_other"},
+                ],
+            )
+            result = drop_runs_from_ledger(["drop-me"], root=root)
+            self.assertEqual(result["runs"], 1)
+            self.assertEqual(result["site_rows"], 1)
+            self.assertEqual(result["kpis"]["unique_sites"], 1)
+            self.assertTrue((root / KPIS_JSON).is_file())
+
+    def test_osm_empty_chip_and_tower_tags(self):
+        from enrichment.osm_prefilter import (
+            osm_suggests_empty_chip,
+            parse_overpass_elements,
+        )
+
+        empty = parse_overpass_elements([])
+        self.assertTrue(empty["ok"])
+        self.assertTrue(osm_suggests_empty_chip(empty))
+
+        tower = parse_overpass_elements(
+            [
+                {
+                    "tags": {
+                        "man_made": "mast",
+                        "tower:type": "communication",
+                    }
+                }
+            ]
+        )
+        self.assertTrue(tower["communication_tower"])
+        self.assertFalse(osm_suggests_empty_chip(tower))
+        self.assertFalse(osm_suggests_empty_chip({"ok": False}))
+
+
+class SimpleClassifyStampTests(unittest.TestCase):
+    def test_rooftop_cell_certain_helper(self):
+        from enrichment.bucketing import _rooftop_cell_certain
+
+        certain = _rooftop_ok(
+            site_confidence=0.97,
+            cell_equipment_confidence=0.97,
+            nearmap_tier="naip_only",
+            nearmap_views="",
+            asset_view="NAIP top-down",
+            cell_equipment_evidence="NAIP top-down shows sector panel antennas on a rooftop frame",
+        )
+        self.assertTrue(_rooftop_cell_certain(certain))
+        self.assertFalse(
+            _rooftop_cell_certain(_rooftop_ok(site_confidence=0.9))
+        )
+
+    def test_unstamped_naip_db_tower_at_high_conf_is_ready(self):
+        """Barebones Gemini path may omit dual_model_resolution; solo bar still writes."""
+        decision = bucket_classification(
+            match_source=MATCH_SOURCE_FCC,
+            classified={
+                "site_type": "tower",
+                "tower_subtype": "monopole",
+                "site_confidence": 0.9,
+                "cell_equipment": True,
+                "cell_equipment_confidence": 0.9,
+                "nearmap_tier": "naip_only",
+                "asset_view": "NAIP top-down",
+            },
+            db_lat=36.0256,
+            db_lng=-115.0853,
+            sf_lat=36.0255,
+            sf_lng=-115.0852,
+        )
+        self.assertEqual(decision["bucket"], BUCKET_POTENTIAL_UPDATE)
+
+
+class PinAddressGeocodeTests(unittest.TestCase):
+    def test_build_site_address(self):
+        from enrichment.geo import build_site_address
+
+        self.assertEqual(
+            build_site_address(
+                {
+                    "Site_Street__c": "1598 Cleveland Place",
+                    "Site_City__c": "DENVER",
+                    "Site_State__c": "CO",
+                    "Site_Zip_Code__c": "80202",
+                }
+            ),
+            "1598 Cleveland Place, DENVER, CO 80202",
+        )
+        self.assertIsNone(build_site_address({"Site_City__c": "DENVER"}))
+
+    def test_parse_census_payload_and_mismatch(self):
+        from enrichment.geo import (
+            parse_census_geocode_payload,
+            pin_address_is_mismatch,
+        )
+
+        parsed = parse_census_geocode_payload(
+            {
+                "result": {
+                    "addressMatches": [
+                        {
+                            "matchedAddress": "1598 CLEVELAND PL, DENVER, CO, 80202",
+                            "coordinates": {"x": -104.9879, "y": 39.7417},
+                        }
+                    ]
+                }
+            }
+        )
+        self.assertIsNotNone(parsed)
+        self.assertAlmostEqual(parsed["lat"], 39.7417)
+        self.assertAlmostEqual(parsed["lng"], -104.9879)
+        self.assertEqual(parsed["source"], "census")
+        self.assertFalse(pin_address_is_mismatch(20))
+        self.assertTrue(pin_address_is_mismatch(75))
+        self.assertTrue(pin_address_is_mismatch(180))
+        self.assertIsNone(parse_census_geocode_payload({"result": {"addressMatches": []}}))
+
+    def test_should_compare_rooftop_hosts(self):
+        from enrichment.geo import should_compare_rooftop_hosts
+
+        self.assertTrue(should_compare_rooftop_hosts(15))
+        self.assertTrue(should_compare_rooftop_hosts(25))
+        self.assertFalse(should_compare_rooftop_hosts(10))
+        self.assertFalse(should_compare_rooftop_hosts(25, db_backed=True))
+        self.assertFalse(should_compare_rooftop_hosts(None))
+
+    def test_pick_classify_anchor_prefers_building_and_tower(self):
+        from enrichment.geo import (
+            mismatch_osm_is_decisive,
+            pick_classify_anchor,
+        )
+
+        empty = {
+            "ok": True,
+            "has_building": False,
+            "has_tower_or_mast": False,
+            "communication_tower": False,
+        }
+        building = {
+            "ok": True,
+            "has_building": True,
+            "has_tower_or_mast": False,
+            "communication_tower": False,
+        }
+        tower = {
+            "ok": True,
+            "has_building": False,
+            "has_tower_or_mast": True,
+            "communication_tower": True,
+        }
+        pick, _reason = pick_classify_anchor(pin_osm=empty, address_osm=building)
+        self.assertEqual(pick, "address")
+        self.assertTrue(mismatch_osm_is_decisive(empty, building))
+        pick, _reason = pick_classify_anchor(pin_osm=tower, address_osm=building)
+        self.assertEqual(pick, "pin")
+        pick, reason = pick_classify_anchor(pin_osm=building, address_osm=building)
+        self.assertEqual(pick, "pin")
+        self.assertIn("tie", reason)
+        self.assertFalse(mismatch_osm_is_decisive(building, building))
+        pick, _reason = pick_classify_anchor(
+            pin_osm=empty,
+            address_osm=empty,
+            pin_naip={"site_type": "unclear", "site_confidence": 0.1},
+            address_naip={"site_type": "rooftop", "site_confidence": 0.7},
+        )
+        self.assertEqual(pick, "address")
+
+
+class SqlTokenCacheTests(unittest.TestCase):
+    def tearDown(self):
+        from enrichment import mssql
+
+        mssql._invalidate_sql_token()
+
+    def test_parse_az_expires_on_unix(self):
+        from enrichment.mssql import _parse_az_token_payload
+
+        token, exp = _parse_az_token_payload(
+            {"accessToken": "abc", "expires_on": 1_700_000_000},
+            now=1_699_000_000,
+        )
+        self.assertEqual(token, "abc")
+        self.assertEqual(exp, 1_700_000_000)
+
+    def test_parse_az_expires_on_datetime_string(self):
+        from datetime import datetime
+
+        from enrichment.mssql import _parse_az_token_payload
+
+        stamp = "2030-01-15 12:00:00.123456"
+        token, exp = _parse_az_token_payload(
+            {"accessToken": "abc", "expiresOn": stamp},
+            now=0.0,
+        )
+        self.assertEqual(token, "abc")
+        self.assertAlmostEqual(
+            exp, datetime.strptime("2030-01-15 12:00:00", "%Y-%m-%d %H:%M:%S").timestamp()
+        )
+
+    def test_cached_token_refreshes_near_expiry(self):
+        from enrichment import mssql
+
+        now = 1_000_000.0
+        mssql._store_sql_token("stale", now + 60)
+        self.assertIsNone(mssql._cached_token_if_fresh(now=now))
+        mssql._store_sql_token("fresh", now + 3600)
+        self.assertEqual(mssql._cached_token_if_fresh(now=now), "fresh")
+
+    def test_expired_login_error_detection(self):
+        from enrichment.mssql import _is_expired_sql_login
+
+        self.assertTrue(
+            _is_expired_sql_login(
+                Exception(
+                    "[28000] Login failed for user '<token-identified principal>'. "
+                    "Token is expired. (18456)"
+                )
+            )
+        )
+        self.assertFalse(_is_expired_sql_login(Exception("Login timeout expired")))
+
+    def test_sql_link_failure_detection(self):
+        from enrichment.mssql import is_sql_link_failure
+
+        self.assertTrue(
+            is_sql_link_failure(Exception("[08S01] Communication link failure"))
+        )
+        self.assertTrue(is_sql_link_failure(Exception("Invalid cursor state")))
+        self.assertFalse(is_sql_link_failure(Exception("Login timeout expired")))
+        self.assertFalse(is_sql_link_failure(RuntimeError("sql-called")))
+
+
+class SqlReconnectTests(unittest.TestCase):
+    def test_sql_link_failure_reconnects_once(self):
+        from unittest.mock import patch
+
+        from enrichment import mssql as mssql_mod
+        from enrichment.constants import PROXIMITY_MAX_M
+        from enrichment.pipeline import _process_site
+
+        calls = {"n": 0}
+
+        def fake_hit(_cursor, *_args, **_kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise Exception("[08S01] Communication link failure")
+            return None
+
+        class LiveConn:
+            def cursor(self):
+                return object()
+
+            def close(self):
+                pass
+
+        live = LiveConn()
+        dead = LiveConn()
+        sql_state = {"conn": dead, "cursor": object()}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(mssql_mod, "connect_mssql", return_value=live):
+                with patch("enrichment.pipeline.find_proximity_hit", fake_hit):
+                    row = _process_site(
+                        {
+                            "Id": "a0ZSQLR000000001",
+                            "Site_Latitude__c": 43.0,
+                            "Site_Longitude__c": -89.0,
+                        },
+                        cursor=sql_state["cursor"],
+                        sql_state=sql_state,
+                        max_m=PROXIMITY_MAX_M,
+                        skip_classify=False,
+                        classify_fn=lambda **_k: {
+                            "site_type": "rooftop",
+                            "site_confidence": 0.9,
+                        },
+                        chip_dir=Path(tmp),
+                        verbose=False,
+                    )
+        self.assertEqual(calls["n"], 2)
+        self.assertIs(sql_state["conn"], live)
+        self.assertNotEqual(row.get("holdout_reason"), "sql_error")
+
+    def test_non_link_sql_error_does_not_reconnect(self):
+        from unittest.mock import patch
+
+        from enrichment import mssql as mssql_mod
+        from enrichment.constants import PROXIMITY_MAX_M
+        from enrichment.pipeline import _process_site
+
+        class BoomCursor:
+            def execute(self, *_args, **_kwargs):
+                raise RuntimeError("sql-called")
+
+        sql_state = {"conn": object(), "cursor": BoomCursor()}
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(mssql_mod, "connect_mssql") as connect:
+                row = _process_site(
+                    {
+                        "Id": "a0ZSQLNR00000001",
+                        "Site_Latitude__c": 43.0,
+                        "Site_Longitude__c": -89.0,
+                    },
+                    cursor=sql_state["cursor"],
+                    sql_state=sql_state,
+                    max_m=PROXIMITY_MAX_M,
+                    skip_classify=False,
+                    classify_fn=lambda **_k: {"site_type": "tower"},
+                    chip_dir=Path(tmp),
+                    verbose=False,
+                )
+        connect.assert_not_called()
+        self.assertEqual(row["holdout_reason"], "sql_error")
+
+    def test_sql_error_is_not_dequeued(self):
+        from enrichment.constants import BUCKET_OTHER
+        from enrichment.pipeline import _collect_apply_rows
+
+        rows = [
+            {
+                "Id": "a0ZSQLERR0000001",
+                "bucket": BUCKET_OTHER,
+                "holdout_reason": "sql_error",
+                "sf_update_status": "skipped",
+            }
+        ]
+        apply_rows = _collect_apply_rows(
+            rows,
+            dequeue_holdouts=True,
+            db_only=False,
+            confirm_rooftop=False,
+            confirm_existing=False,
+        )
+        self.assertEqual(apply_rows, [])
+
+
+class HoldoutRerunTests(unittest.TestCase):
+    def test_holdout_ids_from_run_folder(self):
+        from enrichment.constants import HOLDOUT_CSV
+        from enrichment.outputs import holdout_ids_from_run_specs, write_csv
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run = root / "2026-09-01_example"
+            run.mkdir()
+            write_csv(
+                run / HOLDOUT_CSV,
+                [
+                    {"Id": "a0Zaaa", "holdout_reason": "other"},
+                    {"Id": "a0Zbbb", "holdout_reason": "tower_no_cell_equipment"},
+                    {"Id": "a0Zaaa", "holdout_reason": "other"},
+                ],
+                ("Id", "holdout_reason"),
+            )
+            ids = holdout_ids_from_run_specs([run.name], runs_root=root)
+        self.assertEqual(ids, ["a0Zaaa", "a0Zbbb"])
+
+    def test_site_ids_from_run_date_prefix(self):
+        from enrichment.constants import DETAIL_CSV
+        from enrichment.naip_classify import resolve_reuse_chips_dirs
+        from enrichment.outputs import site_ids_from_run_specs, write_csv
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            older = root / "2026-09-01_100000_sf_enrichment"
+            newer = root / "2026-09-01_163825_sf_enrichment"
+            skipped = root / "2026-08-31_155100_sf_enrichment"
+            for run in (older, newer, skipped):
+                (run / "chips").mkdir(parents=True)
+            write_csv(
+                older / DETAIL_CSV,
+                [
+                    {"Id": "a0Zold", "Stage__c": "Outreach - Verified"},
+                    {"Id": "a0Zshared", "Stage__c": "Outreach - Verified"},
+                    {"Id": "a0Zworking", "Stage__c": "Working-Connected"},
+                ],
+                ("Id", "Stage__c"),
+            )
+            write_csv(
+                newer / DETAIL_CSV,
+                [
+                    {
+                        "Id": "a0Znew",
+                        "Stage__c": "Outreach - Verified",
+                        "sf_update_status": "dequeued",
+                    },
+                    {
+                        "Id": "a0Zshared",
+                        "Stage__c": "Outreach - Verified",
+                        "sf_update_status": "updated",
+                    },
+                ],
+                ("Id", "Stage__c", "sf_update_status"),
+            )
+            write_csv(
+                skipped / DETAIL_CSV,
+                [{"Id": "a0Zaug", "Stage__c": "Outreach - Verified"}],
+                ("Id", "Stage__c"),
+            )
+            ids = site_ids_from_run_specs(["2026-09-01"], runs_root=root)
+            pending = site_ids_from_run_specs(
+                ["2026-09-01"], runs_root=root, skip_applied=True
+            )
+            all_stages = site_ids_from_run_specs(
+                ["2026-09-01"], runs_root=root, stages=[]
+            )
+            chips = resolve_reuse_chips_dirs(["2026-09-01"], runs_root=root)
+        self.assertEqual(ids, ["a0Znew", "a0Zshared", "a0Zold"])
+        self.assertEqual(pending, ["a0Znew", "a0Zold"])
+        self.assertEqual(all_stages, ["a0Znew", "a0Zshared", "a0Zold", "a0Zworking"])
+        self.assertEqual(
+            [path.parent.name for path in chips],
+            ["2026-09-01_163825_sf_enrichment", "2026-09-01_100000_sf_enrichment"],
+        )
+
+    def test_load_saved_chip_pack(self):
+        from PIL import Image
+
+        from enrichment.naip_classify import load_saved_chip_pack, saved_chip_pack_usable
+
+        with tempfile.TemporaryDirectory() as tmp:
+            chips = Path(tmp) / "chips"
+            chips.mkdir()
+            Image.new("RGB", (8, 8), "red").save(chips / "a0Ztest_nearmap_vert.jpg")
+            Image.new("RGB", (8, 8), "blue").save(chips / "a0Ztest_nearmap_north.jpg")
+            Image.new("RGB", (8, 8), "green").save(chips / "a0Ztest_NAIP.jpg")
+            pack = load_saved_chip_pack([chips], "a0Ztest")
+            empty = load_saved_chip_pack([chips], "missing")
+        self.assertTrue(saved_chip_pack_usable(pack))
+        self.assertIn("Vert", pack["nearmap_views"])
+        self.assertIn("North", pack["nearmap_views"])
+        self.assertIsNotNone(pack["naip"])
+        self.assertFalse(saved_chip_pack_usable(empty))
+
+
+class DbOnlyPipelineTests(unittest.TestCase):
+    def _site(self, **extra):
+        row = {
+            "Id": "a0ZDBONLY0000001",
+            "Site_Latitude__c": 43.0,
+            "Site_Longitude__c": -89.0,
+        }
+        row.update(extra)
+        return row
+
+    def _process(self, cursor, *, db_only=True, classify_fn=None):
+        from enrichment.constants import PROXIMITY_MAX_M
+        from enrichment.pipeline import _process_site
+
+        called = {"n": 0}
+
+        def boom(**_kwargs):
+            called["n"] += 1
+            raise AssertionError("classify must not run in db_only")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            return (
+                _process_site(
+                    self._site(),
+                    cursor=cursor,
+                    max_m=PROXIMITY_MAX_M,
+                    skip_classify=False,
+                    db_only=db_only,
+                    classify_fn=classify_fn or boom,
+                    chip_dir=Path(tmp),
+                    verbose=False,
+                ),
+                called,
+            )
+
+    def test_unique_close_hit_applies_without_classify(self):
+        from enrichment.constants import BUCKET_POTENTIAL_UPDATE
+
+        cursor = FakeCursor(
+            fcc_rows=[
+                {
+                    "ID": 1,
+                    "ASR_Number": "A",
+                    "Latitude_Decimal": 43.00005,
+                    "Longitude_Decimal": -89.0,
+                    "Registration_Type": "Monopole",
+                }
+            ]
+        )
+        row, called = self._process(cursor)
+        self.assertEqual(called["n"], 0)
+        self.assertEqual(row["bucket"], BUCKET_POTENTIAL_UPDATE)
+        self.assertEqual(row["holdout_reason"], "skip_classify_db_hit")
+        self.assertEqual(row["update_site_type"], "Monopole")
+        self.assertEqual(row["update_verified_site_source"], "FCC")
+        self.assertEqual(row["match_source"], "FCC")
+
+    def test_ambiguous_cluster_does_not_apply_or_classify(self):
+        from enrichment.constants import BUCKET_OTHER
+
+        cursor = FakeCursor(
+            fcc_rows=[
+                {
+                    "ID": 1,
+                    "ASR_Number": "A",
+                    "Latitude_Decimal": 43.00008,
+                    "Longitude_Decimal": -89.0,
+                },
+                {
+                    "ID": 2,
+                    "ASR_Number": "B",
+                    "Latitude_Decimal": 43.00012,
+                    "Longitude_Decimal": -89.0,
+                },
+            ]
+        )
+        row, called = self._process(cursor)
+        self.assertEqual(called["n"], 0)
+        self.assertEqual(row["bucket"], BUCKET_OTHER)
+        self.assertEqual(row["holdout_reason"], "db_only_no_unique_hit")
+        self.assertEqual(row["update_site_type"], "")
+
+    def test_no_hit_does_not_classify(self):
+        from enrichment.constants import BUCKET_OTHER
+
+        row, called = self._process(FakeCursor())
+        self.assertEqual(called["n"], 0)
+        self.assertEqual(row["bucket"], BUCKET_OTHER)
+        self.assertEqual(row["holdout_reason"], "db_only_no_unique_hit")
+
+
+class ConfirmRooftopTests(unittest.TestCase):
+    def test_presence_prompt_asks_for_building_not_cellular(self):
+        prompt = classification_prompt_for_run(presence_only=True)
+        self.assertIn("building-presence", prompt)
+        self.assertIn("Do not require antennas", prompt)
+        self.assertNotIn("Ordinary building mechanicals alone are NOT", prompt)
+        stock = classification_prompt_for_run(presence_only=False)
+        self.assertIn("ROOFTOP SITE: a building whose roof hosts cellular", stock)
+        self.assertIs(prompt, ROOFTOP_PRESENCE_PROMPT)
+
+    def test_naip_rooftop_persists_type_without_cell_or_coords(self):
+        for cell in (False, None, True):
+            with self.subTest(cell_equipment=cell):
+                decision = naip_rooftop_confirm_decision(
+                    {
+                        "site_type": "rooftop",
+                        "site_confidence": 0.7,
+                        "cell_equipment": cell,
+                    },
+                    existing_site_type="Rooftop",
+                )
+                self.assertEqual(decision["bucket"], BUCKET_POTENTIAL_UPDATE)
+                self.assertEqual(decision["update_site_type"], "Rooftop")
+                self.assertEqual(decision["update_lat"], "")
+                self.assertEqual(decision["update_verified_site"], "")
+                self.assertEqual(decision["holdout_reason"], "naip_rooftop_confirm")
+                self.assertFalse(decision["cell_equipment_confirmed"])
+
+    def test_rooftop_confirm_keeps_existing_site_type(self):
+        decision = naip_rooftop_confirm_decision(
+            {"site_type": "rooftop", "site_confidence": 0.7},
+            existing_site_type="Small Cell",
+        )
+        self.assertEqual(decision["bucket"], BUCKET_POTENTIAL_UPDATE)
+        self.assertEqual(decision["update_site_type"], "Small Cell")
+
+    def test_process_site_confirms_hvac_only_rooftop(self):
+        from enrichment.constants import PROXIMITY_MAX_M
+        from enrichment.pipeline import _process_site
+
+        def classify(**_kwargs):
+            return {
+                "site_type": "rooftop",
+                "site_confidence": 0.75,
+                "cell_equipment": False,
+                "cell_equipment_confidence": 0.2,
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            row = _process_site(
+                {
+                    "Id": "a0ZROOF000000003",
+                    "Site_Latitude__c": 43.0,
+                    "Site_Longitude__c": -89.0,
+                    "Site_Type__c": "Rooftop",
+                },
+                cursor=None,
+                max_m=PROXIMITY_MAX_M,
+                skip_classify=False,
+                classify_fn=classify,
+                chip_dir=Path(tmp),
+                verbose=False,
+                confirm_rooftop=True,
+            )
+        self.assertEqual(row["bucket"], BUCKET_POTENTIAL_UPDATE)
+        self.assertEqual(row["update_site_type"], "Rooftop")
+        self.assertEqual(row["naip_cell_equipment"], False)
+
+    def test_naip_other_or_low_conf_does_nothing(self):
+        other = naip_rooftop_confirm_decision(
+            {"site_type": "other", "site_confidence": 0.9}
+        )
+        weak = naip_rooftop_confirm_decision(
+            {"site_type": "rooftop", "site_confidence": 0.2}
+        )
+        tower = naip_rooftop_confirm_decision(
+            {"site_type": "tower", "site_confidence": 0.95}
+        )
+        for decision in (other, weak, tower):
+            self.assertEqual(decision["bucket"], BUCKET_OTHER)
+            self.assertEqual(decision["holdout_reason"], "naip_rooftop_unconfirmed")
+            self.assertEqual(decision["update_site_type"], "")
+
+    def test_process_site_skips_proximity_and_confirms(self):
+        from enrichment.constants import PROXIMITY_MAX_M
+        from enrichment.pipeline import _process_site
+
+        def classify(**_kwargs):
+            return {"site_type": "rooftop", "site_confidence": 0.8}
+
+        class BoomCursor:
+            def execute(self, *_args, **_kwargs):
+                raise AssertionError("confirm_rooftop must not query FCC/TowerSource")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            row = _process_site(
+                {
+                    "Id": "a0ZROOF000000001",
+                    "Site_Latitude__c": 43.0,
+                    "Site_Longitude__c": -89.0,
+                    "Site_Type__c": "Rooftop",
+                },
+                cursor=BoomCursor(),
+                max_m=PROXIMITY_MAX_M,
+                skip_classify=False,
+                classify_fn=classify,
+                chip_dir=Path(tmp),
+                verbose=False,
+                confirm_rooftop=True,
+            )
+        self.assertEqual(row["bucket"], BUCKET_POTENTIAL_UPDATE)
+        self.assertEqual(row["update_site_type"], "Rooftop")
+        self.assertEqual(row["match_source"], MATCH_SOURCE_NONE)
+        self.assertEqual(row["holdout_reason"], "naip_rooftop_confirm")
+
+    def test_confirm_does_not_reuse_cluster(self):
+        from enrichment.constants import PROXIMITY_MAX_M
+        from enrichment.pipeline import _process_site
+
+        calls = {"n": 0}
+
+        def classify(**_kwargs):
+            calls["n"] += 1
+            return {"site_type": "rooftop", "site_confidence": 0.8}
+
+        cache = [
+            {
+                "lat": 43.0,
+                "lon": -89.0,
+                "classified": {"site_type": "other", "site_confidence": 0.9},
+            }
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            row = _process_site(
+                {
+                    "Id": "a0ZROOF000000002",
+                    "Site_Latitude__c": 43.0,
+                    "Site_Longitude__c": -89.0,
+                    "Site_Type__c": "Rooftop",
+                },
+                cursor=None,
+                max_m=PROXIMITY_MAX_M,
+                skip_classify=False,
+                classify_fn=classify,
+                chip_dir=Path(tmp),
+                verbose=False,
+                cluster_cache=cache,
+                confirm_rooftop=True,
+            )
+        self.assertEqual(calls["n"], 1)
+        self.assertEqual(row["update_site_type"], "Rooftop")
+
+    def test_confirm_existing_rooftop_skips_sql(self):
+        from enrichment.constants import PROXIMITY_MAX_M
+        from enrichment.pipeline import _process_site
+
+        def classify(**_kwargs):
+            return {"site_type": "rooftop", "site_confidence": 0.8}
+
+        class BoomCursor:
+            def execute(self, *_args, **_kwargs):
+                raise AssertionError("rooftop confirm_existing must not query FCC")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            row = _process_site(
+                {
+                    "Id": "a0ZROOF000000010",
+                    "Site_Latitude__c": 43.0,
+                    "Site_Longitude__c": -89.0,
+                    "Site_Type__c": "Rooftop",
+                    "Stage__c": "Outreach - Verified",
+                },
+                cursor=BoomCursor(),
+                max_m=PROXIMITY_MAX_M,
+                skip_classify=False,
+                classify_fn=classify,
+                chip_dir=Path(tmp),
+                verbose=False,
+                confirm_existing=True,
+            )
+        self.assertEqual(row["bucket"], BUCKET_POTENTIAL_UPDATE)
+        self.assertEqual(row["update_site_type"], "Rooftop")
+        self.assertEqual(row["holdout_reason"], "naip_rooftop_confirm")
+
+    def test_confirm_existing_tower_uses_proximity(self):
+        from enrichment.constants import PROXIMITY_MAX_M
+        from enrichment.pipeline import _process_site
+
+        class BoomCursor:
+            def execute(self, *_args, **_kwargs):
+                raise RuntimeError("sql-called")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            row = _process_site(
+                {
+                    "Id": "a0ZTOWER00000001",
+                    "Site_Latitude__c": 43.0,
+                    "Site_Longitude__c": -89.0,
+                    "Site_Type__c": "Monopole",
+                    "Stage__c": "Outreach - Verified",
+                },
+                cursor=BoomCursor(),
+                max_m=PROXIMITY_MAX_M,
+                skip_classify=False,
+                classify_fn=lambda **_k: {"site_type": "tower", "site_confidence": 0.9},
+                chip_dir=Path(tmp),
+                verbose=False,
+                confirm_existing=True,
+            )
+        self.assertEqual(row["holdout_reason"], "sql_error")
+        self.assertIn("sql-called", row.get("error") or "")
+
+    def test_apply_sets_classified_without_holdout_or_coords(self):
+        from enrichment.sf_ops import apply_one_update
+
+        site = _FakeSiteSObject()
+        entry = apply_one_update(
+            _FakeClient(site),
+            {
+                "Id": "a0ZTEST000000099",
+                "naip_site_type": "rooftop",
+                "update_lat": "",
+                "update_lng": "",
+                "update_site_type": "Rooftop",
+                "holdout_reason": "naip_rooftop_confirm",
+            },
+            dry_run=False,
+            verbose=False,
+            write_holdout=False,
+            error_holdout=False,
+        )
+        self.assertTrue(entry["success"])
+        payload = site.calls[0][1]
+        self.assertEqual(payload["Site_Type__c"], "Rooftop")
+        self.assertTrue(payload["LLM_Classified__c"])
+        self.assertNotIn("LLM_Holdout__c", payload)
+        self.assertNotIn("Site_Latitude__c", payload)
+
+    def test_apply_paused_run_pushes_pending_confirms_only(self):
+        import enrichment.metrics as metrics_mod
+        from enrichment.constants import DETAIL_CSV
+        from enrichment.outputs import DETAIL_COLUMNS, write_csv
+        from enrichment.pipeline import apply_paused_run
+
+        site = _FakeSiteSObject()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run_dir = root / "paused"
+            run_dir.mkdir()
+            write_csv(
+                run_dir / DETAIL_CSV,
+                [
+                    {
+                        "Id": "a0ZPEND000000001",
+                        "bucket": "potential_update",
+                        "naip_site_type": "rooftop",
+                        "update_site_type": "Rooftop",
+                        "holdout_reason": "naip_rooftop_confirm",
+                        "sf_update_status": "pending",
+                        "outcome_class": "applied_rooftop",
+                    },
+                    {
+                        "Id": "a0ZSKIP000000001",
+                        "bucket": "other_or_else",
+                        "holdout_reason": "naip_rooftop_unconfirmed",
+                        "sf_update_status": "skipped",
+                        "outcome_class": "holdout_empty",
+                    },
+                ],
+                DETAIL_COLUMNS,
+            )
+            old_dir = metrics_mod.metrics_dir
+            old_sql = os.environ.get("METRICS_SQL")
+            metrics_mod.metrics_dir = lambda: root
+            os.environ["METRICS_SQL"] = "0"
+            try:
+                summary = apply_paused_run(
+                    sf_client=_FakeClient(site),
+                    run_dir=run_dir,
+                    apply=True,
+                    confirm_rooftop=True,
+                    verbose=False,
+                )
+            finally:
+                metrics_mod.metrics_dir = old_dir
+                if old_sql is None:
+                    os.environ.pop("METRICS_SQL", None)
+                else:
+                    os.environ["METRICS_SQL"] = old_sql
+        self.assertEqual(len(site.calls), 1)
+        self.assertEqual(site.calls[0][0], "a0ZPEND000000001")
+        self.assertEqual(site.calls[0][1]["Site_Type__c"], "Rooftop")
+        self.assertTrue(site.calls[0][1]["LLM_Classified__c"])
+        self.assertNotIn("Site_Latitude__c", site.calls[0][1])
+        self.assertEqual(summary["apply"]["success"], 1)
+        self.assertEqual(summary["apply"]["failed"], 0)
+
+    def test_run_enrichment_applies_salesforce_after_each_site(self):
+        import enrichment.metrics as metrics_mod
+        from enrichment.pipeline import run_enrichment
+
+        site = _FakeSiteSObject()
+        applied_before_second: list[int] = []
+
+        def classify(**_kwargs):
+            if _kwargs.get("site_id") == "a0ZSECOND000000001":
+                applied_before_second.append(len(site.calls))
+            return _rooftop_ok()
+
+        class FakeSql:
+            def cursor(self):
+                return FakeCursor()
+
+            def close(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run_dir = root / "live"
+            old_dir = metrics_mod.metrics_dir
+            old_sql = os.environ.get("METRICS_SQL")
+            old_batch = os.environ.get("APPLY_BATCH_SIZE")
+            metrics_mod.metrics_dir = lambda: root
+            os.environ["METRICS_SQL"] = "0"
+            os.environ["APPLY_BATCH_SIZE"] = "1"  # per-site write contract
+            try:
+                summary = run_enrichment(
+                    sf_client=_FakeClient(site),
+                    sql_connection=FakeSql(),
+                    run_dir=run_dir,
+                    sites=[
+                        {
+                            "Id": "a0ZFIRST0000000001",
+                            "Site_Latitude__c": 43.0,
+                            "Site_Longitude__c": -89.0,
+                        },
+                        {
+                            "Id": "a0ZSECOND000000001",
+                            "Site_Latitude__c": 43.1,
+                            "Site_Longitude__c": -89.1,
+                        },
+                    ],
+                    classify_fn=classify,
+                    apply=True,
+                    dequeue_holdouts=False,
+                    verbose=False,
+                    workers=1,
+                )
+            finally:
+                if old_batch is None:
+                    os.environ.pop("APPLY_BATCH_SIZE", None)
+                else:
+                    os.environ["APPLY_BATCH_SIZE"] = old_batch
+                metrics_mod.metrics_dir = old_dir
+                if old_sql is None:
+                    os.environ.pop("METRICS_SQL", None)
+                else:
+                    os.environ["METRICS_SQL"] = old_sql
+        self.assertEqual(applied_before_second, [1])
+        self.assertEqual([call[0] for call in site.calls], [
+            "a0ZFIRST0000000001",
+            "a0ZSECOND000000001",
+        ])
+        self.assertEqual(summary["apply"]["success"], 2)
+        self.assertEqual(summary["apply"]["failed"], 0)
+
+    def test_confirm_updated_counts_as_rooftop_write(self):
+        from enrichment.metrics import rollup_kpis, snapshot_run
+
+        snap = snapshot_run(
+            [
+                {
+                    "Id": "a",
+                    "bucket": "potential_update",
+                    "update_site_type": "Rooftop",
+                    "naip_site_type": "rooftop",
+                    "holdout_reason": "naip_rooftop_confirm",
+                    "sf_update_status": "updated",
+                },
+                {
+                    "Id": "b",
+                    "bucket": "other_or_else",
+                    "holdout_reason": "naip_rooftop_unconfirmed",
+                    "sf_update_status": "skipped",
+                },
+            ],
+            run_id="confirm-test",
+            confirm_rooftop=True,
+        )
+        by_id = {r["Id"]: r for r in snap["site_records"]}
+        self.assertEqual(by_id["a"]["outcome"], "applied_rooftop")
+        self.assertEqual(by_id["b"]["outcome"], "holdout_other")
+        kpis = rollup_kpis(snap["site_records"])
+        self.assertEqual(kpis["unique_sites"], 2)
+        self.assertEqual(kpis["written_sites"], 1)
+        self.assertEqual(kpis["rooftop_sf_writes"], 1)
+
+
+class ProgressBusyTests(unittest.TestCase):
+    def test_format_busy_line_includes_elapsed_and_spinner(self):
+        from enrichment.progress import format_busy_line
+
+        self.assertEqual(
+            format_busy_line("[1/3] a0Z | 1 Main St", frame="/", elapsed_s=12.4),
+            "[1/3] a0Z | 1 Main St | run 12.4s  /",
+        )
+        self.assertEqual(
+            format_busy_line("connecting SQL", elapsed_s=65),
+            "connecting SQL | run 1m05s",
+        )
+
+    def test_buffered_site_context_prints_each_site_as_one_block(self):
+        import io
+        import threading
+        from unittest.mock import patch
+
+        from enrichment import progress
+
+        buf = io.StringIO()
+        both_started = threading.Barrier(2)
+
+        def worker(label):
+            with progress.site_context(label, buffered=True):
+                progress.step("first")
+                both_started.wait()
+                progress.step("second")
+
+        with patch.object(progress.sys, "stdout", buf):
+            threads = [threading.Thread(target=worker, args=(n,)) for n in ("A", "B")]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        lines = [line for line in buf.getvalue().splitlines() if line]
+        self.assertEqual(len(lines), 4)
+        for start in (0, 2):
+            label = lines[start][1]
+            self.assertEqual(lines[start], f"[{label}]   -> first")
+            self.assertEqual(lines[start + 1], f"[{label}]   -> second")
+
+    def test_busy_non_tty_prints_one_line(self):
+        import io
+        from unittest.mock import patch
+
+        from enrichment import progress
+
+        buf = io.StringIO()
+        progress.reset_run_timer()
+        with patch.object(progress, "_stdout_is_tty", return_value=False):
+            with patch.object(progress.sys, "stdout", buf):
+                with progress.busy("[2/10] a0ZTEST | 1 Main St"):
+                    pass
+        text = buf.getvalue()
+        self.assertIn("[2/10] a0ZTEST | 1 Main St | run ", text)
+        self.assertNotIn("\r", text)
+        self.assertEqual(text.count("\n"), 1)
+
+
+if __name__ == "__main__":
+    unittest.main()
