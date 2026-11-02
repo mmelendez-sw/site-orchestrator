@@ -83,6 +83,11 @@ def _csv_oblique_views(raw: str, default: tuple[str, ...] = ("North", "East")) -
 
 OBLIQUE_VIEWS = _csv_oblique_views(env_str("NEARMAP_OBLIQUE_VIEWS", "North,East"))
 NEARMAP_VIEWS = ["Vert", *OBLIQUE_VIEWS]
+# Oblique directions one site may newly buy per run (0 = no cap). Sides the
+# tile cache already holds are free and do not count, so with 1 a held-out
+# site gains one side per re-run (North, East, South, West order) instead of
+# a full pack at once.
+NEARMAP_NEW_OBLIQUES_PER_SITE = max(0, env_int("NEARMAP_NEW_OBLIQUES_PER_SITE", 0))
 
 
 def nearmap_api_key() -> str:
@@ -486,7 +491,10 @@ def _tile_position(view: str, tx: int, ty: int, x0: int, x1: int, y0: int, y1: i
 
 # Purposes the budget guard drops first (at the soft limit); "pack" (the
 # primary Vert / first oblique) only stops at the hard limit.
-OPTIONAL_PURPOSES = frozenset({"wide", "second", "recenter", "oblique_extra"})
+OPTIONAL_PURPOSES = frozenset({"wide", "second", "recenter", "oblique_extra", "detail"})
+# Zoom-21 close-up of a disputed rooftop box (DETAIL_ZOOM_CROP): side length in m.
+NEARMAP_DETAIL_ZOOM = env_int("NEARMAP_DETAIL_ZOOM", 21)
+NEARMAP_DETAIL_CHIP_M = env_float("NEARMAP_DETAIL_CHIP_M", 50)
 
 
 class NearmapMeter:
@@ -500,6 +508,9 @@ class NearmapMeter:
         self.by_purpose: dict[str, int] = {}
         self.budget_blocked = False
         self.budget_skipped: list[str] = []
+        # NEARMAP_NEW_OBLIQUES_PER_SITE: sides bought new this run / refused by the cap.
+        self.new_obliques: list[str] = []
+        self.obliques_capped: list[str] = []
 
     def record(self, purpose: str, tiles: list[tuple[bytes | None, bool]]) -> int:
         billed = sum(len(data) for data, cached in tiles if data and not cached)
@@ -844,6 +855,28 @@ def cached_nearmap_views(lat: float, lon: float, chip_m: float = NEARMAP_CHIP_M,
     return result, (max(dates) if dates else None)
 
 
+def _new_oblique_allowed(lat: float, lon: float, chip_m: float, view: str,
+                         capture_date: str | None) -> bool:
+    """Apply ``NEARMAP_NEW_OBLIQUES_PER_SITE`` to one oblique on this site's meter.
+
+    A side already in the tile cache for this survey is free and always
+    allowed; a side this site already bought this run stays allowed (re-center
+    packs). Anything else counts against the cap.
+    """
+    cap = NEARMAP_NEW_OBLIQUES_PER_SITE
+    meter = _current_meter()
+    if cap <= 0 or meter is None or view == "Vert" or view in meter.new_obliques:
+        return True
+    cached = _cached_capture_date(lat, lon, chip_m, view)
+    if cached is not None and cached == capture_date:
+        return True
+    if len(meter.new_obliques) >= cap:
+        meter.obliques_capped.append(view)
+        return False
+    meter.new_obliques.append(view)
+    return True
+
+
 def fetch_nearmap_views(lat: float, lon: float, chip_m: float = NEARMAP_CHIP_M,
                         views: list[str] | None = None, *, zoom: int | None = None,
                         purpose: str = "pack"):
@@ -878,6 +911,8 @@ def fetch_nearmap_views(lat: float, lon: float, chip_m: float = NEARMAP_CHIP_M,
                     meter.budget_blocked = True
             logger.warning("Nearmap %s skipped: %s", purpose, BUDGET.describe())
             break
+        if zoom is None and not _new_oblique_allowed(lat, lon, chip_m, view, capture_date):
+            continue
         canvas = _stitch_view(lat, lon, chip_m, view, capture_date, zoom=zoom, purpose=purpose)
         if canvas is not None:
             result[view] = canvas

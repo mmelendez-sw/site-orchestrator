@@ -231,6 +231,45 @@ class NearmapSpendTests(unittest.TestCase):
         self.assertTrue(meter.budget_blocked)
         get.assert_not_called()
 
+    def _capped_fetch(self, tmp, calls, views, *, cap=1):
+        from classifier import imagery
+
+        with patch.dict(os.environ, {"SITE_ORCHESTRATOR_DATA": tmp, "NEARMAP_API_KEY": "x"}), \
+                patch.object(imagery, "_nearmap_get", side_effect=self._fake_get(calls)), \
+                patch.object(imagery, "nearmap_point_coverage", return_value=(True, "2026-05-01")), \
+                patch.object(imagery, "BUDGET", imagery.NearmapBudget(0, 90)), \
+                patch.object(imagery, "NEARMAP_NEW_OBLIQUES_PER_SITE", cap):
+            with imagery.nearmap_meter() as meter:
+                got, _date = imagery.fetch_nearmap_views(43.0, -89.0, views=views)
+        return got, meter
+
+    def test_new_oblique_cap_buys_one_new_side_per_site(self):
+        calls: list[str] = []
+        with tempfile.TemporaryDirectory() as tmp:
+            got, meter = self._capped_fetch(tmp, calls, ["Vert", "North", "East", "South", "West"])
+        self.assertEqual(sorted(got), ["North", "Vert"])
+        self.assertEqual(meter.new_obliques, ["North"])
+        self.assertEqual(meter.obliques_capped, ["East", "South", "West"])
+
+    def test_new_oblique_cap_lets_cached_sides_through_free(self):
+        calls: list[str] = []
+        with tempfile.TemporaryDirectory() as tmp:
+            self._capped_fetch(tmp, calls, ["Vert", "North"])  # run 1 bought North
+            first_run_calls = len(calls)
+            got, meter = self._capped_fetch(tmp, calls, ["Vert", "North", "East", "South", "West"])
+        self.assertEqual(sorted(got), ["East", "North", "Vert"])  # run 2 adds East only
+        self.assertEqual(meter.new_obliques, ["East"])
+        self.assertEqual(meter.obliques_capped, ["South", "West"])
+        self.assertGreater(meter.cache_hits, 0)
+        self.assertEqual(meter.tiles, len(calls) - first_run_calls)
+
+    def test_new_oblique_cap_off_by_default(self):
+        calls: list[str] = []
+        with tempfile.TemporaryDirectory() as tmp:
+            got, meter = self._capped_fetch(tmp, calls, ["North", "East"], cap=0)
+        self.assertEqual(sorted(got), ["East", "North"])
+        self.assertEqual(meter.obliques_capped, [])
+
 
 class StaggeredObliqueTests(unittest.TestCase):
     def _run(self, reply):

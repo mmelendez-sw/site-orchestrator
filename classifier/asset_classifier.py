@@ -44,6 +44,7 @@ from classifier.prompts import (
     CELL_GEAR_KIND_VALUES,
     CLAIMED_SITE_TOWER_CONFIRM_NOTE,
     CLASSIFICATION_PROMPT,
+    DETAIL_CROP_NOTE,
     EQUIPMENT_RECHECK_PROMPT,
     GEMINI_SCAN_SCHEMA,
     INPUT_CONFIDENCE_PROMPTS,
@@ -594,6 +595,54 @@ def _strict_rooftop_crop_yes(claude_res: dict) -> bool:
         return False
     text = str(claude_res.get("cell_equipment_evidence") or "").lower()
     return not any(cue in text for cue in _CROP_HEDGE_CUES)
+
+
+def confirm_rooftop_cell_on_detail(
+    res: dict,
+    clients: dict,
+    detail_views: list,
+    *,
+    gemini_box,
+    gemini_view: str,
+) -> tuple[dict, bool]:
+    """Claude re-judges a disputed rooftop on a zoom-21 close-up of Gemini's box.
+
+    Only a strict crop yes (``_strict_rooftop_crop_yes``) counts. The close-up
+    has its own pixel frame, so the written box stays Gemini's box on the
+    standard view it came from: offset and box gates keep working unchanged.
+    Anything else leaves ``res`` as it was. Returns (res, agreed).
+    """
+    if not detail_views or clients.get("claude") is None or not gemini_box:
+        return res, False
+    claude_res = classify_site(
+        "claude",
+        clients,
+        detail_views,
+        prompt=cell_confirm_prompt("rooftop", used_crop=True) + DETAIL_CROP_NOTE,
+        claude_model=CLAUDE_ESCALATION_MODEL,
+    )
+    if claude_res.get("cell_equipment") is not True or not _strict_rooftop_crop_yes(claude_res):
+        prior = str(res.get("cell_equipment_evidence") or "").strip()
+        note = f"zoom-21 close-up: Claude {claude_res.get('cell_equipment')}"
+        res["cell_equipment_evidence"] = f"{prior} | {note}".strip(" |")
+        _step_done("dual-model cell", "close-up not confirmed")
+        return res, False
+    res["cell_equipment"] = True
+    res["cell_equipment_confidence"] = claude_res.get("cell_equipment_confidence")
+    res["cell_equipment_evidence"] = (
+        f"zoom-21 close-up: {claude_res.get('cell_equipment_evidence') or ''}"
+    ).strip()
+    res["cell_gear_kind"] = claude_res.get("cell_gear_kind")
+    res["asset_box_2d"] = gemini_box
+    res["asset_view"] = gemini_view
+    res["gemini_cell_equipment"] = True
+    res["claude_cell_equipment"] = True
+    res["claude_dual_mode"] = "detail_zoom21"
+    res["cell_models_agree"] = True
+    res["dual_model_resolution"] = "agree_crop"
+    normalize_model_result(res)
+    _step_done("dual-model cell", "agree (zoom-21 close-up)")
+    return res, True
 
 
 def confirm_rooftop_cell_with_claude(

@@ -17,7 +17,8 @@ from pathlib import Path
 from typing import Any
 
 from classifier.prompts import STREET_BOX_NOTE
-from envutil import env_flag, env_float
+from enrichment.constants import MIN_IMAGERY_ONLY_CELL_CONFIDENCE
+from envutil import env_flag, env_float, env_int
 
 logger = logging.getLogger(__name__)
 
@@ -175,6 +176,21 @@ def saved_chip_pack_usable(pack: dict[str, Any] | None) -> bool:
     return pack.get("naip") is not None or bool(pack.get("nearmap_views"))
 
 
+def reusable_nearmap_views(views: dict[str, Any], *, purchases_allowed: bool) -> bool:
+    """Classify on these already-bought views instead of the normal path?
+
+    Vert-only cannot confirm a rooftop. When purchases are on, the views must
+    also cover every configured oblique: an incomplete set (e.g. Vert+North)
+    would otherwise block buying the missing side, and the normal path's tile
+    cache serves the sides already bought for free.
+    """
+    from classifier import imagery
+
+    if not any(name != "Vert" for name in views):
+        return False
+    return not purchases_allowed or all(view in views for view in imagery.OBLIQUE_VIEWS)
+
+
 def _refresh_classifier_flags(ac: Any) -> None:
     """Re-bind module flags from current env (enrichment may import after .env load)."""
     from classifier import imagery
@@ -198,6 +214,7 @@ def _refresh_classifier_flags(ac: Any) -> None:
     )
     ac.NEARMAP_API_KEY = imagery.nearmap_api_key()
     ac.NEARMAP_STAGGER_OBLIQUES = ac._env_flag("NEARMAP_STAGGER_OBLIQUES", default="1")
+    imagery.NEARMAP_NEW_OBLIQUES_PER_SITE = max(0, env_int("NEARMAP_NEW_OBLIQUES_PER_SITE", 0))
     ac.CHIP_SIZE_M = env_float("CHIP_SIZE_M", 300)
     ac.GEMINI_SOLO_CELL_CONF = env_float("GEMINI_SOLO_CELL_CONF", 0.85)
     ac.EMPTY_CHIP_LOCK_CONF = env_float("NEARMAP_EMPTY_LOCK_CONF", 0.90)
@@ -325,6 +342,59 @@ def dispute_oblique_stages(have: dict, configured: list[str] | tuple[str, ...]) 
     return [stage for stage in (first, rest) if stage]
 
 
+def detail_view_name(asset_view: str | None) -> str | None:
+    """Nearmap view a box was drawn on ("Vert" / "North" ...), else None.
+
+    NAIP and street-level boxes have no Nearmap view to zoom into.
+    """
+    from classifier.views import is_oblique_label, is_street_level_label, is_top_down_label
+
+    label = str(asset_view or "")
+    if not label.lower().startswith("nearmap") or is_street_level_label(label):
+        return None
+    if is_oblique_label(label):
+        lower = label.lower()
+        return next((d for d in ALL_OBLIQUE_DIRECTIONS if d.lower() in lower), None)
+    return "Vert" if is_top_down_label(label) else None
+
+
+def fetch_detail_views(
+    lat: float,
+    lon: float,
+    box,
+    asset_view: str,
+    *,
+    chip_dir: Path | None = None,
+    site_id: str = "",
+) -> list:
+    """Zoom-21 Nearmap close-up of ``box`` on the view it was drawn on.
+
+    Centred on the box's approximate ground position (the pin when that
+    cannot be worked out). Returns ``[(label, image)]`` or ``[]`` when the
+    view has no close-up coverage or the budget refuses the optional buy.
+    """
+    from classifier import imagery
+
+    name = detail_view_name(asset_view)
+    if name is None:
+        return []
+    located = imagery.locate_asset_box_latlon(
+        lat=lat, lon=lon, box=box, box_view=asset_view, nearmap_aoi_m=imagery.NEARMAP_CHIP_M
+    )
+    c_lat, c_lon = (located[0], located[1]) if located else (lat, lon)
+    got, _date = imagery.fetch_nearmap_views(
+        c_lat, c_lon, chip_m=imagery.NEARMAP_DETAIL_CHIP_M, views=[name],
+        zoom=imagery.NEARMAP_DETAIL_ZOOM, purpose="detail",
+    )
+    img = got.get(name)
+    if img is None:
+        return []
+    if chip_dir is not None:
+        img.save(chip_dir / f"{site_id}_nearmap_detail_{name.lower()}.jpg", quality=90)
+    base = "Nearmap top-down" if name == "Vert" else f"Nearmap oblique ({name})"
+    return [(f"{base}, zoom-21 close-up", img)]
+
+
 def _classify_site_imagery(
     *,
     site_id: str,
@@ -444,17 +514,13 @@ def _classify_site_imagery(
         pack = load_saved_chip_pack(saved_nearmap_chip_dirs(), site_id, require_nearmap=True)
         saved_views = pack.get("nearmap_views") or {}
         purchases_allowed = not ac.NAIP_ONLY and bool(imagery.nearmap_api_key())
-        complete = all(view in saved_views for view in imagery.OBLIQUE_VIEWS)
-        if not any(name != "Vert" for name in saved_views) or (purchases_allowed and not complete):
-            # Vert-only packs cannot confirm a rooftop, and an incomplete pack
-            # (e.g. Vert+North) must not block buying the missing oblique: take
-            # the normal path, whose tile cache serves already-bought tiles free.
+        if not reusable_nearmap_views(saved_views, purchases_allowed=purchases_allowed):
             pack = {"naip": None, "nearmap_views": {}, "source_dir": None}
         source = pack["source_dir"].parent.name if pack.get("nearmap_views") else ""
         if not pack.get("nearmap_views") and env_flag("NEARMAP_CACHE_ONLY", True):
             # Tiles bought for neighbouring sites, stitched from disk (never billed).
             cached, _date = imagery.cached_nearmap_views(lat, lon)
-            if any(name != "Vert" for name in cached):  # needs an oblique to be worth reusing
+            if reusable_nearmap_views(cached, purchases_allowed=purchases_allowed):
                 pack = {"naip": None, "nearmap_views": cached, "source_dir": None}
                 source = "tile cache"
         if pack.get("nearmap_views"):
@@ -1258,6 +1324,9 @@ def _classify_site_imagery(
             confirm_views, used_crop = ac.build_cell_confirm_views(res, views)
         if used_crop and verbose:
             progress.step("dual-model on cell crop")
+        # Gemini's box before Claude can veto it: the close-up below zooms on it.
+        gemini_claim_box = ac.get_valid_asset_box(res) if res.get("cell_equipment") is True else None
+        gemini_claim_view = str(res.get("asset_view") or "")
         res, dual_model, cell_agree = ac.confirm_rooftop_cell_with_claude(
             res,
             clients,
@@ -1327,6 +1396,36 @@ def _classify_site_imagery(
                     res, dual_model, cell_agree = retry, dual_retry or dual_model, True
                     views = build_views(nearmap_views)
                     break
+        # Still disputed, or Claude's yes is below the imagery-only bar (the
+        # 2026-11-02 true holdouts sat at 0.62 / 0.72): buy a zoom-21 close-up of
+        # Gemini's box and let Claude judge the gear itself. DETAIL_ZOOM_CROP=0
+        # turns this off.
+        weak_agree = cell_agree and (
+            ac.normalize_confidence(res.get("cell_equipment_confidence")) or 0.0
+        ) < MIN_IMAGERY_ONLY_CELL_CONFIDENCE
+        if (
+            (not cell_agree or weak_agree)
+            and str(res.get("site_type") or "").strip().lower() == "rooftop"
+            and gemini_claim_box
+            and detail_view_name(gemini_claim_view)
+            and purchase_ok
+            and env_flag("DETAIL_ZOOM_CROP", True)
+        ):
+            detail_views = fetch_detail_views(
+                lat, lon, gemini_claim_box, gemini_claim_view,
+                chip_dir=chip_dir, site_id=site_id,
+            )
+            if verbose:
+                progress.step(
+                    "zoom-21 close-up of Gemini's box"
+                    + ("" if detail_views else " — no coverage")
+                )
+            res, detail_agree = ac.confirm_rooftop_cell_on_detail(
+                res, clients, detail_views,
+                gemini_box=gemini_claim_box, gemini_view=gemini_claim_view,
+            )
+            if detail_agree:
+                dual_model, cell_agree = "claude", True
         if dual_model and not escalation_model:
             escalation_model = dual_model
             escalation_reason_str = escalation_reason_str or (

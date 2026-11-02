@@ -2404,6 +2404,20 @@ class HoldoutRerunTests(unittest.TestCase):
         self.assertIsNotNone(pack["naip"])
         self.assertFalse(saved_chip_pack_usable(empty))
 
+    def test_reusable_nearmap_views_needs_every_configured_side_when_buying(self):
+        from unittest.mock import patch
+
+        from classifier import imagery
+        from enrichment.naip_classify import reusable_nearmap_views
+
+        partial = {"Vert": 1, "North": 1}
+        full = {"Vert": 1, "North": 1, "East": 1, "South": 1, "West": 1}
+        with patch.object(imagery, "OBLIQUE_VIEWS", ["North", "East", "South", "West"]):
+            self.assertFalse(reusable_nearmap_views({"Vert": 1}, purchases_allowed=False))
+            self.assertFalse(reusable_nearmap_views(partial, purchases_allowed=True))
+            self.assertTrue(reusable_nearmap_views(partial, purchases_allowed=False))
+            self.assertTrue(reusable_nearmap_views(full, purchases_allowed=True))
+
 
 class DbOnlyPipelineTests(unittest.TestCase):
     def _site(self, **extra):
