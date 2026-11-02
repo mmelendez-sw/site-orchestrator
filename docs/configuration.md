@@ -127,7 +127,6 @@ no inline default (the code decides what absence means); see the file.
 | `NEARMAP_EMPTY_LOCK_CONF` | `0.9` | classifier/asset_classifier.py, enrichment/constants.py, enrichment/naip_classify.py |
 | `NEARMAP_MAX_PX` | `1024` | classifier/imagery.py |
 | `NEARMAP_MONTHLY_BUDGET_MB` | `1500` | classifier/imagery.py, enrichment/budget.py |
-| `NEARMAP_NEW_OBLIQUES_PER_SITE` | `0` | classifier/imagery.py, enrichment/naip_classify.py |
 | `NEARMAP_OBLIQUE_VIEWS` | `North,East` | classifier/imagery.py |
 | `NEARMAP_OBLIQUE_ZOOM` | `20` | classifier/imagery.py |
 | `NEARMAP_PRIOR_USE_MB` | `0` | enrichment/budget.py, enrichment/lanes.py, enrichment/pipeline.py |

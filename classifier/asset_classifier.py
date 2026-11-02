@@ -2049,17 +2049,22 @@ def classify_with_tiers(lat: float, lon: float, img: Image.Image | None,
         nearmap_date = ob_date or nearmap_date
         rest = []
     res, views = classify_pack()
-    if rest:
+    # One more side at a time, re-classifying after each, until the call locks.
+    for i, view in enumerate(rest):
         if obliques_settled(res):
-            _step_done("Nearmap obliques", f"{first[0]} only — call locked, skip {', '.join(rest)}")
-        else:
-            oblique_views, ob_date = fetch_nearmap_views(
-                lat, lon, views=rest, purpose="oblique_extra"
+            seen = [v for v in OBLIQUE_VIEWS if v in nearmap_views]
+            _step_done(
+                "Nearmap obliques",
+                f"{', '.join(seen)} — call locked, skip {', '.join(rest[i:])}",
             )
-            if oblique_views:
-                nearmap_views.update(oblique_views)
-                nearmap_date = ob_date or nearmap_date
-                res, views = classify_pack()
+            break
+        oblique_views, ob_date = fetch_nearmap_views(
+            lat, lon, views=[view], purpose="oblique_extra"
+        )
+        if oblique_views:
+            nearmap_views.update(oblique_views)
+            nearmap_date = ob_date or nearmap_date
+            res, views = classify_pack()
     has_obliques = any(v in nearmap_views for v in OBLIQUE_VIEWS)
     _step_done("Nearmap obliques", None if has_obliques else "no coverage")
     _step_done("classify (Nearmap combined)", _brief_pass_result(res))

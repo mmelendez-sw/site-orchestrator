@@ -231,45 +231,6 @@ class NearmapSpendTests(unittest.TestCase):
         self.assertTrue(meter.budget_blocked)
         get.assert_not_called()
 
-    def _capped_fetch(self, tmp, calls, views, *, cap=1):
-        from classifier import imagery
-
-        with patch.dict(os.environ, {"SITE_ORCHESTRATOR_DATA": tmp, "NEARMAP_API_KEY": "x"}), \
-                patch.object(imagery, "_nearmap_get", side_effect=self._fake_get(calls)), \
-                patch.object(imagery, "nearmap_point_coverage", return_value=(True, "2026-05-01")), \
-                patch.object(imagery, "BUDGET", imagery.NearmapBudget(0, 90)), \
-                patch.object(imagery, "NEARMAP_NEW_OBLIQUES_PER_SITE", cap):
-            with imagery.nearmap_meter() as meter:
-                got, _date = imagery.fetch_nearmap_views(43.0, -89.0, views=views)
-        return got, meter
-
-    def test_new_oblique_cap_buys_one_new_side_per_site(self):
-        calls: list[str] = []
-        with tempfile.TemporaryDirectory() as tmp:
-            got, meter = self._capped_fetch(tmp, calls, ["Vert", "North", "East", "South", "West"])
-        self.assertEqual(sorted(got), ["North", "Vert"])
-        self.assertEqual(meter.new_obliques, ["North"])
-        self.assertEqual(meter.obliques_capped, ["East", "South", "West"])
-
-    def test_new_oblique_cap_lets_cached_sides_through_free(self):
-        calls: list[str] = []
-        with tempfile.TemporaryDirectory() as tmp:
-            self._capped_fetch(tmp, calls, ["Vert", "North"])  # run 1 bought North
-            first_run_calls = len(calls)
-            got, meter = self._capped_fetch(tmp, calls, ["Vert", "North", "East", "South", "West"])
-        self.assertEqual(sorted(got), ["East", "North", "Vert"])  # run 2 adds East only
-        self.assertEqual(meter.new_obliques, ["East"])
-        self.assertEqual(meter.obliques_capped, ["South", "West"])
-        self.assertGreater(meter.cache_hits, 0)
-        self.assertEqual(meter.tiles, len(calls) - first_run_calls)
-
-    def test_new_oblique_cap_off_by_default(self):
-        calls: list[str] = []
-        with tempfile.TemporaryDirectory() as tmp:
-            got, meter = self._capped_fetch(tmp, calls, ["North", "East"], cap=0)
-        self.assertEqual(sorted(got), ["East", "North"])
-        self.assertEqual(meter.obliques_capped, [])
-
 
 class StaggeredObliqueTests(unittest.TestCase):
     def _run(self, reply):
@@ -305,6 +266,29 @@ class StaggeredObliqueTests(unittest.TestCase):
         self.assertEqual(fetched, [["Vert"], ["North"], ["East"]])
         self.assertEqual(sorted(views), ["East", "North", "Vert"])
 
+    def test_four_sides_are_bought_one_at_a_time_until_the_call_locks(self):
+        from classifier import asset_classifier as ac
+
+        fetched: list[list[str]] = []
+        open_call = {"site_type": "rooftop", "site_confidence": 0.8, "cell_equipment": False}
+        locked = {"site_type": "tower", "site_confidence": 0.95, "cell_equipment": True}
+
+        def fake_nearmap(lat, lon, chip_m=100, views=None, **_kw):
+            fetched.append(list(views or []))
+            return {v: Image.new("RGB", (64, 64)) for v in views}, "2026-05-01"
+
+        def fake_pass(_provider, _clients, views, *_a, **kw):
+            if kw.get("screen"):
+                return {"site_type": "rooftop", "site_confidence": 0.8}
+            return dict(locked if any(label == "South" for label, _img in views) else open_call)
+
+        with patch.object(ac, "fetch_nearmap_views", side_effect=fake_nearmap),                 patch.object(ac, "_classify_pass", side_effect=fake_pass),                 patch.object(ac, "NEARMAP_API_KEY", "x"),                 patch.object(ac, "NEARMAP_STAGGER_OBLIQUES", True),                 patch.object(ac, "OBLIQUE_VIEWS", ["North", "East", "South", "West"]):
+            _res, views, _d, _tier, _v = ac.classify_with_tiers(
+                43.0, -89.0, Image.new("RGB", (64, 64)), "gemini", {}, "p", "high",
+                lambda nm: [(k, v) for k, v in nm.items()],
+            )
+        self.assertEqual(fetched, [["Vert"], ["North"], ["East"], ["South"]])  # West never bought
+        self.assertEqual(sorted(views), ["East", "North", "South", "Vert"])
 
 if __name__ == "__main__":
     unittest.main()

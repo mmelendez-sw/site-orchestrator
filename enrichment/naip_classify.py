@@ -18,7 +18,7 @@ from typing import Any
 
 from classifier.prompts import STREET_BOX_NOTE
 from enrichment.constants import MIN_IMAGERY_ONLY_CELL_CONFIDENCE
-from envutil import env_flag, env_float, env_int
+from envutil import env_flag, env_float
 
 logger = logging.getLogger(__name__)
 
@@ -214,7 +214,6 @@ def _refresh_classifier_flags(ac: Any) -> None:
     )
     ac.NEARMAP_API_KEY = imagery.nearmap_api_key()
     ac.NEARMAP_STAGGER_OBLIQUES = ac._env_flag("NEARMAP_STAGGER_OBLIQUES", default="1")
-    imagery.NEARMAP_NEW_OBLIQUES_PER_SITE = max(0, env_int("NEARMAP_NEW_OBLIQUES_PER_SITE", 0))
     ac.CHIP_SIZE_M = env_float("CHIP_SIZE_M", 300)
     ac.GEMINI_SOLO_CELL_CONF = env_float("GEMINI_SOLO_CELL_CONF", 0.85)
     ac.EMPTY_CHIP_LOCK_CONF = env_float("NEARMAP_EMPTY_LOCK_CONF", 0.90)
@@ -332,14 +331,15 @@ ALL_OBLIQUE_DIRECTIONS = ("North", "East", "South", "West")
 
 
 def dispute_oblique_stages(have: dict, configured: list[str] | tuple[str, ...]) -> list[list[str]]:
-    """Oblique directions to buy when the models disagree, in purchase order.
+    """Oblique directions to buy when the models disagree, one per stage.
 
     Missing configured directions first (normally North / East), then the
-    remaining South / West. Directions already in ``have`` are skipped.
+    remaining South / West. Directions already in ``have`` are skipped. Claude
+    re-checks after each side, so a site stops buying once one side agrees.
     """
     first = [v for v in configured if v not in have]
     rest = [v for v in ALL_OBLIQUE_DIRECTIONS if v not in have and v not in first]
-    return [stage for stage in (first, rest) if stage]
+    return [[v] for v in first + rest]
 
 
 def detail_view_name(asset_view: str | None) -> str | None:
