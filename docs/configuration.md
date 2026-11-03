@@ -32,7 +32,7 @@ no inline default (the code decides what absence means); see the file.
 | `AUDIT_RETRY_INCONCLUSIVE` | off | enrichment/__main__.py, enrichment/pipeline.py |
 | `AUDIT_UNQUALIFY_OWNER` | unset | enrichment/connectx_audit.py |
 | `AUTO_SKIP_CLASSIFY` | on | enrichment/cost_policy.py |
-| `AUTO_SKIP_ON_STRUCTURE_M` | `10` | enrichment/constants.py |
+| `AUTO_SKIP_ON_STRUCTURE_M` | `5` | enrichment/constants.py |
 | `AZURE_SQL_ALLOW_INTERACTIVE` | unset | enrichment/mssql.py |
 | `AZURE_SQL_DATABASE` | unset | enrichment/mssql.py |
 | `AZURE_SQL_DRIVER` | unset | enrichment/mssql.py |
@@ -58,6 +58,7 @@ no inline default (the code decides what absence means); see the file.
 | `CONFIRM_ROOFTOP` | off | enrichment/__main__.py |
 | `CONNECTX_AUDIT` | off | enrichment/__main__.py |
 | `DB_ONLY` | off | enrichment/__main__.py |
+| `DB_ONLY_ON_STRUCTURE_M` | `10` | enrichment/constants.py |
 | `DENSITY_RURAL_MAX` | `3` | enrichment/constants.py |
 | `DENSITY_SUBURBAN_MAX` | `12` | enrichment/constants.py |
 | `DEQUEUE_HOLDOUTS` | computed | enrichment/__main__.py |

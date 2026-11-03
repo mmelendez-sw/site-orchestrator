@@ -42,9 +42,9 @@ def auto_skip_classify_reason(
 ) -> str | None:
     """Operator label when imagery can be skipped, else None.
 
-    Unique ≤25 m still skips. A pin on the structure (≤10 m) also skips when
-    extra registry structures sit nearby: the nearest wins. 10–25 m clusters
-    still need the ambiguity gap.
+    Unique ≤25 m still skips. A pin on the structure (``on_structure_m``: 5 m,
+    10 m in DB-only runs) also skips when extra registry structures sit nearby:
+    the nearest wins. Farther clusters still need the ambiguity gap.
     """
     if hit is None:
         return None
@@ -78,12 +78,14 @@ def registry_review_reason(
     hit: ProximityHit | None,
     tier: str = "",
     *,
+    competitor_only: bool = False,
     confident_m: float = PROXIMITY_CONFIDENT_M,
     ambiguity_gap_m: float = PROXIMITY_AMBIGUITY_GAP_M,
 ) -> str:
     """Why a registry hit that was not auto-accepted deserves a person's look, or ''.
 
     Clusters inside ``confident_m`` that the on-structure rule could not settle,
+    competitor-portal-only hits (70% right vs 80% multi-registry, 2026-11-03),
     and lone structures out to REGISTRY_REVIEW_MAX_M (REGISTRY_REVIEW_RURAL_MAX_M
     in rural areas, where far pins more often are the tower).
     """
@@ -91,11 +93,13 @@ def registry_review_reason(
         return ""
     dist = float(hit.distance_m)
     sources = getattr(hit, "sources", "") or hit.source
-    if dist <= float(confident_m):
-        n = hit.candidate_count or 2
-        return f"{n} structures within {float(confident_m):g} m, nearest {dist:.0f} m"
     gap = hit.runner_up_gap_m
     lone = (hit.candidate_count or 1) <= 1 or (gap is not None and float(gap) >= float(ambiguity_gap_m))
+    if dist <= float(confident_m):
+        if lone and competitor_only:
+            return f"competitor portal only, {dist:.0f} m away"
+        n = hit.candidate_count or 2
+        return f"{n} structures within {float(confident_m):g} m, nearest {dist:.0f} m"
     limit = REGISTRY_REVIEW_RURAL_MAX_M if tier == "rural" else REGISTRY_REVIEW_MAX_M
     if lone and dist <= float(limit):
         where = f", {tier}" if tier else ""

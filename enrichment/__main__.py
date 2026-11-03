@@ -31,7 +31,7 @@ inconclusive sites get LLM_Holdout__c=true and that OwnerId only.
 SAVED_NEARMAP_CHIPS=1 classifies on Nearmap chips an earlier run bought.
 LLM_CLASSIFIED=1/0 filters the audit queue (unset = either).
 Set DB_ONLY=1 to skip all imagery. Unique FCC/TowerSource hits ≤25 m
-(or the nearest structure ≤10 m from the pin) write Site_Type, coords and LLM_Classified=true (no
+(or the nearest structure ≤10 m from the pin, DB_ONLY_ON_STRUCTURE_M) write Site_Type, coords and LLM_Classified=true (no
 LLM_Holdout). A site that already has a Site_Type keeps it and its pin; the
 hit only marks it verified. Misses get only LLM_Last_Attempted_Date__c, so
 they stay in the imagery queue. Near misses are listed in review_queue.csv. Default DB-only stages: New/Unreviewed,

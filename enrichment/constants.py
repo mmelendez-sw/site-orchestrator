@@ -11,11 +11,14 @@ PROXIMITY_MAX_M = env_float("PROXIMITY_MAX_M", 500)
 # uniqueness checks — same spirit as the old 25 m default.
 PROXIMITY_CONFIDENT_M = env_float("PROXIMITY_CONFIDENT_M", 25)
 
-# Pin is on the structure: the nearest registry structure wins even when others
-# sit within 25 m (collocation). 2026-11-03 calibration on 8,114 imagery-boxed
+# Pin is on the structure: skip imagery even when other FCC/TowerSource rows
+# sit on the same pad (collocation). 5–25 m clusters still need the 60 m gap.
+AUTO_SKIP_ON_STRUCTURE_M = env_float("AUTO_SKIP_ON_STRUCTURE_M", 5)
+# DB-only runs (no imagery to fall back on): the nearest structure within this
+# of the pin wins a cluster. 2026-11-03 calibration on 8,114 imagery-boxed
 # sites: clusters whose nearest is 5–10 m picked the imaged asset 86% of the
-# time (0–5 m: 92%), 15–25 m only 60%, so 10–25 m clusters still need the gap.
-AUTO_SKIP_ON_STRUCTURE_M = env_float("AUTO_SKIP_ON_STRUCTURE_M", 10)
+# time (towers 90%, n=20), 0–5 m 92%, 15–25 m only 60%.
+DB_ONLY_ON_STRUCTURE_M = env_float("DB_ONLY_ON_STRUCTURE_M", 10)
 
 # Extended-range (confident..max) hits must beat the runner-up by this gap, or
 # sit within ADDRESS_AFFINITY_M of the geocoded address, to avoid wrong neighbors.

@@ -52,12 +52,14 @@ from enrichment.connectx_audit import (
 )
 from enrichment.constants import (
     APPLY_LOG_CSV,
+    AUTO_SKIP_ON_STRUCTURE_M,
     BUCKET_AUDIT_HOLDOUT,
     BUCKET_AUDIT_UNQUALIFY,
     BUCKET_OTHER,
     BUCKET_POTENTIAL_UPDATE,
     BUCKET_ROOFTOP,
     CANDIDATE_CSV,
+    DB_ONLY_ON_STRUCTURE_M,
     DEFAULT_STAGE_FILTER,
     DETAIL_CSV,
     HIGH_INPUT_CONFIDENCE_STAGES,
@@ -1040,7 +1042,9 @@ def _prepare_site(
         and getattr(hit, "sources", "") == MATCH_SOURCE_COMPETITOR
         and not competitor_verified_source()
     )
-    skip_reason = None if competitor_only else auto_skip_classify_reason(hit, force=db_only)
+    skip_reason = None if competitor_only else auto_skip_classify_reason(
+        hit, force=db_only, on_structure_m=DB_ONLY_ON_STRUCTURE_M if db_only else AUTO_SKIP_ON_STRUCTURE_M
+    )
     existing = {
         "existing_site_type": str(site.get("Site_Type__c") or "").strip(),
         "existing_source": str(site.get("Verified_Site_Source__c") or "").strip(),
@@ -1056,7 +1060,9 @@ def _prepare_site(
             return prep
         if hit is not None:
             base["db_site_type"] = site_type_from_db_asset_type(hit.asset_type)
-            base["registry_review"] = registry_review_reason(hit, base.get("density_tier") or "")
+            base["registry_review"] = registry_review_reason(
+                hit, base.get("density_tier") or "", competitor_only=competitor_only
+            )
         if verbose:
             progress.step("db-only — no unique registry hit (no imagery)")
         base["holdout_reason"] = "db_only_no_unique_hit"

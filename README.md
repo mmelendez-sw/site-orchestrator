@@ -104,7 +104,7 @@ With `AUDIT_HOLDOUT_OWNER=<User Id>` the unqualify step is replaced: every `no_a
 
 ## What ICEMAN writes
 
-- **Registry hit:** unique FCC/TowerSource match ≤ 25 m (or the nearest structure ≤ 10 m from the pin, even in a cluster) writes type and coordinates with no imagery. DB-only near misses (unsettled clusters, lone structures to 50 m, 150 m in rural areas by registry density) go to `review_queue.csv` instead.
+- **Registry hit:** unique FCC/TowerSource match ≤ 25 m (or the pin on the structure ≤ 5 m; in DB-only runs the nearest structure ≤ 10 m wins a cluster) writes type and coordinates with no imagery. DB-only near misses (unsettled clusters, competitor-portal-only hits, lone structures to 50 m, 150 m in rural areas by registry density) go to `review_queue.csv` instead.
 - **Towers:** Gemini tower + cell at site confidence ≥ 0.85 and gear confidence ≥ `GEMINI_TOWER_LOCK_CELL_CONF` (0.80) auto-apply; Claude can confirm weaker towers.
 - **Rooftops:** Nearmap obliques + dual-model agreement, or NAIP-only when site and cell confidence ≥ 0.95 with named gear, unhedged evidence and an asset box. A Mapillary photo may stand in for an oblique only with Claude's own box, cell confidence ≥ 0.9, no hedged wording and a photo ≤ `STREET_CONFIRM_MAX_AGE_YEARS` (5) old; those write `Verified_Site_Source = Google Map`.
 - **Consistency re-check** (`CONFIRM_CONSISTENCY`, on): each imagery-only confirm is re-classified on its saved chips and written only when both passes agree; a disagreement holds out as `consistency_disagree`.

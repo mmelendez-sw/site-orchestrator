@@ -63,11 +63,16 @@ class StructureGroupingTests(unittest.TestCase):
         # 4 m apart, nearest past 10 m, gap < 60 m: a collocation question, not written.
         self.assertIsNone(auto_skip_classify_reason(hit, force=True))
 
-    def test_nearest_within_10_m_wins_a_cluster(self):
+    def test_nearest_within_10_m_wins_a_cluster_in_db_only_runs(self):
+        from enrichment.constants import DB_ONLY_ON_STRUCTURE_M
+
         hit = _select(fcc=[_fcc(1, 8, "A"), _fcc(2, 12, "B")], ts=[_ts(3, 24, "C")])
         self.assertEqual(hit.candidate_count, 3)
         self.assertEqual(hit.record_id, "1")
-        self.assertIn("on-structure", auto_skip_classify_reason(hit, force=True) or "")
+        self.assertIn("on-structure", auto_skip_classify_reason(
+            hit, force=True, on_structure_m=DB_ONLY_ON_STRUCTURE_M) or "")
+        # Imagery runs keep the 5 m rule: this cluster still gets imagery.
+        self.assertIsNone(auto_skip_classify_reason(hit, force=True))
 
     def test_shared_asr_merges_even_when_coordinates_disagree(self):
         hit = _select(fcc=[_fcc(1, 3, "1226799", "TOWER")], ts=[_ts(1, 22, "1226799", "Guyed")])
@@ -190,6 +195,7 @@ class RegistryOnlyRunTests(unittest.TestCase):
         self.assertEqual(row["bucket"], BUCKET_OTHER)
         self.assertEqual(row["match_sources"], "Competitor")
         self.assertEqual(row["db_site_type"], "Self Support / Lattice Tower")
+        self.assertEqual(row["registry_review"], "competitor portal only, 4 m away")
         with patch.dict(os.environ, {"COMPETITOR_VERIFIED_SOURCE": "Competitor Site"}):
             row = self._process(_RegistryCursor(comp=[_comp("GIS1", 4.1)]))
             self.assertEqual(row["bucket"], BUCKET_POTENTIAL_UPDATE)
