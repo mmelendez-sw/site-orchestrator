@@ -176,6 +176,17 @@ class RegistryOnlyRunTests(unittest.TestCase):
         for field in ("Site_Type__c", "Site_Latitude__c", "Verified_Site_Source__c"):
             self.assertNotIn(field, payload)
 
+    def test_naip_confirm_needs_the_box_on_the_registry_point(self):
+        def tower_elsewhere(**kwargs):
+            return self._naip_tower(**kwargs) | {"asset_offset_m": 34.0}
+
+        self.classify_calls = []
+        with patch.dict(os.environ, {"NAIP_CONFIRM": "1"}):
+            row = self._process(_RegistryCursor(fcc=[_fcc(1, 38, "1298138", "MTOWER")]), classify_fn=tower_elsewhere)
+        self.assertEqual(row["bucket"], BUCKET_OTHER)
+        self.assertEqual(row["naip_confirm"], "not_confirmed:box_34m_off_registry_point")
+        self.assertEqual(row["update_verified_site"], "")
+
     def test_naip_confirm_leaves_an_unconfirmed_near_miss_stamped(self):
         def nothing(**_kwargs):
             return {"site_type": "other", "site_confidence": 0.8, "nearmap_tier": "naip_only"}

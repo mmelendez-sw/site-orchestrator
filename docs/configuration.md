@@ -120,6 +120,7 @@ no inline default (the code decides what absence means); see the file.
 | `MODEL_MAX_STREET_VIEWS` | `3` | classifier/views.py |
 | `NAIP_AGE_HIGH_CONF_OVERRIDE` | `0.85` | classifier/asset_classifier.py, enrichment/naip_classify.py |
 | `NAIP_CONFIRM` | off | enrichment/pipeline.py |
+| `NAIP_CONFIRM_BOX_M` | `20` | enrichment/constants.py |
 | `NAIP_MAX_AGE_YEARS` | `2` | classifier/asset_classifier.py, enrichment/naip_classify.py |
 | `NAIP_ONLY` | off | classifier/asset_classifier.py, enrichment/naip_classify.py, enrichment/pipeline.py |
 | `NAIP_ROOFTOP_SKIP` | off | classifier/asset_classifier.py |

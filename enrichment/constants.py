@@ -61,6 +61,11 @@ DENSITY_SUBURBAN_MAX = env_int("DENSITY_SUBURBAN_MAX", 12)
 # and held ~40% out to 150 m only in rural areas (2026-11-03 calibration).
 REGISTRY_REVIEW_MAX_M = env_float("REGISTRY_REVIEW_MAX_M", 50)
 REGISTRY_REVIEW_RURAL_MAX_M = env_float("REGISTRY_REVIEW_RURAL_MAX_M", 150)
+# NAIP_CONFIRM writes only when the model's asset box sits on the registry
+# point. 2026-11-03 ground truth (200 near misses): the NAIP tower gate alone
+# confirmed the right structure 55% of the time (base rate 50%); with the box
+# within 20 m of the registry point, 87% (20/23), in every distance band.
+NAIP_CONFIRM_BOX_M = env_float("NAIP_CONFIRM_BOX_M", 20)
 
 SF_QUERY_FIELDS = (
     "Id",

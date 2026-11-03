@@ -66,6 +66,7 @@ from enrichment.constants import (
     HOLDOUT_CSV,
     MATCH_SOURCE_COMPETITOR,
     MATCH_SOURCE_NONE,
+    NAIP_CONFIRM_BOX_M,
     PROXIMITY_MAX_M,
 )
 from enrichment.cost_policy import (
@@ -953,13 +954,19 @@ def _settle_naip_confirm(prep: PreparedSite) -> None:
     """After the NAIP read of a near miss: a bucketed tower confirms the registry
     structure (written like a unique hit); anything else stays a stamped miss."""
     base = prep.base
-    if base.get("bucket") == BUCKET_POTENTIAL_UPDATE:
+    offset = to_float(base.get("asset_offset_m"))
+    on_registry_point = offset is not None and offset <= NAIP_CONFIRM_BOX_M
+    if base.get("bucket") == BUCKET_POTENTIAL_UPDATE and on_registry_point:
         base["naip_confirm"] = "confirmed"
         base["holdout_reason"] = "naip_confirmed_registry"
         base["registry_review"] = ""
         _keep_existing_fields(base, prep.site)
         return
-    base["naip_confirm"] = f"not_confirmed:{base.get('holdout_reason') or base.get('error') or ''}"
+    if base.get("bucket") == BUCKET_POTENTIAL_UPDATE:
+        why = "no_asset_box" if offset is None else f"box_{offset:.0f}m_off_registry_point"
+    else:
+        why = base.get("holdout_reason") or base.get("error") or ""
+    base["naip_confirm"] = f"not_confirmed:{why}"
     base["bucket"] = BUCKET_OTHER
     base["holdout_reason"] = "db_only_no_unique_hit"
     for key in ("update_lat", "update_lng", "update_coord_source", "update_site_type",
