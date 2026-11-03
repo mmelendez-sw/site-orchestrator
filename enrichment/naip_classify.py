@@ -355,7 +355,10 @@ def site_qualified(res: dict[str, Any], cell_agree: bool) -> bool:
     """
     if not cell_agree:
         return False
-    if str(res.get("dual_model_resolution") or "").lower() == "gemini_strong_solo":
+    if (
+        str(res.get("dual_model_resolution") or "").lower() == "gemini_strong_solo"
+        and str(res.get("site_type") or "").lower() == "tower"
+    ):
         return True
     from classifier import asset_classifier as ac
 

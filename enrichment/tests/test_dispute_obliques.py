@@ -22,8 +22,10 @@ class DisputeObliqueStageTests(unittest.TestCase):
                                          "dual_model_resolution": "agree_crop"}, True))  # lukewarm Claude
         self.assertTrue(site_qualified({"cell_equipment_confidence": 0.85,
                                         "dual_model_resolution": "agree_crop"}, True))
-        self.assertTrue(site_qualified({"cell_equipment_confidence": 0.5,
+        self.assertTrue(site_qualified({"cell_equipment_confidence": 0.5, "site_type": "tower",
                                         "dual_model_resolution": "gemini_strong_solo"}, True))
+        self.assertFalse(site_qualified({"cell_equipment_confidence": 0.5, "site_type": "rooftop",
+                                         "dual_model_resolution": "gemini_strong_solo"}, True))
 
     def test_all_four_owned_buys_nothing(self):
         have = {"Vert": 1, "North": 1, "East": 1, "South": 1, "West": 1}
