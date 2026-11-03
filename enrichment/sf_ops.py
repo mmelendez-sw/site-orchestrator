@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterable, Sequence
+from datetime import UTC, datetime
 from typing import Any
 
 from enrichment.coerce import is_missing, to_bool, to_float
@@ -13,6 +14,7 @@ from enrichment.constants import (
     EXCLUDED_STAGE_FILTER,
     SF_QUERY_FIELDS,
 )
+from envutil import env_csv, env_str
 from salesforce.field_map import OBJECT_NAME
 from salesforce.sf_client import SalesforceClient
 
@@ -35,6 +37,32 @@ def is_enrichment_payload(payload: dict[str, Any] | None) -> bool:
     if not payload:
         return False
     return bool(ENRICHMENT_FIELDS.intersection(payload))
+
+
+def attempted_field() -> str | None:
+    """Site__c DateTime stamped on every attempted site; LLM_ATTEMPTED_FIELD=0 turns it off."""
+    text = env_str("LLM_ATTEMPTED_FIELD", "LLM_Last_Attempted_Date__c")
+    if text.lower() in {"0", "false", "no", "off", "none"}:
+        return None
+    return text
+
+
+def utc_now_iso() -> str:
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def stamp_attempted(payload: dict[str, Any], row: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Add the attempt timestamp (the row's ``attempted_at``, else now) to a payload."""
+    field = attempted_field()
+    if field:
+        payload[field] = str((row or {}).get("attempted_at") or "").strip() or utc_now_iso()
+    return payload
+
+
+def is_attempt_only_payload(payload: dict[str, Any] | None) -> bool:
+    """True when the payload only records that the site was attempted."""
+    field = attempted_field()
+    return bool(payload) and field is not None and set(payload) == {field}
 
 
 def parse_carrier_like(raw: str | None, *, default: str | None = None) -> str | None:
@@ -104,6 +132,21 @@ def _parse_optional_filter(raw: str | None, *, default: str | None) -> str | Non
     return text
 
 
+def parse_not_attempted_since(raw: str | None) -> str | None:
+    """NOT_ATTEMPTED_SINCE → SOQL datetime literal (YYYY-MM-DD, UTC midnight),
+    ``never`` (only sites never attempted), or None."""
+    text = (raw or "").strip()
+    if not text:
+        return None
+    if text.lower() == "never":
+        return "never"
+    try:
+        day = datetime.strptime(text, "%Y-%m-%d")
+    except ValueError as exc:
+        raise ValueError(f"NOT_ATTEMPTED_SINCE must be YYYY-MM-DD, got {text!r}") from exc
+    return day.strftime("%Y-%m-%dT00:00:00Z")
+
+
 def _soql_quote(value: str) -> str:
     return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
 
@@ -123,8 +166,14 @@ def build_blank_site_type_query(
     states: Sequence[str] | None = None,
     llm_classified: bool = False,
     site_type: str | None = None,
+    not_attempted_since: str | None = None,
+    exclude_site_types: Sequence[str] | None = None,
 ) -> str:
     """SOQL for enrichment queue sites.
+
+    `not_attempted_since` (SOQL datetime literal) keeps only sites never
+    attempted or last attempted before it; ``never`` keeps only the never
+    attempted. `exclude_site_types` drops those picklist values (blank stays).
 
     Default: blank ``Site_Type__c``. Pass ``site_type='Rooftop'`` to audit
     rows that already have that picklist value. Pass ``any`` / ``all`` / ``*``
@@ -191,6 +240,16 @@ def build_blank_site_type_query(
     ]
     if clean_states:
         clauses.append(f"Site_State__c IN ({_soql_in(clean_states)})")
+    field = attempted_field()
+    if not_attempted_since == "never" and field:
+        clauses.append(f"{field} = null")
+    elif not_attempted_since and field:
+        clauses.append(f"({field} = null OR {field} < {not_attempted_since})")
+    excluded_types = [t.strip() for t in (exclude_site_types or []) if t.strip()]
+    if excluded_types:
+        clauses.append(
+            f"(Site_Type__c = null OR Site_Type__c NOT IN ({_soql_in(excluded_types)}))"
+        )
     return (
         f"SELECT {field_list} FROM {OBJECT_NAME} WHERE "
         + " AND ".join(clauses)
@@ -249,6 +308,8 @@ def query_blank_site_type_sites(
         states=states,
         llm_classified=llm_classified,
         site_type=site_type,
+        not_attempted_since=parse_not_attempted_since(env_str("NOT_ATTEMPTED_SINCE")),
+        exclude_site_types=env_csv("SITE_TYPE_EXCLUDE"),
     )
     logger.info("Salesforce SOQL: %s", soql)
     return query_all(client, soql)
@@ -372,6 +433,7 @@ def update_site(
     payload: dict[str, Any],
     *,
     verbose: bool = False,
+    headers: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Update one Site__c row. Raises on API failure; caller should catch per-row."""
     if not record_id:
@@ -380,13 +442,26 @@ def update_site(
         raise ValueError("Update payload is empty")
     if verbose:
         logger.info("SF update %s payload=%s", record_id, payload)
-    result = getattr(client.sf, OBJECT_NAME).update(record_id, payload)
+    sobject = getattr(client.sf, OBJECT_NAME)
+    if headers:
+        result = sobject.update(record_id, payload, headers=headers)
+    else:
+        result = sobject.update(record_id, payload)
     # simple_salesforce returns HTTP status int on success for update.
     return {"id": record_id, "status": result, "success": True}
 
 
 def build_row_payload(row: dict[str, Any], *, write_holdout: bool = True) -> dict[str, Any]:
-    """Salesforce payload for one detail row (site fields + queue flags)."""
+    """Salesforce payload for one detail row: site fields, queue flags, attempt date.
+
+    ``attempt_only`` rows (no decision to write) carry just the attempt date.
+    """
+    if to_bool(row.get("attempt_only")) is True:
+        return stamp_attempted({}, row)
+    return stamp_attempted(_decision_payload(row, write_holdout=write_holdout), row)
+
+
+def _decision_payload(row: dict[str, Any], *, write_holdout: bool) -> dict[str, Any]:
     from enrichment.connectx_audit import (
         audit_holdout_payload,
         confirmed_owner_id,
@@ -460,27 +535,84 @@ def _new_entry(sf_id: str, payload: dict[str, Any], *, dry_run: bool) -> dict[st
     }
 
 
-def _needs_error_fallback(
-    entry: dict[str, Any], *, error_holdout: bool, dry_run: bool
-) -> bool:
+def duplicate_flag_field() -> str | None:
+    """Site__c checkbox ticked when a write hits a duplicate rule; DUPLICATE_FLAG_FIELD=0 turns it off."""
+    text = env_str("DUPLICATE_FLAG_FIELD", "Potential_Duplicate__c")
+    if text.lower() in {"0", "false", "no", "off", "none"}:
+        return None
+    return text
+
+
+# Saves through duplicate-rule matches; sent only with the duplicate-flag retry.
+ALLOW_DUPLICATES_HEADER = {"Sforce-Duplicate-Rule-Header": "allowSave=true"}
+
+
+def _flags_duplicate(entry: dict[str, Any]) -> bool:
+    """True when the failed write hit a duplicate rule and the flag is not yet sent."""
+    field = duplicate_flag_field()
     return (
-        error_holdout
-        and not dry_run
-        and bool(entry["Id"])
-        and not _is_holdout_fallback_payload(entry["payload"])
+        field is not None
+        and "DUPLICATES_DETECTED" in str(entry.get("error") or "")
+        and field not in (entry.get("payload") or {})
     )
 
 
-def _mark_fallback(entry: dict[str, Any], error: str, fallback_error: str | None) -> None:
-    """Record the outcome of the LLM_Holdout retry after a failed write."""
+def _wants_holdout(entry: dict[str, Any], *, error_holdout: bool) -> bool:
+    return (
+        error_holdout
+        and not _is_holdout_fallback_payload(entry["payload"])
+        and not is_attempt_only_payload(entry["payload"])
+    )
+
+
+def _needs_error_fallback(
+    entry: dict[str, Any], *, error_holdout: bool, dry_run: bool
+) -> bool:
+    """Retry a failed write: holdout dequeue, and/or tick the duplicate flag."""
+    return (
+        not dry_run
+        and bool(entry["Id"])
+        and (_wants_holdout(entry, error_holdout=error_holdout) or _flags_duplicate(entry))
+    )
+
+
+def _fallback_payload(entry: dict[str, Any], *, error_holdout: bool) -> dict[str, Any]:
+    """Retry payload: holdout flags (when the mode dequeues failures), the
+    duplicate flag (duplicate-rule errors), and the failed write's attempt date."""
+    payload: dict[str, Any] = {}
+    if _wants_holdout(entry, error_holdout=error_holdout):
+        payload.update(APPLY_ERROR_HOLDOUT_PAYLOAD)
+    if _flags_duplicate(entry):
+        payload[duplicate_flag_field()] = True
+    field = attempted_field()
+    if field and (entry.get("payload") or {}).get(field):
+        payload[field] = entry["payload"][field]
+    return payload
+
+
+def _retry_headers(payload: dict[str, Any]) -> dict[str, str] | None:
+    field = duplicate_flag_field()
+    return ALLOW_DUPLICATES_HEADER if field and payload.get(field) is True else None
+
+
+def _mark_fallback(
+    entry: dict[str, Any],
+    payload: dict[str, Any],
+    fallback_error: str | None,
+) -> None:
+    """Record the outcome of the retry after a failed write."""
     original = entry["error"]
-    entry["payload"] = dict(APPLY_ERROR_HOLDOUT_PAYLOAD)
+    entry["payload"] = payload
     if fallback_error is None:
         entry["success"] = True
-        entry["status"] = "updated_holdout_after_error"
+        dequeued = payload.get("LLM_Holdout__c") is True
+        entry["status"] = "updated_holdout_after_error" if dequeued else "duplicate_flagged"
         entry["error"] = f"fallback after apply error: {original}"
         logger.warning(
-            "SF write failed for %s — dequeued LLM_Holdout=true: %s", entry["Id"], error
+            "SF write failed for %s — %s: %s",
+            entry["Id"],
+            "dequeued LLM_Holdout=true" if dequeued else "flagged potential duplicate",
+            original,
         )
     else:
         entry["status"] = "failed"
@@ -538,18 +670,28 @@ def apply_one_update(
             if verbose:
                 progress.warn(f"SF update failed — continuing: {exc}")
             return entry
+    retry = _fallback_payload(entry, error_holdout=error_holdout)
     try:
-        update_site(client, sf_id, dict(APPLY_ERROR_HOLDOUT_PAYLOAD), verbose=False)
-        _mark_fallback(entry, entry["error"], None)
+        update_site(client, sf_id, retry, verbose=False, headers=_retry_headers(retry))
+        _mark_fallback(entry, retry, None)
         if verbose:
-            progress.warn(
-                "SF write failed — dequeued (LLM_Classified=false, LLM_Holdout=true)"
-            )
+            progress.warn(f"SF write failed — {_format_apply_result(retry, dry_run=False)}")
     except Exception as fallback_exc:  # noqa: BLE001
-        _mark_fallback(entry, entry["error"], str(fallback_exc))
+        _mark_fallback(entry, retry, str(fallback_exc))
         if verbose:
             progress.warn(f"SF update failed — continuing: {entry['error']}")
     return entry
+
+
+def _is_duplicate_flag_only(payload: dict[str, Any]) -> bool:
+    """Duplicate-flag retry that left the queue flags alone (no holdout dequeue)."""
+    field = duplicate_flag_field()
+    return (
+        field is not None
+        and payload.get(field) is True
+        and payload.get("LLM_Holdout__c") is not True
+        and not is_enrichment_payload(payload)
+    )
 
 
 def status_from_entry(entry: dict[str, Any]) -> str:
@@ -560,6 +702,10 @@ def status_from_entry(entry: dict[str, Any]) -> str:
         return "failed"
     payload = entry.get("payload")
     payload = payload if isinstance(payload, dict) else {}
+    if is_attempt_only_payload(payload):
+        return "stamped"
+    if _is_duplicate_flag_only(payload):
+        return "duplicate_flagged"
     if payload.get("Stage__c") == "Unqualified":
         return "unqualified"
     if is_enrichment_payload(payload):
@@ -579,11 +725,19 @@ def _format_apply_result(
 ) -> str:
     """Human-readable apply line: enrichment details, or holdout dequeue."""
     prefix = "SF dry-run OK (not written)" if dry_run else "SF updated"
-    if status == "updated_holdout_after_error":
+    dup_field = duplicate_flag_field()
+    dup = " + Potential_Duplicate=true" if dup_field and payload.get(dup_field) is True else ""
+    if status == "updated_holdout_after_error" or (
+        dup and payload.get("LLM_Holdout__c") is True
+    ):
         return (
             f"{prefix} | apply error fallback | "
-            "dequeued (LLM_Classified=false, LLM_Holdout=true)"
+            f"dequeued (LLM_Classified=false, LLM_Holdout=true){dup}"
         )
+    if _is_duplicate_flag_only(payload):
+        return f"{prefix} | duplicate rule hit | Potential_Duplicate=true (queue flags unchanged)"
+    if is_attempt_only_payload(payload):
+        return f"{prefix} | attempt date only (queue flags unchanged)"
     if payload.get("Stage__c") == "Unqualified":
         return (
             f"{prefix} | Unqualified ({payload.get('Unqualified_Reason__c') or '—'}) | "
@@ -623,6 +777,8 @@ def _collection_errors(result: dict[str, Any]) -> str:
 def update_sites_collection(
     client: SalesforceClient,
     updates: Sequence[tuple[str, dict[str, Any]]],
+    *,
+    headers: dict[str, str] | None = None,
 ) -> list[str | None]:
     """PATCH up to 200 Site__c rows in one call. Per-row error text or None.
 
@@ -640,7 +796,8 @@ def update_sites_collection(
             for sf_id, payload in updates
         ],
     }
-    response = client.sf.restful("composite/sobjects", method="PATCH", json=body)
+    kwargs = {"headers": headers} if headers else {}
+    response = client.sf.restful("composite/sobjects", method="PATCH", json=body, **kwargs)
     if not isinstance(response, list) or len(response) != len(updates):
         raise RuntimeError(f"unexpected sObject Collections reply: {response!r}")
     return [
@@ -650,17 +807,20 @@ def update_sites_collection(
 
 
 def _send_updates(
-    client: SalesforceClient, updates: Sequence[tuple[str, dict[str, Any]]]
+    client: SalesforceClient,
+    updates: Sequence[tuple[str, dict[str, Any]]],
+    *,
+    headers: dict[str, str] | None = None,
 ) -> list[str | None]:
     """One PATCH for a single row, sObject Collections for several."""
     if len(updates) == 1:
         sf_id, payload = updates[0]
         try:
-            update_site(client, sf_id, payload, verbose=False)
+            update_site(client, sf_id, payload, verbose=False, headers=headers)
             return [None]
         except Exception as exc:  # noqa: BLE001
             return [str(exc)]
-    return update_sites_collection(client, updates)
+    return update_sites_collection(client, updates, headers=headers)
 
 
 def apply_updates_batch(
@@ -766,19 +926,23 @@ def _fallback_failed(
     *,
     error_holdout: bool,
 ) -> None:
-    """LLM_Holdout retry for every failed entry that qualifies (one batch)."""
-    retry = [
-        entry
-        for entry in entries
-        if entry["status"] == "failed"
-        and _needs_error_fallback(entry, error_holdout=error_holdout, dry_run=False)
-    ]
-    if not retry:
-        return
-    payload = dict(APPLY_ERROR_HOLDOUT_PAYLOAD)
-    try:
-        errors = _send_updates(client, [(entry["Id"], payload) for entry in retry])
-    except Exception as exc:  # noqa: BLE001
-        errors = [str(exc)] * len(retry)
-    for entry, error in zip(retry, errors):
-        _mark_fallback(entry, entry["error"], error)
+    """Retry every failed entry that qualifies: one batch per header set
+    (duplicate-flag retries save through the duplicate rule)."""
+    groups: dict[bool, list[tuple[dict[str, Any], dict[str, Any]]]] = {}
+    for entry in entries:
+        if entry["status"] != "failed" or not _needs_error_fallback(
+            entry, error_holdout=error_holdout, dry_run=False
+        ):
+            continue
+        retry = _fallback_payload(entry, error_holdout=error_holdout)
+        groups.setdefault(_retry_headers(retry) is not None, []).append((entry, retry))
+    for allow_duplicates, batch in groups.items():
+        headers = ALLOW_DUPLICATES_HEADER if allow_duplicates else None
+        try:
+            errors = _send_updates(
+                client, [(entry["Id"], retry) for entry, retry in batch], headers=headers
+            )
+        except Exception as exc:  # noqa: BLE001
+            errors = [str(exc)] * len(batch)
+        for (entry, retry), error in zip(batch, errors):
+            _mark_fallback(entry, retry, error)

@@ -10,9 +10,13 @@ from typing import Any
 from enrichment.coerce import to_float
 from enrichment.constants import (
     AUTO_SKIP_ON_STRUCTURE_M,
+    DENSITY_RURAL_MAX,
+    DENSITY_SUBURBAN_MAX,
     NEARMAP_EMPTY_LOCK_CONF,
     PROXIMITY_AMBIGUITY_GAP_M,
     PROXIMITY_CONFIDENT_M,
+    REGISTRY_REVIEW_MAX_M,
+    REGISTRY_REVIEW_RURAL_MAX_M,
 )
 from enrichment.geo import haversine_meters
 from enrichment.mssql import ProximityHit
@@ -38,9 +42,9 @@ def auto_skip_classify_reason(
 ) -> str | None:
     """Operator label when imagery can be skipped, else None.
 
-    Unique ≤25 m still skips. A pin on the structure (≤5 m) also skips when
-    extra FCC/TowerSource rows share the pad — that is collocation, not a
-    wrong-neighbor choice. 10–25 m clusters still need the ambiguity gap.
+    Unique ≤25 m still skips. A pin on the structure (≤10 m) also skips when
+    extra registry structures sit nearby: the nearest wins. 10–25 m clusters
+    still need the ambiguity gap.
     """
     if hit is None:
         return None
@@ -59,6 +63,44 @@ def auto_skip_classify_reason(
     if gap is not None and float(gap) >= float(ambiguity_gap_m):
         return f"unique DB hit ≤{float(confident_m):g} m"
     return None
+
+
+def density_tier(count: int | None) -> str:
+    """rural / suburban / urban from registered structures near the pin."""
+    if count is None:
+        return ""
+    if count <= DENSITY_RURAL_MAX:
+        return "rural"
+    return "suburban" if count <= DENSITY_SUBURBAN_MAX else "urban"
+
+
+def registry_review_reason(
+    hit: ProximityHit | None,
+    tier: str = "",
+    *,
+    confident_m: float = PROXIMITY_CONFIDENT_M,
+    ambiguity_gap_m: float = PROXIMITY_AMBIGUITY_GAP_M,
+) -> str:
+    """Why a registry hit that was not auto-accepted deserves a person's look, or ''.
+
+    Clusters inside ``confident_m`` that the on-structure rule could not settle,
+    and lone structures out to REGISTRY_REVIEW_MAX_M (REGISTRY_REVIEW_RURAL_MAX_M
+    in rural areas, where far pins more often are the tower).
+    """
+    if hit is None:
+        return ""
+    dist = float(hit.distance_m)
+    sources = getattr(hit, "sources", "") or hit.source
+    if dist <= float(confident_m):
+        n = hit.candidate_count or 2
+        return f"{n} structures within {float(confident_m):g} m, nearest {dist:.0f} m"
+    gap = hit.runner_up_gap_m
+    lone = (hit.candidate_count or 1) <= 1 or (gap is not None and float(gap) >= float(ambiguity_gap_m))
+    limit = REGISTRY_REVIEW_RURAL_MAX_M if tier == "rural" else REGISTRY_REVIEW_MAX_M
+    if lone and dist <= float(limit):
+        where = f", {tier}" if tier else ""
+        return f"lone {sources} structure {dist:.0f} m away{where}"
+    return ""
 
 
 def find_cluster_match(

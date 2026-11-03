@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from classifier.prompts import CELL_GEAR_KIND_VALUES
-from envutil import env_float
+from envutil import env_float, env_int
 
 PROXIMITY_MAX_M = env_float("PROXIMITY_MAX_M", 500)
 
@@ -11,9 +11,11 @@ PROXIMITY_MAX_M = env_float("PROXIMITY_MAX_M", 500)
 # uniqueness checks — same spirit as the old 25 m default.
 PROXIMITY_CONFIDENT_M = env_float("PROXIMITY_CONFIDENT_M", 25)
 
-# Pin is on the structure: skip imagery even when other FCC/TowerSource rows
-# sit on the same pad (collocation). 10–25 m clusters still need the 75 m gap.
-AUTO_SKIP_ON_STRUCTURE_M = env_float("AUTO_SKIP_ON_STRUCTURE_M", 5)
+# Pin is on the structure: the nearest registry structure wins even when others
+# sit within 25 m (collocation). 2026-11-03 calibration on 8,114 imagery-boxed
+# sites: clusters whose nearest is 5–10 m picked the imaged asset 86% of the
+# time (0–5 m: 92%), 15–25 m only 60%, so 10–25 m clusters still need the gap.
+AUTO_SKIP_ON_STRUCTURE_M = env_float("AUTO_SKIP_ON_STRUCTURE_M", 10)
 
 # Extended-range (confident..max) hits must beat the runner-up by this gap, or
 # sit within ADDRESS_AFFINITY_M of the geocoded address, to avoid wrong neighbors.
@@ -36,8 +38,26 @@ ROOFTOP_HOST_OFFSET_M = env_float("ROOFTOP_HOST_OFFSET_M", 15)
 # Actual fetch buffer scales with PROXIMITY_MAX_M in mssql._buffer_deg_for_radius.
 BBOX_BUFFER_DEG = 0.0003
 
-FCC_TABLE = "dbo.FCCTowerData"
+FCC_TABLE = "dbo.FCCTowerData"  # FCC_SOURCE=legacy: no status or structure type
+FCC_COMPREHENSIVE_TABLE = "dbo.FCCComprehensiveTowerData"
 TOWERSOURCE_TABLE = "dbo.TowerSourceASRTowers"
+# Tower-company portals (Crown Castle, American Tower, ...); COMPETITOR_SOURCE=0 turns it off.
+COMPETITOR_TABLE = "dbo.ScrapedCompetitorSites"
+
+# Registry rows sharing an ASR number, or this close together, are one
+# physical structure (the same tower listed in FCC, TowerSource and a portal).
+SAME_STRUCTURE_M = env_float("SAME_STRUCTURE_M", 10)
+
+# Urbanicity stand-in: active FCC + TowerSource rows within this of the pin.
+# REGISTRY_DENSITY=0 skips the lookup.
+REGISTRY_DENSITY_RADIUS_M = env_float("REGISTRY_DENSITY_RADIUS_M", 2000)
+DENSITY_RURAL_MAX = env_int("DENSITY_RURAL_MAX", 3)
+DENSITY_SUBURBAN_MAX = env_int("DENSITY_SUBURBAN_MAX", 12)
+# DB-only near misses go to review_queue.csv, not Salesforce. Lone matches past
+# 25 m picked the imaged tower 56–63% of the time at 25–50 m in every tier,
+# and held ~40% out to 150 m only in rural areas (2026-11-03 calibration).
+REGISTRY_REVIEW_MAX_M = env_float("REGISTRY_REVIEW_MAX_M", 50)
+REGISTRY_REVIEW_RURAL_MAX_M = env_float("REGISTRY_REVIEW_RURAL_MAX_M", 150)
 
 SF_QUERY_FIELDS = (
     "Id",
@@ -115,6 +135,7 @@ DEFAULT_OWNER_FILTER = (
 
 MATCH_SOURCE_FCC = "FCC"
 MATCH_SOURCE_TOWERSOURCE = "TowerSource"
+MATCH_SOURCE_COMPETITOR = "Competitor"
 MATCH_SOURCE_NONE = "none"
 
 VERIFIED_SITE_SOURCE_FCC = "FCC"

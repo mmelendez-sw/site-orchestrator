@@ -28,6 +28,7 @@ from enrichment.constants import (
     CELL_GEAR_KINDS,
     DISCERNIBLE_CELL_GEAR_KINDS,
     GEMINI_TOWER_SKIP_CLAUDE_CONF,
+    MATCH_SOURCE_COMPETITOR,
     MATCH_SOURCE_NONE,
     MATCH_SOURCE_TOWERSOURCE,
     MAX_ASSET_OFFSET_M,
@@ -42,7 +43,7 @@ from enrichment.constants import (
     VERIFIED_SITE_SOURCE_NEARMAP,
     VERIFIED_SITE_SOURCE_TOWERSOURCE,
 )
-from envutil import env_float
+from envutil import env_float, env_str
 from salesforce.site_type_mapping import (
     cell_equipment_confirmed,
     map_site_type_for_upload,
@@ -436,6 +437,11 @@ def _asset_offset_too_far(
     return offset if offset > limit else None
 
 
+def competitor_verified_source() -> str:
+    """Verified_Site_Source__c value for competitor-portal hits; blank = none exists yet."""
+    return env_str("COMPETITOR_VERIFIED_SOURCE")
+
+
 def verified_source_for_match(
     match_source: str,
     *,
@@ -444,7 +450,11 @@ def verified_source_for_match(
     """Map match + imagery used to the Salesforce Verified_Site_Source__c value."""
     if match_source == MATCH_SOURCE_TOWERSOURCE:
         return VERIFIED_SITE_SOURCE_TOWERSOURCE
-    if match_source != MATCH_SOURCE_NONE:
+    if match_source == MATCH_SOURCE_COMPETITOR:
+        if competitor_verified_source():
+            return competitor_verified_source()
+        # No picklist value yet: credit the imagery that confirmed the site.
+    elif match_source != MATCH_SOURCE_NONE:
         return VERIFIED_SITE_SOURCE_FCC
     if classified and _used_nearmap_imagery(classified):
         return VERIFIED_SITE_SOURCE_NEARMAP

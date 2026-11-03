@@ -26,6 +26,7 @@ import os
 import queue
 import threading
 import time
+from collections import Counter
 from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
@@ -38,6 +39,7 @@ from enrichment import progress
 from enrichment.bucketing import (
     _holdout,
     bucket_classification,
+    competitor_verified_source,
     imagery_bucket,
     naip_rooftop_confirm_decision,
     verified_source_for_match,
@@ -60,13 +62,16 @@ from enrichment.constants import (
     DETAIL_CSV,
     HIGH_INPUT_CONFIDENCE_STAGES,
     HOLDOUT_CSV,
+    MATCH_SOURCE_COMPETITOR,
     MATCH_SOURCE_NONE,
     PROXIMITY_MAX_M,
 )
 from enrichment.cost_policy import (
     auto_skip_classify_reason,
     cluster_groups,
+    density_tier,
     find_cluster_match,
+    registry_review_reason,
     remember_cluster_result,
 )
 from enrichment.geo import (
@@ -95,6 +100,7 @@ from enrichment.mssql import (
     find_proximity_hits_bulk,
     is_sql_link_failure,
     reconnect_mssql,
+    registry_density_bulk,
 )
 from enrichment.naip_classify import classify_site_imagery
 from enrichment.outputs import (
@@ -107,10 +113,12 @@ from enrichment.outputs import (
 from enrichment.sf_ops import (
     apply_one_update,
     apply_updates_batch,
+    attempted_field,
     parse_sf_lat_lng,
     query_blank_site_type_sites,
     query_sites_by_ids,
     status_from_entry,
+    utc_now_iso,
 )
 from envutil import env_flag, env_float, env_int
 from paths import runs_dir
@@ -121,7 +129,9 @@ from salesforce.site_type_mapping import (
 
 logger = logging.getLogger(__name__)
 
-_ALREADY_WRITTEN = frozenset({"updated", "classified_only", "dequeued", "unqualified"})
+_ALREADY_WRITTEN = frozenset(
+    {"updated", "classified_only", "dequeued", "unqualified", "stamped", "duplicate_flagged"}
+)
 _SQL_ERROR_HOLDOUT = "sql_error"
 _NEARMAP_BUDGET_HOLDOUT = "nearmap_budget"
 # Transient holdouts stay in the Salesforce queue for a later run.
@@ -368,6 +378,12 @@ def _collect_apply_rows(
     confirm_existing: bool,
     connectx_audit: bool = False,
 ) -> list[dict[str, Any]]:
+    """Rows to write. Every other attempted row gets an attempt-date-only write.
+
+    DB-only misses are attempt-only too: they no longer set LLM_Classified, so
+    they stay in the imagery queue. Transient holdouts (SQL error, Nearmap
+    budget) were not really attempted and get nothing.
+    """
     apply_rows = [
         row
         for row in detail_rows
@@ -375,7 +391,7 @@ def _collect_apply_rows(
         and _needs_sf_apply(row)
     ]
     leave_failures = confirm_rooftop or confirm_existing or connectx_audit
-    if not leave_failures and (dequeue_holdouts or db_only):
+    if not leave_failures and dequeue_holdouts and not db_only:
         apply_rows.extend(
             row
             for row in detail_rows
@@ -383,6 +399,16 @@ def _collect_apply_rows(
             and _needs_sf_apply(row)
             and str(row.get("holdout_reason") or "") not in _KEEP_QUEUED_HOLDOUTS
         )
+    if attempted_field():
+        chosen = {id(row) for row in apply_rows}
+        for row in detail_rows:
+            if (
+                id(row) not in chosen
+                and _needs_sf_apply(row)
+                and str(row.get("holdout_reason") or "") not in _KEEP_QUEUED_HOLDOUTS
+            ):
+                row["attempt_only"] = True
+                apply_rows.append(row)
     return apply_rows
 
 
@@ -413,6 +439,8 @@ def _status_counts(detail_rows: Iterable[dict[str, Any]]) -> dict[str, int]:
         "dequeued": 0,
         "classified_only": 0,
         "unqualified": 0,
+        "stamped": 0,
+        "duplicate_flagged": 0,
         "failed": 0,
     }
     for row in detail_rows:
@@ -435,6 +463,8 @@ def _apply_info_from_detail(
         "dequeued_holdouts": counts["dequeued"],
         "classified_only": counts["classified_only"],
         "unqualified": counts["unqualified"],
+        "attempt_only": counts["stamped"],
+        "duplicate_flagged": counts["duplicate_flagged"],
         "failed": counts["failed"],
         "apply": apply,
         "log": log,
@@ -523,7 +553,10 @@ def _apply_rows(
 
 REVIEW_CSV = "review_queue.csv"
 REVIEW_COLUMNS = (
-    "Id", "review_reason", "footprint_status", "footprint_distance_m", "naip_site_type", "gemini_cell_confidence", "cell_equipment_confidence",
+    "Id", "review_reason", "Site_Street__c", "Site_City__c", "Site_State__c", "sf_lat", "sf_lng",
+    "match_distance_m", "match_sources", "match_candidate_count", "match_runner_up_gap_m",
+    "match_asr_number", "db_site_type", "classify_lat", "classify_lng", "registry_density",
+    "density_tier", "footprint_status", "footprint_distance_m", "naip_site_type", "gemini_cell_confidence", "cell_equipment_confidence",
     "dual_model_resolution", "holdout_reason", "audit_reason", "nearmap_views",
     "supplemental_sources", "cell_equipment_evidence", "chip_dir",
 )
@@ -534,6 +567,8 @@ def review_reason(row: dict[str, Any]) -> str:
     """Why an unconfirmed row needs a person, or '' (models split hard, stealth, unstable)."""
     if row.get("bucket") == BUCKET_POTENTIAL_UPDATE:
         return ""
+    if row.get("registry_review"):
+        return str(row["registry_review"])
     try:
         gemini = float(row.get("gemini_cell_confidence") or 0)
     except (TypeError, ValueError):
@@ -774,6 +809,35 @@ def _prefetch_signals(
     return out
 
 
+def _prefetch_density(
+    sites: list[dict[str, Any]], sql_state: dict[str, Any], *, verbose: bool
+) -> dict[str, dict[str, Any]]:
+    """Registered structures near each pin and its density tier (REGISTRY_DENSITY=0 skips)."""
+    if not sites or sql_state.get("cursor") is None or not env_flag("REGISTRY_DENSITY", True):
+        return {}
+    points = {}
+    for site in sites:
+        coords = parse_sf_lat_lng(site)
+        sf_id = str(site.get("Id") or "")
+        if coords is not None and sf_id:
+            points[sf_id] = coords
+    try:
+        counts = registry_density_bulk(sql_state["cursor"], points)
+    except Exception as exc:  # noqa: BLE001 — density is optional context
+        logger.warning("registry density unavailable: %s", exc)
+        if verbose:
+            progress.warn(f"registry density unavailable ({exc})")
+        return {}
+    out = {
+        sf_id: {"registry_density": n, "density_tier": density_tier(n)}
+        for sf_id, n in counts.items()
+    }
+    if verbose:
+        tiers = Counter(v["density_tier"] for v in out.values())
+        progress.result(f"registry density: {dict(tiers)}")
+    return out
+
+
 # ------------------------------- per site -----------------------------------
 
 
@@ -855,6 +919,7 @@ def _stamp_match(base: dict[str, Any], hit) -> None:
             "match_record_id": hit.record_id or "",
             "match_asr_number": hit.asr_number or "",
             "match_asset_type": hit.asset_type or "",
+            "match_sources": getattr(hit, "sources", "") or describe_match(hit),
             "classify_lat": hit.latitude,
             "classify_lng": hit.longitude,
             "classify_coord_source": f"db:{describe_match(hit)}",
@@ -968,23 +1033,39 @@ def _prepare_site(
         else:
             progress.result("no DB hit → classify on SF pin")
 
-    skip_reason = auto_skip_classify_reason(hit, force=db_only)
+    # A structure only a competitor portal lists cannot be written until
+    # Verified_Site_Source__c has a value for it (COMPETITOR_VERIFIED_SOURCE).
+    competitor_only = (
+        hit is not None
+        and getattr(hit, "sources", "") == MATCH_SOURCE_COMPETITOR
+        and not competitor_verified_source()
+    )
+    skip_reason = None if competitor_only else auto_skip_classify_reason(hit, force=db_only)
+    existing = {
+        "existing_site_type": str(site.get("Site_Type__c") or "").strip(),
+        "existing_source": str(site.get("Verified_Site_Source__c") or "").strip(),
+    }
     if db_only:
         prep.done = True
         if skip_reason is not None and hit is not None:
             if verbose:
                 progress.step(f"db-only unique hit ({skip_reason})")
-            _stamp_unique_db_update(base, hit, base["classify_lat"], base["classify_lng"])
+            _stamp_unique_db_update(
+                base, hit, base["classify_lat"], base["classify_lng"], keep_existing=True, **existing
+            )
             return prep
+        if hit is not None:
+            base["db_site_type"] = site_type_from_db_asset_type(hit.asset_type)
+            base["registry_review"] = registry_review_reason(hit, base.get("density_tier") or "")
         if verbose:
-            progress.step("db-only — no unique FCC/TowerSource hit (no imagery)")
+            progress.step("db-only — no unique registry hit (no imagery)")
         base["holdout_reason"] = "db_only_no_unique_hit"
         return prep
     if skip_classify or skip_reason is not None:
         prep.done = True
         if verbose:
             progress.step("skip classify" if skip_classify else f"auto skip classify ({skip_reason})")
-        if hit is not None:
+        if hit is not None and not competitor_only:
             _stamp_unique_db_update(base, hit, base["classify_lat"], base["classify_lng"])
         else:
             base["holdout_reason"] = "skip_classify_no_db_hit"
@@ -1371,11 +1452,21 @@ def _stamp_unique_db_update(
     hit,
     classify_lat: float,
     classify_lng: float,
+    *,
+    keep_existing: bool = False,
+    existing_site_type: str = "",
+    existing_source: str = "",
 ) -> dict[str, Any]:
-    """Salesforce candidate from a unique FCC/TowerSource hit (no imagery)."""
+    """Salesforce candidate from a unique registry hit (no imagery).
+
+    ``keep_existing`` (registry-only runs): a site that already has a
+    Site_Type keeps it and its pin; the hit only marks it verified, fills a
+    blank Verified_Site_Source, and logs what the registry said.
+    """
     sf_type = site_type_from_db_asset_type(hit.asset_type)
     base["bucket"] = BUCKET_POTENTIAL_UPDATE
     base["holdout_reason"] = "skip_classify_db_hit"
+    base["db_site_type"] = sf_type
     base["naip_site_type"] = "rooftop" if sf_type == "Rooftop" else "tower"
     base["update_lat"] = classify_lat
     base["update_lng"] = classify_lng
@@ -1383,6 +1474,13 @@ def _stamp_unique_db_update(
     base["update_site_type"] = sf_type
     base["update_verified_site"] = True
     base["update_verified_site_source"] = verified_source_for_match(base["match_source"])
+    if keep_existing and existing_site_type:
+        base["site_type_kept"] = existing_site_type
+        base["naip_site_type"] = "rooftop" if existing_site_type == "Rooftop" else "tower"
+        for key in ("update_lat", "update_lng", "update_coord_source", "update_site_type"):
+            base[key] = ""
+        if existing_source:
+            base["update_verified_site_source"] = ""
     return base
 
 
@@ -1463,6 +1561,8 @@ class _RunState:
             row = self.decorate(row)
         row["outcome_class"] = outcome_class(row)
         row.setdefault("sf_update_error", "")
+        if not row.get("attempted_at"):
+            row["attempted_at"] = utc_now_iso()
         row["sf_update_status"] = (
             "pending"
             if row.get("bucket") in {BUCKET_POTENTIAL_UPDATE, BUCKET_AUDIT_UNQUALIFY, BUCKET_AUDIT_HOLDOUT}
@@ -1845,6 +1945,8 @@ def run_enrichment(
             prefetch_sites, geocodes, sql_state, max_m=max_m, verbose=verbose
         )
         signals = _prefetch_signals(prefetch_sites, sql_state, verbose=verbose)
+        for sf_id, density in _prefetch_density(prefetch_sites, sql_state, verbose=verbose).items():
+            signals[sf_id] = {**signals.get(sf_id, {}), **density}
 
         pending: list[tuple[int, PreparedSite]] = []
         classify_error: BaseException | None = None

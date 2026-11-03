@@ -32,7 +32,7 @@ no inline default (the code decides what absence means); see the file.
 | `AUDIT_RETRY_INCONCLUSIVE` | off | enrichment/__main__.py, enrichment/pipeline.py |
 | `AUDIT_UNQUALIFY_OWNER` | unset | enrichment/connectx_audit.py |
 | `AUTO_SKIP_CLASSIFY` | on | enrichment/cost_policy.py |
-| `AUTO_SKIP_ON_STRUCTURE_M` | `5` | enrichment/constants.py |
+| `AUTO_SKIP_ON_STRUCTURE_M` | `10` | enrichment/constants.py |
 | `AZURE_SQL_ALLOW_INTERACTIVE` | unset | enrichment/mssql.py |
 | `AZURE_SQL_DATABASE` | unset | enrichment/mssql.py |
 | `AZURE_SQL_DRIVER` | unset | enrichment/mssql.py |
@@ -51,13 +51,19 @@ no inline default (the code decides what absence means); see the file.
 | `CLAUDE_ESCALATION_MODEL` | `claude-sonnet-4-6` | classifier/asset_classifier.py |
 | `CLAUDE_MODELS` | computed | classifier/llm.py |
 | `CLAUDE_RPM` | `50` | classifier/llm.py |
+| `COMPETITOR_SOURCE` | on | enrichment/mssql.py |
+| `COMPETITOR_VERIFIED_SOURCE` | unset | enrichment/bucketing.py |
 | `CONFIRM_CONSISTENCY` | on | enrichment/pipeline.py |
 | `CONFIRM_EXISTING` | off | enrichment/__main__.py |
 | `CONFIRM_ROOFTOP` | off | enrichment/__main__.py |
 | `CONNECTX_AUDIT` | off | enrichment/__main__.py |
 | `DB_ONLY` | off | enrichment/__main__.py |
+| `DENSITY_RURAL_MAX` | `3` | enrichment/constants.py |
+| `DENSITY_SUBURBAN_MAX` | `12` | enrichment/constants.py |
 | `DEQUEUE_HOLDOUTS` | computed | enrichment/__main__.py |
 | `DISPUTE_EXTRA_OBLIQUES` | on | enrichment/naip_classify.py |
+| `DUPLICATE_FLAG_FIELD` | `Potential_Duplicate__c` | enrichment/sf_ops.py |
+| `FCC_SOURCE` | `comprehensive` | enrichment/mssql.py |
 | `FCC_ULS_MICRO_URL` | `https://data.fcc.gov/download/pub/uls/complete/l_micro.zip` | scripts/load_fcc_uls_microwave.py |
 | `FOOTPRINT_ADDRESS_MAX_M` | `150.0` | enrichment/footprints.py |
 | `FOOTPRINT_BIG_M2` | `10000.0` | enrichment/footprints.py |
@@ -92,6 +98,7 @@ no inline default (the code decides what absence means); see the file.
 | `IMAGERY_CACHE` | on | classifier/imagery.py, classifier/sources/base.py, enrichment/osm_prefilter.py |
 | `LEAD_STAGES` | unset | enrichment/__main__.py |
 | `LIMIT` | unset | enrichment/__main__.py, enrichment/metrics.py |
+| `LLM_ATTEMPTED_FIELD` | `LLM_Last_Attempted_Date__c` | enrichment/sf_ops.py |
 | `LLM_CLASSIFIED` | off | enrichment/__main__.py |
 | `MAPILLARY_ACCESS_TOKEN` | unset | classifier/sources/mapillary.py |
 | `MAPILLARY_CROP` | `1` | classifier/sources/mapillary.py |
@@ -133,6 +140,7 @@ no inline default (the code decides what absence means); see the file.
 | `NEARMAP_TILE_WORKERS` | `4` | classifier/imagery.py |
 | `NEARMAP_VERT_ZOOM` | `20` | classifier/imagery.py |
 | `NEARMAP_WIDE_SCOUT` | `vert` | enrichment/naip_classify.py |
+| `NOT_ATTEMPTED_SINCE` | unset | enrichment/sf_ops.py |
 | `OFFSET` | unset | enrichment/__main__.py |
 | `OPENCELLID_API_KEY` | unset | enrichment/signals/opencellid.py |
 | `OPENCELLID_CACHE_DAYS` | `30` | enrichment/signals/opencellid.py |
@@ -165,6 +173,10 @@ no inline default (the code decides what absence means); see the file.
 | `PULL_LIMIT` | unset | enrichment/reconcile_pull.py |
 | `PULL_REPS` | unset | enrichment/reconcile_pull.py |
 | `QUEUE_OFFSET` | unset | enrichment/__main__.py |
+| `REGISTRY_DENSITY` | on | enrichment/pipeline.py |
+| `REGISTRY_DENSITY_RADIUS_M` | `2000` | enrichment/constants.py |
+| `REGISTRY_REVIEW_MAX_M` | `50` | enrichment/constants.py |
+| `REGISTRY_REVIEW_RURAL_MAX_M` | `150` | enrichment/constants.py |
 | `RERUN_HOLDOUTS_FROM` | unset | enrichment/__main__.py |
 | `RERUN_SITES_FROM` | unset | enrichment/__main__.py |
 | `RERUN_SKIP_APPLIED` | on | enrichment/__main__.py |
@@ -176,6 +188,7 @@ no inline default (the code decides what absence means); see the file.
 | `ROOFTOP_CROP_STRICT_CONF` | `0.8` | classifier/asset_classifier.py |
 | `ROOFTOP_HOST_OFFSET_M` | `15` | enrichment/constants.py |
 | `RUN_DIR` | unset | enrichment/__main__.py |
+| `SAME_STRUCTURE_M` | `10` | enrichment/constants.py |
 | `SAVED_NEARMAP_CHIPS` | on | enrichment/naip_classify.py |
 | `SCREEN_IMAGE_MAX_PX` | `768` | classifier/views.py |
 | `SF_DOMAIN` | `login` | salesforce/sf_client.py |
@@ -188,6 +201,7 @@ no inline default (the code decides what absence means); see the file.
 | `SITE_ACQ_OWNER_ID` | unset | enrichment/connectx_audit.py |
 | `SITE_ORCHESTRATOR_DATA` | unset | paths.py |
 | `SITE_TYPE` | unset | enrichment/__main__.py |
+| `SITE_TYPE_EXCLUDE` | unset | enrichment/sf_ops.py |
 | `SKIP_CLASSIFY` | off | enrichment/__main__.py |
 | `SKIP_FROM` | unset | enrichment/__main__.py |
 | `STAGES` | unset | enrichment/__main__.py |

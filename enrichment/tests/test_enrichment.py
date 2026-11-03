@@ -1483,7 +1483,7 @@ class CostPolicyTests(unittest.TestCase):
 
         hit = ProximityHit(
             source="FCC",
-            distance_m=10.0,
+            distance_m=12.0,
             latitude=43.0,
             longitude=-89.0,
             candidate_count=3,
@@ -2470,13 +2470,13 @@ class DbOnlyPipelineTests(unittest.TestCase):
                 {
                     "ID": 1,
                     "ASR_Number": "A",
-                    "Latitude_Decimal": 43.00008,
+                    "Latitude_Decimal": 43.00011,
                     "Longitude_Decimal": -89.0,
                 },
                 {
                     "ID": 2,
                     "ASR_Number": "B",
-                    "Latitude_Decimal": 43.00012,
+                    "Latitude_Decimal": 43.00015,
                     "Longitude_Decimal": -89.0,
                 },
             ]
@@ -2486,6 +2486,7 @@ class DbOnlyPipelineTests(unittest.TestCase):
         self.assertEqual(row["bucket"], BUCKET_OTHER)
         self.assertEqual(row["holdout_reason"], "db_only_no_unique_hit")
         self.assertEqual(row["update_site_type"], "")
+        self.assertIn("2 structures within 25 m", row["registry_review"])
 
     def test_no_hit_does_not_classify(self):
         from enrichment.constants import BUCKET_OTHER
