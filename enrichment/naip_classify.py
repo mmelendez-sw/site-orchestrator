@@ -437,6 +437,7 @@ def _classify_site_imagery(
     presence_only: bool = False,
     consistency_pass: bool = False,
     site_state: str | None = None,
+    min_oblique_sides: int = 0,
 ) -> dict[str, Any]:
     """Classify one coordinate with the full Nearmap + bifurcated AI stack.
 
@@ -1375,15 +1376,21 @@ def _classify_site_imagery(
             and not ac.NAIP_ONLY
             and (not skip_nearmap_fetch or library_reuse)
         )
+        def needs_another_side() -> bool:
+            # ``min_oblique_sides``: the pipeline re-checks a call that failed the
+            # strict second pass with one more side than it had.
+            seen = sum(1 for v in ALL_OBLIQUE_DIRECTIONS if v in nearmap_views)
+            return not site_qualified(res, cell_agree) or seen < min_oblique_sides
+
         if (
-            not site_qualified(res, cell_agree)
+            needs_another_side()
             and str(res.get("site_type") or "").strip().lower() in {"rooftop", "tower", "other"}
             and purchase_ok
             and env_flag("DISPUTE_EXTRA_OBLIQUES", True)
             and any(v in nearmap_views for v in ALL_OBLIQUE_DIRECTIONS)
         ):
             for stage in dispute_oblique_stages(nearmap_views, imagery.OBLIQUE_VIEWS):
-                if site_qualified(res, cell_agree):
+                if not needs_another_side():
                     break
                 if verbose:
                     progress.step(f"not qualified yet -> buy {', '.join(stage)} oblique")

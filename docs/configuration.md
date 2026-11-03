@@ -55,6 +55,7 @@ no inline default (the code decides what absence means); see the file.
 | `CONFIRM_EXISTING` | off | enrichment/__main__.py |
 | `CONFIRM_ROOFTOP` | off | enrichment/__main__.py |
 | `CONNECTX_AUDIT` | off | enrichment/__main__.py |
+| `CONSISTENCY_BUYS_SIDES` | on | enrichment/pipeline.py |
 | `DB_ONLY` | off | enrichment/__main__.py |
 | `DEQUEUE_HOLDOUTS` | computed | enrichment/__main__.py |
 | `DETAIL_ZOOM_CROP` | on | enrichment/naip_classify.py |
@@ -93,7 +94,6 @@ no inline default (the code decides what absence means); see the file.
 | `IMAGERY_CACHE` | on | classifier/imagery.py, classifier/sources/base.py, enrichment/osm_prefilter.py |
 | `LEAD_STAGES` | unset | enrichment/__main__.py |
 | `LIMIT` | unset | enrichment/__main__.py, enrichment/metrics.py |
-| `LLM_ATTEMPTED_FIELD` | `LLM_Last_Attempted_Date__c` | enrichment/sf_ops.py |
 | `LLM_CLASSIFIED` | off | enrichment/__main__.py |
 | `MAPILLARY_ACCESS_TOKEN` | unset | classifier/sources/mapillary.py |
 | `MAPILLARY_CROP` | `1` | classifier/sources/mapillary.py |
@@ -137,7 +137,6 @@ no inline default (the code decides what absence means); see the file.
 | `NEARMAP_TILE_WORKERS` | `4` | classifier/imagery.py |
 | `NEARMAP_VERT_ZOOM` | `20` | classifier/imagery.py |
 | `NEARMAP_WIDE_SCOUT` | `vert` | enrichment/naip_classify.py |
-| `NOT_ATTEMPTED_SINCE` | unset | enrichment/sf_ops.py |
 | `OFFSET` | unset | enrichment/__main__.py |
 | `OPENCELLID_API_KEY` | unset | enrichment/signals/opencellid.py |
 | `OPENCELLID_CACHE_DAYS` | `30` | enrichment/signals/opencellid.py |

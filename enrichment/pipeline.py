@@ -1099,6 +1099,11 @@ def replay_decision(row: dict[str, Any]) -> dict[str, Any] | None:
     )
 
 
+def _oblique_sides_seen(classified: dict[str, Any]) -> int:
+    views = {v.strip() for v in str(classified.get("nearmap_views") or "").split(",")}
+    return len(views & {"North", "East", "South", "West"})
+
+
 def _call_classify(classify_fn, kwargs: dict[str, Any]) -> dict[str, Any]:
     """Call classify_fn; older / test doubles may accept fewer kwargs."""
     try:
@@ -1318,6 +1323,35 @@ def _classify_prepared(
         )
     ):
         base.update(_consistency_check(prep, classify_fn, kwargs, base, classified, verbose=verbose))
+        # The second pass only sees the sides the first pass bought, so a call
+        # that qualified early (e.g. Vert+North) can fail it for good. Buy the
+        # next side, classify again, and re-check, until it agrees or all four
+        # sides are seen. CONSISTENCY_BUYS_SIDES=0 turns this off.
+        seen = _oblique_sides_seen(classified)
+        while (
+            base.get("holdout_reason") == "consistency_disagree"
+            and env_flag("CONSISTENCY_BUYS_SIDES", True)
+            and seen < 4
+        ):
+            if verbose:
+                progress.step(f"second pass disagreed -> re-check with {seen + 1} side(s)")
+            retry_kwargs = dict(kwargs, min_oblique_sides=seen + 1)
+            try:
+                again = _call_classify(classify_fn, retry_kwargs)
+            except Exception as exc:  # noqa: BLE001
+                if verbose:
+                    progress.warn(f"side re-check failed: {exc}")
+                break
+            if again.get("error") or _oblique_sides_seen(again) <= seen:
+                break  # no coverage for another side
+            classified, seen = again, _oblique_sides_seen(again)
+            _stamp_classified(base, classified, fresh=True)
+            base.update(_bucket(prep, classified))
+            if base.get("bucket") != BUCKET_POTENTIAL_UPDATE:
+                break
+            base.update(
+                _consistency_check(prep, classify_fn, retry_kwargs, base, classified, verbose=verbose)
+            )
     if classified.get("nearmap_budget_blocked") and base.get("bucket") != BUCKET_POTENTIAL_UPDATE:
         # Needed Nearmap the monthly budget refused: keep it queued for next month.
         base["holdout_reason"] = _NEARMAP_BUDGET_HOLDOUT
