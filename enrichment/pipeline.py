@@ -105,7 +105,6 @@ from enrichment.mssql import (
     registry_density_bulk,
 )
 from enrichment.naip_classify import classify_site_imagery
-from enrichment.registry_checks import address_match, naip_registry_check
 from enrichment.outputs import (
     CANDIDATE_COLUMNS,
     DETAIL_COLUMNS,
@@ -113,6 +112,7 @@ from enrichment.outputs import (
     CsvAppender,
     write_csv,
 )
+from enrichment.registry_checks import address_match, naip_registry_check
 from enrichment.sf_ops import (
     apply_one_update,
     apply_updates_batch,
