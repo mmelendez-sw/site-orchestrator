@@ -577,13 +577,15 @@ def _needs_error_fallback(
 
 
 def _fallback_payload(entry: dict[str, Any], *, error_holdout: bool) -> dict[str, Any]:
-    """Retry payload: holdout flags (when the mode dequeues failures), the
-    duplicate flag (duplicate-rule errors), and the failed write's attempt date."""
+    """Retry payload. A duplicate-rule block is not a data error: resend the
+    original write plus the duplicate flag (saved through the rule). Any other
+    failure retries with the holdout flags (when the mode dequeues failures)
+    and the failed write's attempt date."""
+    if _flags_duplicate(entry):
+        return {**(entry.get("payload") or {}), duplicate_flag_field(): True}
     payload: dict[str, Any] = {}
     if _wants_holdout(entry, error_holdout=error_holdout):
         payload.update(APPLY_ERROR_HOLDOUT_PAYLOAD)
-    if _flags_duplicate(entry):
-        payload[duplicate_flag_field()] = True
     field = attempted_field()
     if field and (entry.get("payload") or {}).get(field):
         payload[field] = entry["payload"][field]
@@ -606,14 +608,14 @@ def _mark_fallback(
     if fallback_error is None:
         entry["success"] = True
         dequeued = payload.get("LLM_Holdout__c") is True
-        entry["status"] = "updated_holdout_after_error" if dequeued else "duplicate_flagged"
+        if dequeued:
+            entry["status"], what = "updated_holdout_after_error", "dequeued LLM_Holdout=true"
+        elif _is_duplicate_flag_only(payload):
+            entry["status"], what = "duplicate_flagged", "flagged potential duplicate"
+        else:
+            entry["status"], what = "updated_after_duplicate", "saved through the duplicate rule, flagged"
         entry["error"] = f"fallback after apply error: {original}"
-        logger.warning(
-            "SF write failed for %s — %s: %s",
-            entry["Id"],
-            "dequeued LLM_Holdout=true" if dequeued else "flagged potential duplicate",
-            original,
-        )
+        logger.warning("SF write failed for %s — %s: %s", entry["Id"], what, original)
     else:
         entry["status"] = "failed"
         entry["error"] = (

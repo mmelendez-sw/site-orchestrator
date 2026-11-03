@@ -165,26 +165,29 @@ class DuplicateFlagTests(unittest.TestCase):
     def _retries(self, client, sf_id):
         return [(p, h) for i, p, h in client.sf.writes if i == sf_id][1:]
 
-    def test_duplicate_hit_dequeues_and_flags_through_the_rule(self):
+    def test_duplicate_hit_is_saved_through_the_rule_and_flagged(self):
+        # 2026-11-03: two valid 5 m hits became holdouts because the retry sent
+        # the holdout payload. A duplicate block is not a data error.
         client = _DupClient(dup_ids={"a01"})
         entries = apply_updates_batch(client, [_hit("a01"), _hit("a02")], verbose=False)
         by_id = {e["Id"]: e for e in entries}
         self.assertEqual(status_from_entry(by_id["a02"]), "updated")
-        self.assertEqual(
-            self._retries(client, "a01"),
-            [({"LLM_Classified__c": False, "LLM_Holdout__c": True, DUP: True, FIELD: WHEN}, ALLOW)],
-        )
-        self.assertEqual(status_from_entry(by_id["a01"]), "dequeued")
+        first = client.sf.writes[0][1] if client.sf.writes[0][0] == "a01" else client.sf.writes[1][1]
+        self.assertEqual(self._retries(client, "a01"), [({**first, DUP: True}, ALLOW)])
+        self.assertIsNot(by_id["a01"]["payload"].get("LLM_Holdout__c"), True)
+        self.assertEqual(by_id["a01"]["status"], "updated_after_duplicate")
+        self.assertEqual(status_from_entry(by_id["a01"]), "updated")
         # The decision write itself never bypasses the duplicate rule.
         self.assertTrue(all(h is None for i, _p, h in client.sf.writes[:2]))
 
-    def test_leave_failure_modes_only_tick_the_flag(self):
+    def test_leave_failure_modes_save_through_the_rule_too(self):
         client = _DupClient(dup_ids={"a03"})
         entries = apply_updates_batch(
             client, [_hit("a03")], verbose=False, error_holdout=False
         )
-        self.assertEqual(self._retries(client, "a03"), [({DUP: True, FIELD: WHEN}, ALLOW)])
-        self.assertEqual(status_from_entry(entries[0]), "duplicate_flagged")
+        first = client.sf.writes[0][1]
+        self.assertEqual(self._retries(client, "a03"), [({**first, DUP: True}, ALLOW)])
+        self.assertEqual(status_from_entry(entries[0]), "updated")
         self.assertEqual(_status_counts([{"sf_update_status": "duplicate_flagged"}])["duplicate_flagged"], 1)
 
     def test_attempt_only_duplicate_is_flagged(self):
@@ -206,8 +209,9 @@ class DuplicateFlagTests(unittest.TestCase):
 
         client = _DupClient(dup_ids={"a06"})
         entry = apply_one_update(client, _hit("a06"), verbose=False, error_holdout=False)
-        self.assertEqual(entry["status"], "duplicate_flagged")
-        self.assertEqual(self._retries(client, "a06"), [({DUP: True, FIELD: WHEN}, ALLOW)])
+        self.assertEqual(entry["status"], "updated_after_duplicate")
+        first = client.sf.writes[0][1]
+        self.assertEqual(self._retries(client, "a06"), [({**first, DUP: True}, ALLOW)])
 
     def test_flag_off_keeps_old_behavior(self):
         with patch.dict(os.environ, {"DUPLICATE_FLAG_FIELD": "0"}):
