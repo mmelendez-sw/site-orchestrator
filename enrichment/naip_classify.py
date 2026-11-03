@@ -342,6 +342,26 @@ def dispute_oblique_stages(have: dict, configured: list[str] | tuple[str, ...]) 
     return [[v] for v in first + rest]
 
 
+def _cell_conf(ac: Any, res: dict[str, Any]) -> float:
+    return ac.normalize_confidence(res.get("cell_equipment_confidence")) or 0.0
+
+
+def site_qualified(res: dict[str, Any], cell_agree: bool) -> bool:
+    """Has the site already earned its write, so no more sides are needed?
+
+    A Gemini tower lock (``gemini_strong_solo``) writes on its own; anything
+    else needs Claude's agreement at the imagery-only cell-confidence bar.
+    Gemini being sure on its own never stops the side-by-side escalation.
+    """
+    if not cell_agree:
+        return False
+    if str(res.get("dual_model_resolution") or "").lower() == "gemini_strong_solo":
+        return True
+    from classifier import asset_classifier as ac
+
+    return _cell_conf(ac, res) >= MIN_IMAGERY_ONLY_CELL_CONFIDENCE
+
+
 def detail_view_name(asset_view: str | None) -> str | None:
     """Nearmap view a box was drawn on ("Vert" / "North" ...), else None.
 
@@ -1340,10 +1360,12 @@ def _classify_site_imagery(
             allow_gemini_solo=False,
             all_views=views,
         )
-        # Gemini saw gear, Claude did not: before giving up, buy the oblique
-        # directions this site has not been looked at from (configured North /
-        # East first, then South / West) and let Claude search the new views.
-        # Gear on one face only is common (8 of 13 gear sites in the 2026-10-08
+        # Escalate on qualification, not on Gemini's confidence: until Claude
+        # confirms the gear at the imagery-only bar, buy the next side this site
+        # has not been seen from (North, East, South, West), one at a time, and
+        # check again. A Gemini gear claim is re-checked by Claude on the new
+        # side; with no claim yet, Gemini first looks at every view again. Gear
+        # on one face only is common (8 of 13 gear sites in the 2026-10-08
         # direction test). DISPUTE_EXTRA_OBLIQUES=0 turns this off.
         purchase_ok = (
             bool(ac.NEARMAP_API_KEY)
@@ -1351,16 +1373,17 @@ def _classify_site_imagery(
             and (not skip_nearmap_fetch or library_reuse)
         )
         if (
-            not cell_agree
-            and str(res.get("site_type") or "").strip().lower() in {"rooftop", "tower"}
-            and res.get("gemini_pre_escalation_cell") is True
+            not site_qualified(res, cell_agree)
+            and str(res.get("site_type") or "").strip().lower() in {"rooftop", "tower", "other"}
             and purchase_ok
             and env_flag("DISPUTE_EXTRA_OBLIQUES", True)
             and any(v in nearmap_views for v in ALL_OBLIQUE_DIRECTIONS)
         ):
             for stage in dispute_oblique_stages(nearmap_views, imagery.OBLIQUE_VIEWS):
+                if site_qualified(res, cell_agree):
+                    break
                 if verbose:
-                    progress.step(f"Claude disagreed -> buy {', '.join(stage)} obliques")
+                    progress.step(f"not qualified yet -> buy {', '.join(stage)} oblique")
                 try:
                     extra, _extra_date = imagery.fetch_nearmap_views(
                         lat, lon, views=stage, purpose="oblique_extra"
@@ -1373,6 +1396,34 @@ def _classify_site_imagery(
                     continue
                 nearmap_views.update(extra)
                 nearmap_tier = nearmap_tier_for(nearmap_views)
+                if res.get("gemini_pre_escalation_cell") is not True:
+                    # No gear claim yet: Gemini looks again with the new side.
+                    views = build_views(nearmap_views)
+                    again = ac._classify_pass(primary_provider, clients, views, prompt, input_conf)
+                    again = ac.gate_weak_stealth_tower_claim(ac.gate_weak_rooftop_cell_claim(again))
+                    again["nearmap_tier"] = nearmap_tier
+                    again["nearmap_views"] = ",".join(nearmap_views)
+                    again["classification_stage"] = classification_stage
+                    if (
+                        again.get("cell_equipment") is not True
+                        or str(again.get("site_type") or "").lower() not in {"rooftop", "tower"}
+                    ):
+                        continue
+                    again["gemini_pre_escalation_cell"] = True
+                    again["gemini_pre_escalation_cell_conf"] = again.get("cell_equipment_confidence")
+                    again["gemini_pre_escalation_evidence"] = again.get("cell_equipment_evidence")
+                    again["gemini_pre_escalation_gear"] = again.get("cell_gear_kind")
+                    again = ac.enforce_rooftop_cell_requires_box(again, views)
+                    gemini_claim_box = ac.get_valid_asset_box(again)
+                    gemini_claim_view = str(again.get("asset_view") or "")
+                    again_views, again_crop = ac.build_cell_confirm_views(again, views)
+                    res, dual_again, cell_agree = ac.confirm_rooftop_cell_with_claude(
+                        again, clients, again_views, already_escalated=False,
+                        allow_soft_keep=False, from_wide_rescue=from_wide_rescue,
+                        used_crop=again_crop, allow_gemini_solo=False, all_views=views,
+                    )
+                    dual_model = dual_again or dual_model
+                    continue
                 # Only the new directions (plus Vert): the model view cap would
                 # otherwise drop them in favour of the obliques already judged.
                 focus = {k: v for k, v in nearmap_views.items() if k == "Vert" or k in extra}
@@ -1392,10 +1443,10 @@ def _classify_site_imagery(
                     from_wide_rescue=from_wide_rescue, used_crop=False,
                     allow_gemini_solo=False, all_views=retry_views,
                 )
-                if agree_retry:
+                # Keep the stronger of the two Claude answers.
+                if agree_retry and (not cell_agree or _cell_conf(ac, retry) > _cell_conf(ac, res)):
                     res, dual_model, cell_agree = retry, dual_retry or dual_model, True
-                    views = build_views(nearmap_views)
-                    break
+            views = build_views(nearmap_views)
         # Still disputed, or Claude's yes is below the imagery-only bar (the
         # 2026-11-02 true holdouts sat at 0.62 / 0.72): buy a zoom-21 close-up of
         # Gemini's box and let Claude judge the gear itself. DETAIL_ZOOM_CROP=0
