@@ -501,7 +501,8 @@ _FCC_LEGACY_BBOX = (
 # the legacy names so hit building is shared; dead registrations never match.
 _FCC_COMP_COLUMNS = (
     "id AS ID, Registration_Number AS ASR_Number, Latitude_Decimal, Longitude_Decimal, "
-    "Structure_Type AS Registration_Type, Status_Code_Definition AS Status, Entity_Name"
+    "Structure_Type AS Registration_Type, Status_Code_Definition AS Status, Entity_Name, "
+    "Structure_Street_Address, Structure_City, Structure_ZIP_Code"
 )
 _FCC_COMP_BBOX = (
     "(f.Latitude_Decimal BETWEEN {a} AND {b} AND f.Longitude_Decimal BETWEEN {c} AND {d}"
@@ -516,7 +517,8 @@ _TS_BBOX = (
     " AND ISNULL(t.asset_status, '') NOT IN ('Speculative', 'In development'))"
 )
 _COMP_COLUMNS = (
-    "Unique_Key, latitude, longitude, asset_type, asset_category, asset_status, fcc_asr_number"
+    "Unique_Key, latitude, longitude, asset_type, asset_category, asset_status, fcc_asr_number, "
+    "address, city, postal_code"
 )
 # Planned / under-construction portal entries are not structures yet.
 _COMP_BBOX = (

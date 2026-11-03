@@ -186,6 +186,8 @@ class RegistryOnlyRunTests(unittest.TestCase):
         self.assertEqual(row["bucket"], BUCKET_OTHER)
         self.assertIn("lone FCC structure 38 m away", row["registry_review"])
         self.assertEqual(row["db_site_type"], "Monopole")
+        self.assertEqual(row["address_match"], "")  # registry row carries no address
+        self.assertEqual(row.get("naip_check", ""), "")  # REGISTRY_NAIP_CHECK off by default
         from enrichment.pipeline import review_reason
         self.assertEqual(review_reason(row), row["registry_review"])
 
@@ -247,6 +249,50 @@ class DensityAndReviewTests(unittest.TestCase):
         self.assertIn("FCCComprehensiveTowerData", count_sql)
         self.assertIn("TowerSourceASRTowers", count_sql)
         self.assertEqual(params, (4_000_000.0,))
+
+
+class RegistryCheckTests(unittest.TestCase):
+    def test_compare_addresses(self):
+        from enrichment.registry_checks import compare_addresses
+
+        cases = [
+            (("1234 County Road 12", "53703", "1234 CR 12", ""), "number_and_street"),
+            (("5512 N Oak Street", "", "OAK ST", ""), "street"),
+            (("W5512 Highway 33", "", "HWY 33 & ELM", ""), "street"),
+            (("100 Main St", "53703", "4 MILES N OF TOWN", "53703-1234"), "zip_only"),
+            (("100 Main St", "53703", "22 Pine Rd", "60601"), "none"),
+            (("", "53703", "22 Pine Rd", "53703"), ""),
+        ]
+        for args, expected in cases:
+            self.assertEqual(compare_addresses(*args), expected, args)
+
+    def test_best_address_across_merged_rows(self):
+        from enrichment.registry_checks import address_match
+
+        fcc = _fcc(1, 40, "1298138") | {"Structure_Street_Address": "N OF CR 12", "Structure_City": "X"}
+        ts = _ts(1, 40.2, "1298138") | {"street1": "1234 County Rd 12", "city": "Madison", "postal_code": "53703"}
+        hit = _select(fcc=[fcc], ts=[ts])
+        got = address_match({"Site_Street__c": "1234 County Road 12", "Site_Zip_Code__c": "53703"}, hit)
+        self.assertEqual(got, {"address_match": "number_and_street", "registry_address": "1234 County Rd 12, Madison"})
+
+    def test_naip_check_reads_the_registry_point(self):
+        from PIL import Image
+
+        from enrichment.registry_checks import naip_registry_check
+
+        geo = {"crs": "EPSG:32616", "x_min": 0, "x_max": 120, "y_min": 0, "y_max": 120, "chip_m": 120}
+        with patch("classifier.imagery.fetch_chip", return_value=(Image.new("RGB", (200, 200)), {"image_date": "2023-06-01"}, geo)) as chip,              patch("classifier.asset_classifier._call_gemini_json",
+                   return_value={"structure_at_ring": "tower", "confidence": 0.9, "evidence": "lattice shadow"}) as call:
+            got = naip_registry_check(43.0, -89.0, client=object())
+        chip.assert_called_once_with(43.0, -89.0, 120.0)
+        self.assertEqual(call.call_count, 1)
+        self.assertEqual((got["naip_check"], got["naip_check_date"]), ("tower", "2023-06-01"))
+
+    def test_naip_check_never_raises(self):
+        from enrichment.registry_checks import naip_registry_check
+
+        with patch("classifier.imagery.fetch_chip", side_effect=RuntimeError("stac down")):
+            self.assertEqual(naip_registry_check(43.0, -89.0, client=object())["naip_check"], "error")
 
 
 class QueueFilterTests(unittest.TestCase):

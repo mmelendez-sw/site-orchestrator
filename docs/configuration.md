@@ -72,7 +72,7 @@ no inline default (the code decides what absence means); see the file.
 | `FOOTPRINT_PIN_CHECK` | on | enrichment/footprints.py |
 | `FOOTPRINT_SNAP_MAX_M` | `60.0` | enrichment/footprints.py |
 | `FORCE_ROOF_SCOUT` | off | enrichment/naip_classify.py |
-| `GEMINI_API_KEY` | unset | enrichment/naip_classify.py |
+| `GEMINI_API_KEY` | unset | enrichment/naip_classify.py, enrichment/registry_checks.py |
 | `GEMINI_CLAUDE_BOX_IOU` | `0.2` | classifier/asset_classifier.py |
 | `GEMINI_FALLBACK_AFTER` | `2` | classifier/asset_classifier.py |
 | `GEMINI_FALLBACK_COOLDOWN_S` | `300` | classifier/asset_classifier.py |
@@ -176,6 +176,9 @@ no inline default (the code decides what absence means); see the file.
 | `QUEUE_OFFSET` | unset | enrichment/__main__.py |
 | `REGISTRY_DENSITY` | on | enrichment/pipeline.py |
 | `REGISTRY_DENSITY_RADIUS_M` | `2000` | enrichment/constants.py |
+| `REGISTRY_NAIP_CHECK` | off | enrichment/pipeline.py |
+| `REGISTRY_NAIP_CHIP_M` | `120` | enrichment/registry_checks.py |
+| `REGISTRY_NAIP_MODEL` | computed | enrichment/registry_checks.py |
 | `REGISTRY_REVIEW_MAX_M` | `50` | enrichment/constants.py |
 | `REGISTRY_REVIEW_RURAL_MAX_M` | `150` | enrichment/constants.py |
 | `RERUN_HOLDOUTS_FROM` | unset | enrichment/__main__.py |

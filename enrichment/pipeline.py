@@ -105,6 +105,7 @@ from enrichment.mssql import (
     registry_density_bulk,
 )
 from enrichment.naip_classify import classify_site_imagery
+from enrichment.registry_checks import address_match, naip_registry_check
 from enrichment.outputs import (
     CANDIDATE_COLUMNS,
     DETAIL_COLUMNS,
@@ -123,7 +124,7 @@ from enrichment.sf_ops import (
     utc_now_iso,
 )
 from envutil import env_flag, env_float, env_int
-from paths import runs_dir
+from paths import chips_dir, runs_dir
 from salesforce.site_type_mapping import (
     is_sales_tower_type,
     site_type_from_db_asset_type,
@@ -558,7 +559,8 @@ REVIEW_COLUMNS = (
     "Id", "review_reason", "Site_Street__c", "Site_City__c", "Site_State__c", "sf_lat", "sf_lng",
     "match_distance_m", "match_sources", "match_candidate_count", "match_runner_up_gap_m",
     "match_asr_number", "db_site_type", "classify_lat", "classify_lng", "registry_density",
-    "density_tier", "footprint_status", "footprint_distance_m", "naip_site_type", "gemini_cell_confidence", "cell_equipment_confidence",
+    "density_tier", "address_match", "registry_address", "naip_check", "naip_check_conf",
+    "naip_check_evidence", "naip_check_chip", "footprint_status", "footprint_distance_m", "naip_site_type", "gemini_cell_confidence", "cell_equipment_confidence",
     "dual_model_resolution", "holdout_reason", "audit_reason", "nearmap_views",
     "supplemental_sources", "cell_equipment_evidence", "chip_dir",
 )
@@ -929,6 +931,20 @@ def _stamp_match(base: dict[str, Any], hit) -> None:
     )
 
 
+def _stamp_registry_checks(
+    base: dict[str, Any], site: dict[str, Any], hit, sf_lat: float, sf_lng: float, *, verbose: bool
+) -> None:
+    """Address agreement (free) and, with REGISTRY_NAIP_CHECK=1, a NAIP read at
+    the registry point for a near miss headed to review_queue.csv."""
+    base.update(address_match(site, hit))
+    if not env_flag("REGISTRY_NAIP_CHECK", False):
+        return
+    chip = chips_dir() / "registry_checks" / f"{base.get('Id') or 'site'}.jpg"
+    base.update(naip_registry_check(hit.latitude, hit.longitude, pin=(sf_lat, sf_lng), save_to=chip))
+    if verbose:
+        progress.result(f"registry checks: address={base['address_match'] or '-'} naip={base['naip_check']}")
+
+
 def _prepare_site(
     site: dict[str, Any],
     *,
@@ -1063,6 +1079,8 @@ def _prepare_site(
             base["registry_review"] = registry_review_reason(
                 hit, base.get("density_tier") or "", competitor_only=competitor_only
             )
+            if base["registry_review"]:
+                _stamp_registry_checks(base, site, hit, sf_lat, sf_lng, verbose=verbose)
         if verbose:
             progress.step("db-only — no unique registry hit (no imagery)")
         base["holdout_reason"] = "db_only_no_unique_hit"
