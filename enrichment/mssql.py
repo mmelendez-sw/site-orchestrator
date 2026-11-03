@@ -502,7 +502,7 @@ _FCC_LEGACY_BBOX = (
 _FCC_COMP_COLUMNS = (
     "id AS ID, Registration_Number AS ASR_Number, Latitude_Decimal, Longitude_Decimal, "
     "Structure_Type AS Registration_Type, Status_Code_Definition AS Status, Entity_Name, "
-    "Structure_Street_Address, Structure_City, Structure_ZIP_Code"
+    "Structure_Street_Address, Structure_City, Structure_ZIP_Code, Overall_Height_AGL"
 )
 _FCC_COMP_BBOX = (
     "(f.Latitude_Decimal BETWEEN {a} AND {b} AND f.Longitude_Decimal BETWEEN {c} AND {d}"

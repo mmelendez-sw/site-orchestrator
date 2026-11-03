@@ -112,7 +112,7 @@ from enrichment.outputs import (
     CsvAppender,
     write_csv,
 )
-from enrichment.registry_checks import address_match, naip_registry_check
+from enrichment.registry_checks import address_match, naip_registry_check, registry_height_m
 from enrichment.sf_ops import (
     apply_one_update,
     apply_updates_batch,
@@ -559,7 +559,7 @@ REVIEW_COLUMNS = (
     "Id", "review_reason", "Site_Street__c", "Site_City__c", "Site_State__c", "sf_lat", "sf_lng",
     "match_distance_m", "match_sources", "match_candidate_count", "match_runner_up_gap_m",
     "match_asr_number", "db_site_type", "classify_lat", "classify_lng", "registry_density",
-    "density_tier", "address_match", "registry_address", "naip_check", "naip_check_conf",
+    "density_tier", "naip_confirm", "address_match", "registry_address", "registry_height_m", "naip_check", "naip_check_conf",
     "naip_check_evidence", "naip_check_chip", "footprint_status", "footprint_distance_m", "naip_site_type", "gemini_cell_confidence", "cell_equipment_confidence",
     "dual_model_resolution", "holdout_reason", "audit_reason", "nearmap_views",
     "supplemental_sources", "cell_equipment_evidence", "chip_dir",
@@ -931,12 +931,49 @@ def _stamp_match(base: dict[str, Any], hit) -> None:
     )
 
 
+def naip_confirm_enabled() -> bool:
+    """DB-only near misses get a free NAIP read at the registry point (NAIP_CONFIRM=1)."""
+    return env_flag("NAIP_CONFIRM", False)
+
+
+def _keep_existing_fields(base: dict[str, Any], site: dict[str, Any]) -> None:
+    """Registry-only semantics for a typed site: verified only; type, pin and a
+    filled source stay (mirrors _stamp_unique_db_update keep_existing)."""
+    existing_type = str(site.get("Site_Type__c") or "").strip()
+    if not existing_type:
+        return
+    base["site_type_kept"] = existing_type
+    for key in ("update_lat", "update_lng", "update_coord_source", "update_site_type"):
+        base[key] = ""
+    if str(site.get("Verified_Site_Source__c") or "").strip():
+        base["update_verified_site_source"] = ""
+
+
+def _settle_naip_confirm(prep: PreparedSite) -> None:
+    """After the NAIP read of a near miss: a bucketed tower confirms the registry
+    structure (written like a unique hit); anything else stays a stamped miss."""
+    base = prep.base
+    if base.get("bucket") == BUCKET_POTENTIAL_UPDATE:
+        base["naip_confirm"] = "confirmed"
+        base["holdout_reason"] = "naip_confirmed_registry"
+        base["registry_review"] = ""
+        _keep_existing_fields(base, prep.site)
+        return
+    base["naip_confirm"] = f"not_confirmed:{base.get('holdout_reason') or base.get('error') or ''}"
+    base["bucket"] = BUCKET_OTHER
+    base["holdout_reason"] = "db_only_no_unique_hit"
+    for key in ("update_lat", "update_lng", "update_coord_source", "update_site_type",
+                "update_verified_site", "update_verified_site_source"):
+        base[key] = ""
+
+
 def _stamp_registry_checks(
     base: dict[str, Any], site: dict[str, Any], hit, sf_lat: float, sf_lng: float, *, verbose: bool
 ) -> None:
     """Address agreement (free) and, with REGISTRY_NAIP_CHECK=1, a NAIP read at
     the registry point for a near miss headed to review_queue.csv."""
     base.update(address_match(site, hit))
+    base["registry_height_m"] = registry_height_m(hit)
     if not env_flag("REGISTRY_NAIP_CHECK", False):
         return
     chip = chips_dir() / "registry_checks" / f"{base.get('Id') or 'site'}.jpg"
@@ -1081,6 +1118,13 @@ def _prepare_site(
             )
             if base["registry_review"]:
                 _stamp_registry_checks(base, site, hit, sf_lat, sf_lng, verbose=verbose)
+                if naip_confirm_enabled():
+                    # Free NAIP at the registry point decides it (see _classify_prepared).
+                    prep.extra["naip_confirm"] = True
+                    prep.done = False
+                    if verbose:
+                        progress.step("db-only near miss → NAIP confirm at the registry point")
+                    return prep
         if verbose:
             progress.step("db-only — no unique registry hit (no imagery)")
         base["holdout_reason"] = "db_only_no_unique_hit"
@@ -1391,6 +1435,8 @@ def _classify_prepared(
         base["error"] = f"classify_failed: {exc}"
         base["bucket"] = BUCKET_OTHER
         base["holdout_reason"] = "classify_error"
+        if prep.extra.get("naip_confirm"):
+            base["naip_confirm"] = "error"
         return base
 
     _stamp_classified(base, classified, fresh=True)
@@ -1412,6 +1458,9 @@ def _classify_prepared(
         except (TypeError, ValueError):
             pass
     base.update(_bucket(prep, classified))
+    if prep.extra.get("naip_confirm"):
+        _settle_naip_confirm(prep)
+        return base
     if (
         base.get("bucket") == BUCKET_POTENTIAL_UPDATE
         and prep.hit is None
@@ -1878,7 +1927,11 @@ def run_enrichment(
             own_sql = True
             if verbose:
                 progress.result("connected")
-        classify = None if db_only else (classify_fn or classify_site_imagery)
+        if db_only and naip_confirm_enabled():
+            os.environ["NAIP_ONLY"] = "1"  # never buy Nearmap from a DB-only run
+            classify = classify_fn or classify_site_imagery
+        else:
+            classify = None if db_only else (classify_fn or classify_site_imagery)
 
     sql_state: dict[str, Any] = {"conn": sql_connection, "cursor": None}
     sink: SiteSink | None = None

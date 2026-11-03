@@ -112,6 +112,18 @@ def address_match(site: dict[str, Any], hit) -> dict[str, str]:
     return best
 
 
+def registry_height_m(hit) -> str:
+    """FCC Overall_Height_AGL (metres) for the structure, or '' (TowerSource/portal rows carry none)."""
+    for member in getattr(hit, "members", ()) or ((hit,) if hit is not None else ()):
+        value = (member.raw or {}).get("Overall_Height_AGL")
+        try:
+            if value not in (None, ""):
+                return f"{float(value):.0f}"
+        except (TypeError, ValueError):
+            continue
+    return ""
+
+
 # ------------------------------- NAIP check ---------------------------------
 
 NAIP_CHECK_CHIP_M = env_float("REGISTRY_NAIP_CHIP_M", 120)

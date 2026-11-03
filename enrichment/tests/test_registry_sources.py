@@ -135,7 +135,7 @@ class _RegistryCursor:
 
 @patch.dict(os.environ, {"FCC_SOURCE": "comprehensive", "COMPETITOR_SOURCE": "1"})
 class RegistryOnlyRunTests(unittest.TestCase):
-    def _process(self, cursor, **site):
+    def _process(self, cursor, classify_fn=None, **site):
         from enrichment.pipeline import _process_site
 
         def boom(**_kwargs):
@@ -145,8 +145,53 @@ class RegistryOnlyRunTests(unittest.TestCase):
             return _process_site(
                 {"Id": "a0ZREG0000000001", "Site_Latitude__c": PIN[0], "Site_Longitude__c": PIN[1], **site},
                 cursor=cursor, max_m=PROXIMITY_MAX_M, skip_classify=False, db_only=True,
-                classify_fn=boom, chip_dir=Path(tmp), verbose=False,
+                classify_fn=classify_fn or boom, chip_dir=Path(tmp), verbose=False,
             )
+
+    def _naip_tower(self, **kwargs):
+        # The production NAIP-only Gemini tower lock, as naip_classify returns it.
+        self.classify_calls.append(kwargs)
+        return {"site_type": "tower", "tower_subtype": "monopole", "cell_equipment": True,
+                "site_confidence": 0.9, "cell_equipment_confidence": 0.85, "dual_model_resolution": "",
+                "nearmap_tier": "naip_only", "asset_offset_m": 4.0, "asset_box_2d": [10, 10, 40, 40]}
+
+    def test_naip_confirm_writes_a_near_miss_the_classifier_confirms(self):
+        self.classify_calls = []
+        with patch.dict(os.environ, {"NAIP_CONFIRM": "1"}):
+            row = self._process(_RegistryCursor(fcc=[_fcc(1, 38, "1298138", "MTOWER")]),
+                                classify_fn=self._naip_tower, Site_Type__c="Tower Land",
+                                Verified_Site_Source__c="Bing Map")
+        self.assertEqual(row["bucket"], BUCKET_POTENTIAL_UPDATE)
+        self.assertEqual(row["naip_confirm"], "confirmed")
+        self.assertEqual(row["registry_review"], "")
+        self.assertEqual(row["holdout_reason"], "naip_confirmed_registry")
+        # Classified at the registry point, not the pin.
+        call = self.classify_calls[0]
+        self.assertAlmostEqual(call["lat"], PIN[0] + 38 * M, places=6)
+        self.assertTrue(call["db_backed"])
+        # Typed site: verified only; type, pin and source kept.
+        self.assertEqual(row["site_type_kept"], "Tower Land")
+        payload = build_row_payload(row, write_holdout=False)
+        self.assertEqual(payload["Verified_Site__c"], True)
+        for field in ("Site_Type__c", "Site_Latitude__c", "Verified_Site_Source__c"):
+            self.assertNotIn(field, payload)
+
+    def test_naip_confirm_leaves_an_unconfirmed_near_miss_stamped(self):
+        def nothing(**_kwargs):
+            return {"site_type": "other", "site_confidence": 0.8, "nearmap_tier": "naip_only"}
+
+        with patch.dict(os.environ, {"NAIP_CONFIRM": "1"}):
+            row = self._process(_RegistryCursor(fcc=[_fcc(1, 38, "1298138", "MTOWER")]), classify_fn=nothing)
+        self.assertEqual(row["bucket"], BUCKET_OTHER)
+        self.assertEqual(row["naip_confirm"], "not_confirmed:other")
+        self.assertEqual(row["holdout_reason"], "db_only_no_unique_hit")
+        self.assertIn("lone FCC structure 38 m away", row["registry_review"])
+        self.assertEqual(row["update_verified_site"], "")
+
+    def test_naip_confirm_off_never_classifies(self):
+        row = self._process(_RegistryCursor(fcc=[_fcc(1, 38, "1298138", "MTOWER")]))
+        self.assertEqual(row["bucket"], BUCKET_OTHER)
+        self.assertEqual(row["naip_confirm"], "")
 
     def test_queries_comprehensive_without_dead_registrations_and_the_portals(self):
         cursor = _RegistryCursor()
