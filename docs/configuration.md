@@ -63,7 +63,7 @@ no inline default (the code decides what absence means); see the file.
 | `DENSITY_RURAL_MAX` | `3` | enrichment/constants.py |
 | `DENSITY_SUBURBAN_MAX` | `12` | enrichment/constants.py |
 | `DEQUEUE_HOLDOUTS` | computed | enrichment/__main__.py |
-| `DETAIL_ZOOM_CROP` | on | enrichment/naip_classify.py |
+| `DETAIL_ZOOM_CROP` | off | enrichment/naip_classify.py |
 | `DISPUTE_EXTRA_OBLIQUES` | on | enrichment/naip_classify.py |
 | `DUPLICATE_FLAG_FIELD` | `Potential_Duplicate__c` | enrichment/sf_ops.py |
 | `FCC_SOURCE` | `comprehensive` | enrichment/mssql.py |

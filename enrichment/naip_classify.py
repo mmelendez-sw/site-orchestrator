@@ -1459,8 +1459,9 @@ def _classify_site_imagery(
             views = build_views(nearmap_views)
         # Still disputed, or Claude's yes is below the imagery-only bar (the
         # 2026-11-02 true holdouts sat at 0.62 / 0.72): buy a zoom-21 close-up of
-        # Gemini's box and let Claude judge the gear itself. DETAIL_ZOOM_CROP=0
-        # turns this off.
+        # Gemini's box and let Claude judge the gear itself. Off by default
+        # (DETAIL_ZOOM_CROP=1 turns it on): through 2026-11-03 it ran 370 times,
+        # cost ~0.29 MB each and never confirmed a site.
         weak_agree = cell_agree and (
             ac.normalize_confidence(res.get("cell_equipment_confidence")) or 0.0
         ) < MIN_IMAGERY_ONLY_CELL_CONFIDENCE
@@ -1470,7 +1471,7 @@ def _classify_site_imagery(
             and gemini_claim_box
             and detail_view_name(gemini_claim_view)
             and purchase_ok
-            and env_flag("DETAIL_ZOOM_CROP", True)
+            and env_flag("DETAIL_ZOOM_CROP", False)
         ):
             detail_views = fetch_detail_views(
                 lat, lon, gemini_claim_box, gemini_claim_view,
