@@ -376,7 +376,9 @@ def _nearmap_get(url: str) -> requests.Response:
         resp = _session().get(
             url, headers={"Authorization": f"Apikey {nearmap_api_key()}"},
             timeout=60)
-        if resp.status_code in (429, 502, 503) and attempt < 2:
+        # 504: a gateway time-out on the West oblique ended a 2026-11-03 site's
+        # escalation one side short.
+        if resp.status_code in (429, 502, 503, 504) and attempt < 2:
             time.sleep(2 * (attempt + 1))
             continue
         return resp

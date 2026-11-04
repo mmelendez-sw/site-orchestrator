@@ -349,20 +349,31 @@ def _cell_conf(ac: Any, res: dict[str, Any]) -> float:
 def site_qualified(res: dict[str, Any], cell_agree: bool) -> bool:
     """Has the site already earned its write, so no more sides are needed?
 
-    A Gemini tower lock (``gemini_strong_solo``) writes on its own; anything
-    else needs Claude's agreement at the imagery-only cell-confidence bar.
-    Gemini being sure on its own never stops the side-by-side escalation.
+    A Gemini tower lock (``gemini_strong_solo``) writes on its own when the
+    write gate accepts it (not boxed on a street photo); anything else needs
+    Claude's agreement at the imagery-only cell-confidence bar, and a rooftop
+    also needs the box the write gate takes (compact, on Nearmap). On
+    2026-11-03 calls that stopped here but failed those gates ended as
+    one-sided holdouts. Gemini being sure on its own never stops the
+    side-by-side escalation.
     """
+    from enrichment import bucketing as bk
+
     if not cell_agree:
         return False
+    site_type = str(res.get("site_type") or "").lower()
     if (
         str(res.get("dual_model_resolution") or "").lower() == "gemini_strong_solo"
-        and str(res.get("site_type") or "").lower() == "tower"
+        and site_type == "tower"
     ):
-        return True
+        return bk._tower_gemini_high_conf_ok(res)
     from classifier import asset_classifier as ac
 
-    return _cell_conf(ac, res) >= MIN_IMAGERY_ONLY_CELL_CONFIDENCE
+    if _cell_conf(ac, res) < MIN_IMAGERY_ONLY_CELL_CONFIDENCE:
+        return False
+    if site_type == "rooftop" and not bk._rooftop_cell_certain(res):
+        return bk._rooftop_localization_box_ok(res, require_localized=True)
+    return True
 
 
 def detail_view_name(asset_view: str | None) -> str | None:
@@ -689,7 +700,7 @@ def _classify_site_imagery(
             "lon": lon,
         }
 
-    def build_views(nm_views, naip_img=None, chip_m=None):
+    def build_views(nm_views, naip_img=None, chip_m=None, *, street=True):
         views_out = _labeled_views(
             ac,
             img if naip_img is None else naip_img,
@@ -698,7 +709,7 @@ def _classify_site_imagery(
             chip_dir=chip_dir,
             site_id=site_id,
         )
-        if supplemental_views and (nm_views or supplemental_can_confirm):
+        if street and supplemental_views and (nm_views or supplemental_can_confirm):
             views_out = views_out + supplemental_views
         return views_out
 
@@ -829,6 +840,7 @@ def _classify_site_imagery(
             naip_age_years=(naip_meta or {}).get("image_age_years"),
             db_backed=db_backed,
             osm_tower=osm_tower,
+            nearmap_required=min_oblique_sides > 0,
         )
         primary_model = primary_provider
     else:
@@ -1436,8 +1448,10 @@ def _classify_site_imagery(
                     continue
                 # Only the new directions (plus Vert): the model view cap would
                 # otherwise drop them in favour of the obliques already judged.
+                # No street photos unless they can confirm: a box drawn on one
+                # cannot be written.
                 focus = {k: v for k, v in nearmap_views.items() if k == "Vert" or k in extra}
-                retry_views = build_views(focus)
+                retry_views = build_views(focus, street=supplemental_can_confirm)
                 retry = dict(res)
                 retry.update({
                     "cell_equipment": True,
@@ -1453,8 +1467,13 @@ def _classify_site_imagery(
                     from_wide_rescue=from_wide_rescue, used_crop=False,
                     allow_gemini_solo=False, all_views=retry_views,
                 )
-                # Keep the stronger of the two Claude answers.
-                if agree_retry and (not cell_agree or _cell_conf(ac, retry) > _cell_conf(ac, res)):
+                # Keep the stronger of the two Claude answers, or the one the
+                # write gate takes (e.g. a compact box on the new side).
+                if agree_retry and (
+                    not cell_agree
+                    or _cell_conf(ac, retry) > _cell_conf(ac, res)
+                    or (site_qualified(retry, True) and not site_qualified(res, cell_agree))
+                ):
                     res, dual_model, cell_agree = retry, dual_retry or dual_model, True
             views = build_views(nearmap_views)
         # Still disputed, or Claude's yes is below the imagery-only bar (the

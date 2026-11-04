@@ -1954,14 +1954,16 @@ def classify_with_tiers(lat: float, lon: float, img: Image.Image | None,
                         build_views,
                         naip_age_years: float | None = None,
                         db_backed: bool = False,
-                        osm_tower: bool = False) -> tuple[dict, dict, str | None, str, list]:
+                        osm_tower: bool = False,
+                        nearmap_required: bool = False) -> tuple[dict, dict, str | None, str, list]:
     """NAIP screen, then Nearmap Vert+obliques unless a cheaper lock applies.
 
     Skip paid imagery when: a DB-backed NAIP tower already decided cell at
     medium+ conf; NAIP rooftop cell is locked at the Gemini solo bar; NAIP
     is empty and OSM has no building/tower; an OSM communication tower plus
     Gemini lock; or there is no API key. Remaining claimed sites and weaker
-    rooftops still buy Vert+obliques.
+    rooftops still buy Vert+obliques. ``nearmap_required`` (a NAIP-only call
+    the write gate held out) never skips.
     """
     nearmap_views: dict = {}
     nearmap_date = None
@@ -1974,7 +1976,7 @@ def classify_with_tiers(lat: float, lon: float, img: Image.Image | None,
     _step_done("classify (NAIP)", _brief_pass_result(res))
     stamp_naip_screen(res)
 
-    skip = skip_nearmap_after_naip_reason(
+    skip = None if nearmap_required else skip_nearmap_after_naip_reason(
         res, db_backed=db_backed, osm_tower=False, naip_age_years=naip_age_years
     )
     if skip:
@@ -1982,7 +1984,7 @@ def classify_with_tiers(lat: float, lon: float, img: Image.Image | None,
         return res, nearmap_views, nearmap_date, "naip_only", views
 
     osm_info = None
-    if not db_backed:
+    if not db_backed and not nearmap_required:
         osm_info = _osm_features(lat, lon)
         if osm_info.get("communication_tower"):
             osm_tower = True

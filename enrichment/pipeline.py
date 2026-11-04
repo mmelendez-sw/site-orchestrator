@@ -1260,6 +1260,23 @@ def _oblique_sides_seen(classified: dict[str, Any]) -> int:
     return len(views & {"North", "East", "South", "West"})
 
 
+# Write-gate holdouts another Nearmap side can settle (a strict second pass on
+# more sides, a compact box on another face, Claude's own look at a Gemini
+# tower, Nearmap for a NAIP-only tower). On 2026-11-03 these ended as holdouts
+# that had seen 0-3 sides.
+_MORE_SIDES_HOLDOUTS = frozenset({
+    "consistency_disagree",
+    "rooftop_needs_oblique_asset_box",
+    "rooftop_needs_asset_box",
+    "rooftop_needs_nearmap_obliques",
+    "rooftop_needs_dual_model_cell",
+    "rooftop_low_cell_confidence",
+    "imagery_only_needs_crop_or_localize_agree",
+    "tower_needs_dual_model_cell",
+    "tower_naip_only_forbidden",
+})
+
+
 def _call_classify(classify_fn, kwargs: dict[str, Any]) -> dict[str, Any]:
     """Call classify_fn; older / test doubles may accept fewer kwargs."""
     try:
@@ -1473,43 +1490,47 @@ def _classify_prepared(
     if prep.extra.get("naip_confirm"):
         _settle_naip_confirm(prep)
         return base
-    if (
-        base.get("bucket") == BUCKET_POTENTIAL_UPDATE
-        and prep.hit is None
-        and not prep.rooftop_confirm
-        and env_flag("CONFIRM_CONSISTENCY", True)
-        and (
-            str(classified.get("dual_model_resolution") or "").strip().lower() not in _DUAL_AGREE
-            or _rereview_mode()
+
+    def needs_second_pass(call: dict[str, Any]) -> bool:
+        return (
+            base.get("bucket") == BUCKET_POTENTIAL_UPDATE
+            and prep.hit is None
+            and not prep.rooftop_confirm
+            and env_flag("CONFIRM_CONSISTENCY", True)
+            and (
+                str(call.get("dual_model_resolution") or "").strip().lower() not in _DUAL_AGREE
+                or _rereview_mode()
+            )
         )
-    ):
+
+    if needs_second_pass(classified):
         base.update(_consistency_check(prep, classify_fn, kwargs, base, classified, verbose=verbose))
-        # The second pass only sees the sides the first pass bought, so a call
-        # that qualified early (e.g. Vert+North) can fail it for good. Buy the
-        # next side, classify again, and re-check, until it agrees or all four
-        # sides are seen. CONSISTENCY_BUYS_SIDES=0 turns this off.
-        seen = _oblique_sides_seen(classified)
-        while (
-            base.get("holdout_reason") == "consistency_disagree"
-            and env_flag("CONSISTENCY_BUYS_SIDES", True)
-            and seen < 4
-        ):
+    # A call can stop buying sides and still be held out by the write gate or
+    # the strict second pass (which only sees the sides the first pass
+    # bought). Buy the next side, classify again, and re-check, until it
+    # writes or all four sides are seen. CONSISTENCY_BUYS_SIDES=0 turns this off.
+    seen = _oblique_sides_seen(classified)
+    while (
+        base.get("holdout_reason") in _MORE_SIDES_HOLDOUTS
+        and not prep.rooftop_confirm
+        and env_flag("CONSISTENCY_BUYS_SIDES", True)
+        and seen < 4
+    ):
+        if verbose:
+            progress.step(f"{base.get('holdout_reason')} -> re-check with {seen + 1} side(s)")
+        retry_kwargs = dict(kwargs, min_oblique_sides=seen + 1)
+        try:
+            again = _call_classify(classify_fn, retry_kwargs)
+        except Exception as exc:  # noqa: BLE001
             if verbose:
-                progress.step(f"second pass disagreed -> re-check with {seen + 1} side(s)")
-            retry_kwargs = dict(kwargs, min_oblique_sides=seen + 1)
-            try:
-                again = _call_classify(classify_fn, retry_kwargs)
-            except Exception as exc:  # noqa: BLE001
-                if verbose:
-                    progress.warn(f"side re-check failed: {exc}")
-                break
-            if again.get("error") or _oblique_sides_seen(again) <= seen:
-                break  # no coverage for another side
-            classified, seen = again, _oblique_sides_seen(again)
-            _stamp_classified(base, classified, fresh=True)
-            base.update(_bucket(prep, classified))
-            if base.get("bucket") != BUCKET_POTENTIAL_UPDATE:
-                break
+                progress.warn(f"side re-check failed: {exc}")
+            break
+        if again.get("error") or _oblique_sides_seen(again) <= seen:
+            break  # no coverage for another side
+        classified, seen = again, _oblique_sides_seen(again)
+        _stamp_classified(base, classified, fresh=True)
+        base.update(_bucket(prep, classified))
+        if needs_second_pass(classified):
             base.update(
                 _consistency_check(prep, classify_fn, retry_kwargs, base, classified, verbose=verbose)
             )

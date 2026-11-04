@@ -65,6 +65,51 @@ class ConsistencyCheckTests(unittest.TestCase):
         self.assertEqual(pipeline._oblique_sides_seen({"nearmap_views": "Vert,North,East,South,West"}), 4)
         self.assertEqual(pipeline._oblique_sides_seen({}), 0)
 
+    def _classify_prepared(self, buckets, views):
+        calls = []
+
+        def classify_fn(**kw):
+            calls.append(kw)
+            return {"site_type": "tower", "nearmap_views": views[len(calls) - 1]}
+
+        prep = pipeline.PreparedSite(
+            base={"Id": "a0Z1", "classify_lat": 40.0, "classify_lng": -74.0,
+                  "pin_address_offset_m": "", "pin_address_mismatch": False},
+            site={}, hit=object(), sf_lat=40.0, sf_lng=-74.0,
+        )
+        with patch.object(pipeline, "_bucket", side_effect=buckets):
+            out = pipeline._classify_prepared(
+                prep, classify_fn=classify_fn, chip_dir=None, verbose=False,
+                cluster_cache=None, reuse_chips_dirs=None,
+            )
+        return out, calls
+
+    def test_write_gate_holdout_buys_another_side(self):
+        # 2026-11-03: a NAIP-only DB-hit tower was held out with no Nearmap.
+        out, calls = self._classify_prepared(
+            [{"bucket": "other_or_else", "holdout_reason": "tower_naip_only_forbidden"},
+             {"bucket": "potential_update", "holdout_reason": "", "update_site_type": "Monopole"}],
+            ["", "Vert,North"],
+        )
+        self.assertEqual([c.get("min_oblique_sides", 0) for c in calls], [0, 1])
+        self.assertEqual(out["bucket"], "potential_update")
+
+    def test_other_holdouts_do_not_buy_sides(self):
+        out, calls = self._classify_prepared(
+            [{"bucket": "potential_rooftop", "holdout_reason": "rooftop_no_cell_equipment"}],
+            ["Vert,North"],
+        )
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(out["holdout_reason"], "rooftop_no_cell_equipment")
+
+    def test_no_new_side_stops_the_re_check(self):
+        out, calls = self._classify_prepared(
+            [{"bucket": "potential_rooftop", "holdout_reason": "rooftop_needs_oblique_asset_box"}],
+            ["Vert,North", "Vert,North"],
+        )
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(out["holdout_reason"], "rooftop_needs_oblique_asset_box")
+
     def test_no_chip_dir_skips(self):
         out, calls = self._run({}, kwargs=dict(self.kwargs, chip_dir=None))
         self.assertEqual((out, calls), ({"consistency_check": "skipped_no_chips"}, []))
