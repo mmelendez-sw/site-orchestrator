@@ -15,7 +15,10 @@ from typing import Any
 from enrichment.coerce import to_float as _to_float
 from enrichment.constants import (
     BBOX_BUFFER_DEG,
+    COMPETITOR_TABLE,
+    FCC_COMPREHENSIVE_TABLE,
     FCC_TABLE,
+    MATCH_SOURCE_COMPETITOR,
     MATCH_SOURCE_FCC,
     MATCH_SOURCE_NONE,
     MATCH_SOURCE_TOWERSOURCE,
@@ -23,10 +26,13 @@ from enrichment.constants import (
     PROXIMITY_AMBIGUITY_GAP_M,
     PROXIMITY_CONFIDENT_M,
     PROXIMITY_MAX_M,
+    REGISTRY_DENSITY_RADIUS_M,
+    SAME_STRUCTURE_M,
     TOWERSOURCE_TABLE,
 )
 from enrichment.geo import haversine_meters
-from envutil import env_int
+from envutil import env_flag, env_int, env_str
+from salesforce.site_type_mapping import specific_site_type_from_db_asset_type
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +55,14 @@ class ProximityHit:
     selection_reason: str | None = None
     candidate_count: int | None = None
     runner_up_gap_m: float | None = None
+    # Every registry row merged into this structure (this hit included).
+    members: tuple[ProximityHit, ...] = ()
+
+    @property
+    def sources(self) -> str:
+        """Registries listing this structure, e.g. ``FCC+TowerSource``."""
+        names = {h.source for h in self.members} or {self.source}
+        return "+".join(sorted(names, key=lambda s: _SOURCE_RANK.get(s, 9)))
 
 
 def _buffer_deg_for_radius(max_m: float, lat: float) -> tuple[float, float]:
@@ -456,54 +470,111 @@ def towersource_coordinates(row: dict[str, Any]) -> tuple[float, float] | None:
     return lat, lng
 
 
+def _precise(value: float, decimals: int = 4) -> bool:
+    """True when the coordinate carries at least ``decimals`` decimal places."""
+    return abs(round(value, decimals - 1) - value) > 1e-9
+
+
+def competitor_coordinates(row: dict[str, Any]) -> tuple[float, float] | None:
+    """Portal coordinates; ≤3 decimals (~100 m) cannot place a 25 m match."""
+    coords = towersource_coordinates(row)
+    if coords is None or not (_precise(coords[0]) and _precise(coords[1])):
+        return None
+    return coords
+
+
 def _row_dict(cursor, row) -> dict[str, Any]:
     columns = [col[0] for col in cursor.description]
     return dict(zip(columns, row))
 
 
-_FCC_COLUMNS = (
+_FCC_LEGACY_COLUMNS = (
     "ID, ASR_Number, Latitude_Decimal, Longitude_Decimal, "
     "Latitude_Calculated, Longitude_Calculated, "
     "Registration_Type, Record_Type, Entity_Name"
+)
+_FCC_LEGACY_BBOX = (
+    "((f.Latitude_Decimal BETWEEN {a} AND {b} AND f.Longitude_Decimal BETWEEN {c} AND {d})"
+    " OR (f.Latitude_Calculated BETWEEN {a} AND {b} AND f.Longitude_Calculated BETWEEN {c} AND {d}))"
+)
+# Same registrations as FCCTowerData, plus status and structure type. Aliased to
+# the legacy names so hit building is shared; dead registrations never match.
+_FCC_COMP_COLUMNS = (
+    "id AS ID, Registration_Number AS ASR_Number, Latitude_Decimal, Longitude_Decimal, "
+    "Structure_Type AS Registration_Type, Status_Code_Definition AS Status, Entity_Name, "
+    "Structure_Street_Address, Structure_City, Structure_ZIP_Code, Overall_Height_AGL"
+)
+_FCC_COMP_BBOX = (
+    "(f.Latitude_Decimal BETWEEN {a} AND {b} AND f.Longitude_Decimal BETWEEN {c} AND {d}"
+    " AND ISNULL(f.Status_Code_Definition, '') NOT IN ('Dismantled', 'Canceled', 'Terminated'))"
 )
 _TS_COLUMNS = (
     "operator_site_identifier, asset_name, asset_type, asset_category, "
     "latitude, longitude, fcc_asr_number, street1, city, state, postal_code"
 )
-_FCC_BBOX = (
-    "((f.Latitude_Decimal BETWEEN {a} AND {b} AND f.Longitude_Decimal BETWEEN {c} AND {d})"
-    " OR (f.Latitude_Calculated BETWEEN {a} AND {b} AND f.Longitude_Calculated BETWEEN {c} AND {d}))"
+_TS_BBOX = (
+    "(t.latitude BETWEEN {a} AND {b} AND t.longitude BETWEEN {c} AND {d}"
+    " AND ISNULL(t.asset_status, '') NOT IN ('Speculative', 'In development'))"
 )
-_TS_BBOX = "(t.latitude BETWEEN {a} AND {b} AND t.longitude BETWEEN {c} AND {d})"
+_COMP_COLUMNS = (
+    "Unique_Key, latitude, longitude, asset_type, asset_category, asset_status, fcc_asr_number, "
+    "address, city, postal_code"
+)
+# Planned / under-construction portal entries are not structures yet.
+_COMP_BBOX = (
+    "(s.latitude BETWEEN {a} AND {b} AND s.longitude BETWEEN {c} AND {d}"
+    " AND ISNULL(s.asset_category, '') <> 'Towers in Dev.'"
+    " AND ISNULL(s.asset_status, '') <> 'INDEV'"
+    " AND ISNULL(s.asset_status, '') NOT LIKE 'Q[1-4]-%')"
+)
+
+
+def _fcc_source() -> tuple[str, str, str]:
+    """(table, columns, bbox) for FCC: Comprehensive unless FCC_SOURCE=legacy."""
+    if env_str("FCC_SOURCE", "comprehensive").lower() == "legacy":
+        return FCC_TABLE, _FCC_LEGACY_COLUMNS, _FCC_LEGACY_BBOX
+    return FCC_COMPREHENSIVE_TABLE, _FCC_COMP_COLUMNS, _FCC_COMP_BBOX
+
+
+def competitor_source_enabled() -> bool:
+    return env_flag("COMPETITOR_SOURCE", True)
 
 
 def _prefixed(columns: str, alias: str) -> str:
     return ", ".join(f"{alias}.{col.strip()}" for col in columns.split(","))
 
 
+def _fetch_candidates(
+    cursor, table: str, columns: str, alias: str, bbox: str, lat: float, lng: float, max_m: float
+) -> list[dict[str, Any]]:
+    box = _bbox(lat, lng, max_m=max_m)
+    where = bbox.format(a="?", b="?", c="?", d="?")
+    cursor.execute(
+        f"SELECT {_prefixed(columns, alias)} FROM {table} AS {alias} WHERE {where}",
+        *(box * (where.count("?") // 4)),
+    )
+    return [_row_dict(cursor, row) for row in cursor.fetchall()]
+
+
 def _fetch_fcc_candidates(
     cursor, lat: float, lng: float, *, max_m: float = PROXIMITY_MAX_M
 ) -> list[dict[str, Any]]:
-    min_lat, max_lat, min_lng, max_lng = _bbox(lat, lng, max_m=max_m)
-    where = _FCC_BBOX.format(a="?", b="?", c="?", d="?")
-    cursor.execute(
-        f"SELECT {_prefixed(_FCC_COLUMNS, 'f')} FROM {FCC_TABLE} AS f WHERE {where}",
-        min_lat, max_lat, min_lng, max_lng,
-        min_lat, max_lat, min_lng, max_lng,
-    )
-    return [_row_dict(cursor, row) for row in cursor.fetchall()]
+    table, columns, bbox = _fcc_source()
+    return _fetch_candidates(cursor, table, columns, "f", bbox, lat, lng, max_m)
 
 
 def _fetch_towersource_candidates(
     cursor, lat: float, lng: float, *, max_m: float = PROXIMITY_MAX_M
 ) -> list[dict[str, Any]]:
-    min_lat, max_lat, min_lng, max_lng = _bbox(lat, lng, max_m=max_m)
-    where = _TS_BBOX.format(a="?", b="?", c="?", d="?")
-    cursor.execute(
-        f"SELECT {_prefixed(_TS_COLUMNS, 't')} FROM {TOWERSOURCE_TABLE} AS t WHERE {where}",
-        min_lat, max_lat, min_lng, max_lng,
-    )
-    return [_row_dict(cursor, row) for row in cursor.fetchall()]
+    return _fetch_candidates(cursor, TOWERSOURCE_TABLE, _TS_COLUMNS, "t", _TS_BBOX, lat, lng, max_m)
+
+
+def _fetch_competitor_candidates(
+    cursor, lat: float, lng: float, *, max_m: float = PROXIMITY_MAX_M
+) -> list[dict[str, Any]]:
+    if not competitor_source_enabled():
+        return []
+    return _fetch_candidates(cursor, COMPETITOR_TABLE, _COMP_COLUMNS, "s", _COMP_BBOX, lat, lng, max_m)
 
 
 def _first_value(row: dict[str, Any], keys: Sequence[str]) -> str | None:
@@ -577,6 +648,65 @@ def _pin_distance(hit: ProximityHit) -> float:
     return hit.distance_to_pin_m if hit.distance_to_pin_m is not None else hit.distance_m
 
 
+# Whose coordinates represent a structure listed in several registries.
+_SOURCE_RANK = {MATCH_SOURCE_FCC: 0, MATCH_SOURCE_TOWERSOURCE: 1, MATCH_SOURCE_COMPETITOR: 2}
+# Whose structure type wins: TowerSource labels the actual build.
+_TYPE_RANK = {MATCH_SOURCE_TOWERSOURCE: 0, MATCH_SOURCE_FCC: 1, MATCH_SOURCE_COMPETITOR: 2}
+
+
+def _asr_key(value: str | None) -> str:
+    text = str(value or "").strip()
+    try:
+        return str(int(float(text)))
+    except ValueError:
+        return text.upper()
+
+
+def _same_asr(a: ProximityHit, b: ProximityHit) -> bool:
+    return bool(a.asr_number) and _asr_key(a.asr_number) == _asr_key(b.asr_number)
+
+
+def _joins_group(hit: ProximityHit, group: list[ProximityHit], merge_m: float) -> bool:
+    """Same structure: a shared ASR number, or another registry's row within
+    ``merge_m``. Two rows of one registry stay separate (distinct registrations
+    on a pad are a collocation question, not a duplicate listing)."""
+    if any(_same_asr(hit, member) for member in group):
+        return True
+    if any(member.source == hit.source for member in group):
+        return False
+    return any(
+        haversine_meters(hit.latitude, hit.longitude, m.latitude, m.longitude) <= merge_m
+        for m in group
+    )
+
+
+def _structure_hit(group: list[ProximityHit]) -> ProximityHit:
+    """One hit for a structure: FCC coordinates first, the most specific type."""
+    rep = min(group, key=lambda h: (_SOURCE_RANK.get(h.source, 9), _pin_distance(h)))
+    by_type = sorted(group, key=lambda h: _TYPE_RANK.get(h.source, 9))
+    asset_type = next(
+        (h.asset_type for h in by_type if specific_site_type_from_db_asset_type(h.asset_type)),
+        rep.asset_type,
+    )
+    return replace(rep, asset_type=asset_type, members=tuple(group))
+
+
+def group_structures(
+    hits: Sequence[ProximityHit], *, merge_m: float = SAME_STRUCTURE_M
+) -> list[ProximityHit]:
+    """Merge rows for the same physical structure so one tower listed in FCC,
+    TowerSource and a portal is one candidate, not an ambiguous cluster."""
+    groups: list[list[ProximityHit]] = []
+    for hit in sorted(hits, key=_pin_distance):
+        for group in groups:
+            if _joins_group(hit, group, merge_m):
+                group.append(hit)
+                break
+        else:
+            groups.append([hit])
+    return [_structure_hit(group) for group in groups]
+
+
 def select_proximity_hit(
     hits: Sequence[ProximityHit],
     *,
@@ -591,7 +721,7 @@ def select_proximity_hit(
     """
     if not hits:
         return None
-    cands = _dedupe_hits(hits)
+    cands = group_structures(_dedupe_hits(hits))
     n = len(cands)
 
     def _gap(best: ProximityHit, key) -> float | None:
@@ -612,7 +742,7 @@ def select_proximity_hit(
     # 1) Confident: within confident_m of pin.
     by_pin = sorted(
         cands,
-        key=lambda h: (_pin_distance(h), 0 if h.source == MATCH_SOURCE_FCC else 1),
+        key=lambda h: (_pin_distance(h), _SOURCE_RANK.get(h.source, 9)),
     )
     confident_pin = [h for h in by_pin if _pin_distance(h) <= confident_m]
     if confident_pin:
@@ -631,7 +761,7 @@ def select_proximity_hit(
             with_addr,
             key=lambda h: (
                 h.distance_to_address_m or 1e9,
-                0 if h.source == MATCH_SOURCE_FCC else 1,
+                _SOURCE_RANK.get(h.source, 9),
             ),
         )
         best = by_addr[0]
@@ -670,8 +800,9 @@ def select_from_candidate_rows(
     confident_m: float = PROXIMITY_CONFIDENT_M,
     ambiguity_gap_m: float = PROXIMITY_AMBIGUITY_GAP_M,
     address_affinity_m: float = PROXIMITY_ADDRESS_AFFINITY_M,
+    competitor_rows: Iterable[dict[str, Any]] = (),
 ) -> ProximityHit | None:
-    """Turn raw FCC/TowerSource rows near a pin (and address) into one hit."""
+    """Turn raw FCC/TowerSource/competitor rows near a pin (and address) into one hit."""
     common = dict(
         pin_lat=lat,
         pin_lng=lng,
@@ -695,6 +826,14 @@ def select_from_candidate_rows(
         asr_keys=("fcc_asr_number",),
         asset_type_keys=("asset_type", "asset_category"),
         **common,
+    ) + _hits_from_rows(
+        competitor_rows,
+        source=MATCH_SOURCE_COMPETITOR,
+        coord_fn=competitor_coordinates,
+        id_keys=("Unique_Key",),
+        asr_keys=("fcc_asr_number",),
+        asset_type_keys=("asset_type",),
+        **common,
     )
     return select_proximity_hit(
         hits,
@@ -716,19 +855,23 @@ def find_proximity_hit(
     ambiguity_gap_m: float = PROXIMITY_AMBIGUITY_GAP_M,
     address_affinity_m: float = PROXIMITY_ADDRESS_AFFINITY_M,
 ) -> ProximityHit | None:
-    """Return best FCC/TowerSource hit within max_m with anti-ambiguity rules.
+    """Return best FCC/TowerSource/competitor hit within max_m with anti-ambiguity rules.
 
     Searches a bbox large enough for max_m. Optional geocoded address enables
     address-affinity selection when the SF pin is offset from the street.
     """
     fcc_rows = _fetch_fcc_candidates(cursor, lat, lng, max_m=max_m)
     ts_rows = _fetch_towersource_candidates(cursor, lat, lng, max_m=max_m)
+    comp_rows = _fetch_competitor_candidates(cursor, lat, lng, max_m=max_m)
     # Also fetch around the address when it differs from the pin.
     if _address_differs(lat, lng, address_lat, address_lng):
         fcc_rows = list(fcc_rows) + _fetch_fcc_candidates(
             cursor, address_lat, address_lng, max_m=max_m
         )
         ts_rows = list(ts_rows) + _fetch_towersource_candidates(
+            cursor, address_lat, address_lng, max_m=max_m
+        )
+        comp_rows = list(comp_rows) + _fetch_competitor_candidates(
             cursor, address_lat, address_lng, max_m=max_m
         )
     return select_from_candidate_rows(
@@ -742,6 +885,7 @@ def find_proximity_hit(
         confident_m=confident_m,
         ambiguity_gap_m=ambiguity_gap_m,
         address_affinity_m=address_affinity_m,
+        competitor_rows=comp_rows,
     )
 
 
@@ -808,12 +952,18 @@ def _bulk_chunk(cursor, queries: Sequence[ProximityQuery], max_m: float):
         "VALUES (?, ?, ?, ?, ?)",
         _bulk_points(queries, max_m),
     )
-    fcc = _grouped_rows(cursor, _bulk_join_sql(_FCC_COLUMNS, "f", FCC_TABLE, _FCC_BBOX))
+    fcc_table, fcc_columns, fcc_bbox = _fcc_source()
+    fcc = _grouped_rows(cursor, _bulk_join_sql(fcc_columns, "f", fcc_table, fcc_bbox))
     ts = _grouped_rows(
         cursor, _bulk_join_sql(_TS_COLUMNS, "t", TOWERSOURCE_TABLE, _TS_BBOX)
     )
+    comp: dict[str, list[dict[str, Any]]] = {}
+    if competitor_source_enabled():
+        comp = _grouped_rows(
+            cursor, _bulk_join_sql(_COMP_COLUMNS, "s", COMPETITOR_TABLE, _COMP_BBOX)
+        )
     cursor.execute(f"DROP TABLE {_BULK_POINTS}")
-    return fcc, ts
+    return fcc, ts, comp
 
 
 def find_proximity_hits_bulk(
@@ -826,13 +976,14 @@ def find_proximity_hits_bulk(
     """Same selection as ``find_proximity_hit`` for many sites in few queries.
 
     Each chunk loads bbox points (pin, plus address when it differs) into a
-    session temp table and joins FCC and TowerSource once each, instead of
-    two to four queries per site. Raises on SQL errors; callers fall back.
+    session temp table and joins FCC, TowerSource and the competitor portals
+    once each, instead of several queries per site. Raises on SQL errors;
+    callers fall back.
     """
     results: dict[str, ProximityHit | None] = {}
     for start in range(0, len(queries), max(1, int(chunk_size))):
         chunk = list(queries[start : start + chunk_size])
-        fcc, ts = _bulk_chunk(cursor, chunk, max_m)
+        fcc, ts, comp = _bulk_chunk(cursor, chunk, max_m)
         for q in chunk:
             results[q.key] = select_from_candidate_rows(
                 fcc.get(q.key, []),
@@ -842,8 +993,60 @@ def find_proximity_hits_bulk(
                 max_m=max_m,
                 address_lat=q.address_lat,
                 address_lng=q.address_lng,
+                competitor_rows=comp.get(q.key, []),
             )
     return results
+
+
+_DENSITY_POINTS = "#enrichment_density_points"
+_DENSITY_SQL = (
+    f"SELECT p.query_key, COUNT(*) FROM {_DENSITY_POINTS} AS p JOIN ("
+    "SELECT Latitude_Decimal AS lat, Longitude_Decimal AS lng FROM {fcc} "
+    "WHERE ISNULL(Status_Code_Definition, '') NOT IN ('Dismantled', 'Canceled', 'Terminated') "
+    "UNION ALL SELECT latitude, longitude FROM {ts} "
+    "WHERE ISNULL(asset_status, '') NOT IN ('Speculative', 'In development')"
+    ") AS x ON x.lat BETWEEN p.min_lat AND p.max_lat AND x.lng BETWEEN p.min_lng AND p.max_lng "
+    "AND SQUARE((x.lat - p.lat) * 111320.0) "
+    "+ SQUARE((x.lng - p.lng) * 111320.0 * COS(RADIANS(p.lat))) <= ? "
+    "GROUP BY p.query_key"
+)
+
+
+def registry_density_bulk(
+    cursor,
+    points: dict[str, tuple[float, float]],
+    *,
+    radius_m: float = REGISTRY_DENSITY_RADIUS_M,
+    chunk_size: int = 500,
+) -> dict[str, int]:
+    """Active FCC + TowerSource rows within ``radius_m`` of each point (0 when none).
+
+    A stand-in for urbanicity: the count is also the wrong-neighbor risk a far
+    registry match carries. Raises on SQL errors; callers treat density as optional.
+    """
+    out = dict.fromkeys(points, 0)
+    items = list(points.items())
+    sql = _DENSITY_SQL.format(fcc=FCC_COMPREHENSIVE_TABLE, ts=TOWERSOURCE_TABLE)
+    for start in range(0, len(items), max(1, int(chunk_size))):
+        cursor.execute(
+            f"IF OBJECT_ID('tempdb..{_DENSITY_POINTS}') IS NOT NULL DROP TABLE {_DENSITY_POINTS}; "
+            f"CREATE TABLE {_DENSITY_POINTS} (query_key nvarchar(64) NOT NULL, "
+            "lat float NOT NULL, lng float NOT NULL, min_lat float NOT NULL, "
+            "max_lat float NOT NULL, min_lng float NOT NULL, max_lng float NOT NULL)"
+        )
+        try:
+            cursor.fast_executemany = True
+        except AttributeError:
+            pass
+        cursor.executemany(
+            f"INSERT INTO {_DENSITY_POINTS} VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [(key, lat, lng, *_bbox(lat, lng, max_m=radius_m)) for key, (lat, lng) in items[start : start + chunk_size]],
+        )
+        cursor.execute(sql, float(radius_m) ** 2)
+        for key, count in cursor.fetchall():
+            out[str(key)] = int(count)
+        cursor.execute(f"DROP TABLE {_DENSITY_POINTS}")
+    return out
 
 
 def describe_match(hit: ProximityHit | None) -> str:

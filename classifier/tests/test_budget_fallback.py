@@ -88,7 +88,9 @@ class SharedBudgetTests(unittest.TestCase):
         self.assertEqual(a.spent, 1 * MB)
         a.add(2 * MB, purpose="pack")
         # The new-code site finishes: usage row flagged as covered by purchases.
-        with patch.object(metrics, "metrics_dir", lambda: self.root):
+        # Pin its stamp inside October so the month filter below sees it.
+        with patch.object(metrics, "metrics_dir", lambda: self.root), \
+             patch.object(metrics, "_utc_stamp", lambda now=None: "2026-10-07T11:30:00Z"):
             metrics.record_nearmap_usage("run-1", {"Id": "a0Z1", "nearmap_bytes": 2 * MB})
         # An old-code lane still running writes an unflagged row: still counted.
         metrics._append_jsonl(self.root / metrics.NEARMAP_USAGE_JSONL,

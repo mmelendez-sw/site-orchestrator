@@ -26,6 +26,7 @@ import os
 import queue
 import threading
 import time
+from collections import Counter
 from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
@@ -38,6 +39,7 @@ from enrichment import progress
 from enrichment.bucketing import (
     _holdout,
     bucket_classification,
+    competitor_verified_source,
     imagery_bucket,
     naip_rooftop_confirm_decision,
     verified_source_for_match,
@@ -50,23 +52,29 @@ from enrichment.connectx_audit import (
 )
 from enrichment.constants import (
     APPLY_LOG_CSV,
+    AUTO_SKIP_ON_STRUCTURE_M,
     BUCKET_AUDIT_HOLDOUT,
     BUCKET_AUDIT_UNQUALIFY,
     BUCKET_OTHER,
     BUCKET_POTENTIAL_UPDATE,
     BUCKET_ROOFTOP,
     CANDIDATE_CSV,
+    DB_ONLY_ON_STRUCTURE_M,
     DEFAULT_STAGE_FILTER,
     DETAIL_CSV,
     HIGH_INPUT_CONFIDENCE_STAGES,
     HOLDOUT_CSV,
+    MATCH_SOURCE_COMPETITOR,
     MATCH_SOURCE_NONE,
+    NAIP_CONFIRM_BOX_M,
     PROXIMITY_MAX_M,
 )
 from enrichment.cost_policy import (
     auto_skip_classify_reason,
     cluster_groups,
+    density_tier,
     find_cluster_match,
+    registry_review_reason,
     remember_cluster_result,
 )
 from enrichment.geo import (
@@ -95,6 +103,7 @@ from enrichment.mssql import (
     find_proximity_hits_bulk,
     is_sql_link_failure,
     reconnect_mssql,
+    registry_density_bulk,
 )
 from enrichment.naip_classify import classify_site_imagery
 from enrichment.outputs import (
@@ -104,16 +113,19 @@ from enrichment.outputs import (
     CsvAppender,
     write_csv,
 )
+from enrichment.registry_checks import address_match, naip_registry_check, registry_height_m
 from enrichment.sf_ops import (
     apply_one_update,
     apply_updates_batch,
+    attempted_field,
     parse_sf_lat_lng,
     query_blank_site_type_sites,
     query_sites_by_ids,
     status_from_entry,
+    utc_now_iso,
 )
 from envutil import env_flag, env_float, env_int
-from paths import runs_dir
+from paths import chips_dir, runs_dir
 from salesforce.site_type_mapping import (
     is_sales_tower_type,
     site_type_from_db_asset_type,
@@ -121,7 +133,9 @@ from salesforce.site_type_mapping import (
 
 logger = logging.getLogger(__name__)
 
-_ALREADY_WRITTEN = frozenset({"updated", "classified_only", "dequeued", "unqualified"})
+_ALREADY_WRITTEN = frozenset(
+    {"updated", "classified_only", "dequeued", "unqualified", "stamped", "duplicate_flagged"}
+)
 _SQL_ERROR_HOLDOUT = "sql_error"
 _NEARMAP_BUDGET_HOLDOUT = "nearmap_budget"
 # Transient holdouts stay in the Salesforce queue for a later run.
@@ -368,6 +382,12 @@ def _collect_apply_rows(
     confirm_existing: bool,
     connectx_audit: bool = False,
 ) -> list[dict[str, Any]]:
+    """Rows to write. Every other attempted row gets an attempt-date-only write.
+
+    DB-only misses are attempt-only too: they no longer set LLM_Classified, so
+    they stay in the imagery queue. Transient holdouts (SQL error, Nearmap
+    budget) were not really attempted and get nothing.
+    """
     apply_rows = [
         row
         for row in detail_rows
@@ -375,7 +395,7 @@ def _collect_apply_rows(
         and _needs_sf_apply(row)
     ]
     leave_failures = confirm_rooftop or confirm_existing or connectx_audit
-    if not leave_failures and (dequeue_holdouts or db_only):
+    if not leave_failures and dequeue_holdouts and not db_only:
         apply_rows.extend(
             row
             for row in detail_rows
@@ -383,6 +403,16 @@ def _collect_apply_rows(
             and _needs_sf_apply(row)
             and str(row.get("holdout_reason") or "") not in _KEEP_QUEUED_HOLDOUTS
         )
+    if attempted_field():
+        chosen = {id(row) for row in apply_rows}
+        for row in detail_rows:
+            if (
+                id(row) not in chosen
+                and _needs_sf_apply(row)
+                and str(row.get("holdout_reason") or "") not in _KEEP_QUEUED_HOLDOUTS
+            ):
+                row["attempt_only"] = True
+                apply_rows.append(row)
     return apply_rows
 
 
@@ -413,6 +443,8 @@ def _status_counts(detail_rows: Iterable[dict[str, Any]]) -> dict[str, int]:
         "dequeued": 0,
         "classified_only": 0,
         "unqualified": 0,
+        "stamped": 0,
+        "duplicate_flagged": 0,
         "failed": 0,
     }
     for row in detail_rows:
@@ -435,6 +467,8 @@ def _apply_info_from_detail(
         "dequeued_holdouts": counts["dequeued"],
         "classified_only": counts["classified_only"],
         "unqualified": counts["unqualified"],
+        "attempt_only": counts["stamped"],
+        "duplicate_flagged": counts["duplicate_flagged"],
         "failed": counts["failed"],
         "apply": apply,
         "log": log,
@@ -523,7 +557,11 @@ def _apply_rows(
 
 REVIEW_CSV = "review_queue.csv"
 REVIEW_COLUMNS = (
-    "Id", "review_reason", "footprint_status", "footprint_distance_m", "naip_site_type", "gemini_cell_confidence", "cell_equipment_confidence",
+    "Id", "review_reason", "Site_Street__c", "Site_City__c", "Site_State__c", "sf_lat", "sf_lng",
+    "match_distance_m", "match_sources", "match_candidate_count", "match_runner_up_gap_m",
+    "match_asr_number", "db_site_type", "classify_lat", "classify_lng", "registry_density",
+    "density_tier", "naip_confirm", "address_match", "registry_address", "registry_height_m", "naip_check", "naip_check_conf",
+    "naip_check_evidence", "naip_check_chip", "footprint_status", "footprint_distance_m", "naip_site_type", "gemini_cell_confidence", "cell_equipment_confidence",
     "dual_model_resolution", "holdout_reason", "audit_reason", "nearmap_views",
     "supplemental_sources", "cell_equipment_evidence", "chip_dir",
 )
@@ -534,6 +572,8 @@ def review_reason(row: dict[str, Any]) -> str:
     """Why an unconfirmed row needs a person, or '' (models split hard, stealth, unstable)."""
     if row.get("bucket") == BUCKET_POTENTIAL_UPDATE:
         return ""
+    if row.get("registry_review"):
+        return str(row["registry_review"])
     try:
         gemini = float(row.get("gemini_cell_confidence") or 0)
     except (TypeError, ValueError):
@@ -774,6 +814,35 @@ def _prefetch_signals(
     return out
 
 
+def _prefetch_density(
+    sites: list[dict[str, Any]], sql_state: dict[str, Any], *, verbose: bool
+) -> dict[str, dict[str, Any]]:
+    """Registered structures near each pin and its density tier (REGISTRY_DENSITY=0 skips)."""
+    if not sites or sql_state.get("cursor") is None or not env_flag("REGISTRY_DENSITY", True):
+        return {}
+    points = {}
+    for site in sites:
+        coords = parse_sf_lat_lng(site)
+        sf_id = str(site.get("Id") or "")
+        if coords is not None and sf_id:
+            points[sf_id] = coords
+    try:
+        counts = registry_density_bulk(sql_state["cursor"], points)
+    except Exception as exc:  # noqa: BLE001 — density is optional context
+        logger.warning("registry density unavailable: %s", exc)
+        if verbose:
+            progress.warn(f"registry density unavailable ({exc})")
+        return {}
+    out = {
+        sf_id: {"registry_density": n, "density_tier": density_tier(n)}
+        for sf_id, n in counts.items()
+    }
+    if verbose:
+        tiers = Counter(v["density_tier"] for v in out.values())
+        progress.result(f"registry density: {dict(tiers)}")
+    return out
+
+
 # ------------------------------- per site -----------------------------------
 
 
@@ -855,11 +924,69 @@ def _stamp_match(base: dict[str, Any], hit) -> None:
             "match_record_id": hit.record_id or "",
             "match_asr_number": hit.asr_number or "",
             "match_asset_type": hit.asset_type or "",
+            "match_sources": getattr(hit, "sources", "") or describe_match(hit),
             "classify_lat": hit.latitude,
             "classify_lng": hit.longitude,
             "classify_coord_source": f"db:{describe_match(hit)}",
         }
     )
+
+
+def naip_confirm_enabled() -> bool:
+    """DB-only near misses get a free NAIP read at the registry point (NAIP_CONFIRM=1)."""
+    return env_flag("NAIP_CONFIRM", False)
+
+
+def _keep_existing_fields(base: dict[str, Any], site: dict[str, Any]) -> None:
+    """Registry-only semantics for a typed site: verified only; type, pin and a
+    filled source stay (mirrors _stamp_unique_db_update keep_existing)."""
+    existing_type = str(site.get("Site_Type__c") or "").strip()
+    if not existing_type:
+        return
+    base["site_type_kept"] = existing_type
+    for key in ("update_lat", "update_lng", "update_coord_source", "update_site_type"):
+        base[key] = ""
+    if str(site.get("Verified_Site_Source__c") or "").strip():
+        base["update_verified_site_source"] = ""
+
+
+def _settle_naip_confirm(prep: PreparedSite) -> None:
+    """After the NAIP read of a near miss: a bucketed tower confirms the registry
+    structure (written like a unique hit); anything else stays a stamped miss."""
+    base = prep.base
+    offset = to_float(base.get("asset_offset_m"))
+    on_registry_point = offset is not None and offset <= NAIP_CONFIRM_BOX_M
+    if base.get("bucket") == BUCKET_POTENTIAL_UPDATE and on_registry_point:
+        base["naip_confirm"] = "confirmed"
+        base["holdout_reason"] = "naip_confirmed_registry"
+        base["registry_review"] = ""
+        _keep_existing_fields(base, prep.site)
+        return
+    if base.get("bucket") == BUCKET_POTENTIAL_UPDATE:
+        why = "no_asset_box" if offset is None else f"box_{offset:.0f}m_off_registry_point"
+    else:
+        why = base.get("holdout_reason") or base.get("error") or ""
+    base["naip_confirm"] = f"not_confirmed:{why}"
+    base["bucket"] = BUCKET_OTHER
+    base["holdout_reason"] = "db_only_no_unique_hit"
+    for key in ("update_lat", "update_lng", "update_coord_source", "update_site_type",
+                "update_verified_site", "update_verified_site_source"):
+        base[key] = ""
+
+
+def _stamp_registry_checks(
+    base: dict[str, Any], site: dict[str, Any], hit, sf_lat: float, sf_lng: float, *, verbose: bool
+) -> None:
+    """Address agreement (free) and, with REGISTRY_NAIP_CHECK=1, a NAIP read at
+    the registry point for a near miss headed to review_queue.csv."""
+    base.update(address_match(site, hit))
+    base["registry_height_m"] = registry_height_m(hit)
+    if not env_flag("REGISTRY_NAIP_CHECK", False):
+        return
+    chip = chips_dir() / "registry_checks" / f"{base.get('Id') or 'site'}.jpg"
+    base.update(naip_registry_check(hit.latitude, hit.longitude, pin=(sf_lat, sf_lng), save_to=chip))
+    if verbose:
+        progress.result(f"registry checks: address={base['address_match'] or '-'} naip={base['naip_check']}")
 
 
 def _prepare_site(
@@ -968,23 +1095,52 @@ def _prepare_site(
         else:
             progress.result("no DB hit → classify on SF pin")
 
-    skip_reason = auto_skip_classify_reason(hit, force=db_only)
+    # A structure only a competitor portal lists cannot be written until
+    # Verified_Site_Source__c has a value for it (COMPETITOR_VERIFIED_SOURCE).
+    competitor_only = (
+        hit is not None
+        and getattr(hit, "sources", "") == MATCH_SOURCE_COMPETITOR
+        and not competitor_verified_source()
+    )
+    skip_reason = None if competitor_only else auto_skip_classify_reason(
+        hit, force=db_only, on_structure_m=DB_ONLY_ON_STRUCTURE_M if db_only else AUTO_SKIP_ON_STRUCTURE_M
+    )
+    existing = {
+        "existing_site_type": str(site.get("Site_Type__c") or "").strip(),
+        "existing_source": str(site.get("Verified_Site_Source__c") or "").strip(),
+    }
     if db_only:
         prep.done = True
         if skip_reason is not None and hit is not None:
             if verbose:
                 progress.step(f"db-only unique hit ({skip_reason})")
-            _stamp_unique_db_update(base, hit, base["classify_lat"], base["classify_lng"])
+            _stamp_unique_db_update(
+                base, hit, base["classify_lat"], base["classify_lng"], keep_existing=True, **existing
+            )
             return prep
+        if hit is not None:
+            base["db_site_type"] = site_type_from_db_asset_type(hit.asset_type)
+            base["registry_review"] = registry_review_reason(
+                hit, base.get("density_tier") or "", competitor_only=competitor_only
+            )
+            if base["registry_review"]:
+                _stamp_registry_checks(base, site, hit, sf_lat, sf_lng, verbose=verbose)
+                if naip_confirm_enabled():
+                    # Free NAIP at the registry point decides it (see _classify_prepared).
+                    prep.extra["naip_confirm"] = True
+                    prep.done = False
+                    if verbose:
+                        progress.step("db-only near miss → NAIP confirm at the registry point")
+                    return prep
         if verbose:
-            progress.step("db-only — no unique FCC/TowerSource hit (no imagery)")
+            progress.step("db-only — no unique registry hit (no imagery)")
         base["holdout_reason"] = "db_only_no_unique_hit"
         return prep
     if skip_classify or skip_reason is not None:
         prep.done = True
         if verbose:
             progress.step("skip classify" if skip_classify else f"auto skip classify ({skip_reason})")
-        if hit is not None:
+        if hit is not None and not competitor_only:
             _stamp_unique_db_update(base, hit, base["classify_lat"], base["classify_lng"])
         else:
             base["holdout_reason"] = "skip_classify_no_db_hit"
@@ -1097,6 +1253,11 @@ def replay_decision(row: dict[str, Any]) -> dict[str, Any] | None:
         sf_lat=to_float(row.get("sf_lat")),
         sf_lng=to_float(row.get("sf_lng")),
     )
+
+
+def _oblique_sides_seen(classified: dict[str, Any]) -> int:
+    views = {v.strip() for v in str(classified.get("nearmap_views") or "").split(",")}
+    return len(views & {"North", "East", "South", "West"})
 
 
 def _call_classify(classify_fn, kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -1286,6 +1447,8 @@ def _classify_prepared(
         base["error"] = f"classify_failed: {exc}"
         base["bucket"] = BUCKET_OTHER
         base["holdout_reason"] = "classify_error"
+        if prep.extra.get("naip_confirm"):
+            base["naip_confirm"] = "error"
         return base
 
     _stamp_classified(base, classified, fresh=True)
@@ -1307,6 +1470,9 @@ def _classify_prepared(
         except (TypeError, ValueError):
             pass
     base.update(_bucket(prep, classified))
+    if prep.extra.get("naip_confirm"):
+        _settle_naip_confirm(prep)
+        return base
     if (
         base.get("bucket") == BUCKET_POTENTIAL_UPDATE
         and prep.hit is None
@@ -1318,6 +1484,35 @@ def _classify_prepared(
         )
     ):
         base.update(_consistency_check(prep, classify_fn, kwargs, base, classified, verbose=verbose))
+        # The second pass only sees the sides the first pass bought, so a call
+        # that qualified early (e.g. Vert+North) can fail it for good. Buy the
+        # next side, classify again, and re-check, until it agrees or all four
+        # sides are seen. CONSISTENCY_BUYS_SIDES=0 turns this off.
+        seen = _oblique_sides_seen(classified)
+        while (
+            base.get("holdout_reason") == "consistency_disagree"
+            and env_flag("CONSISTENCY_BUYS_SIDES", True)
+            and seen < 4
+        ):
+            if verbose:
+                progress.step(f"second pass disagreed -> re-check with {seen + 1} side(s)")
+            retry_kwargs = dict(kwargs, min_oblique_sides=seen + 1)
+            try:
+                again = _call_classify(classify_fn, retry_kwargs)
+            except Exception as exc:  # noqa: BLE001
+                if verbose:
+                    progress.warn(f"side re-check failed: {exc}")
+                break
+            if again.get("error") or _oblique_sides_seen(again) <= seen:
+                break  # no coverage for another side
+            classified, seen = again, _oblique_sides_seen(again)
+            _stamp_classified(base, classified, fresh=True)
+            base.update(_bucket(prep, classified))
+            if base.get("bucket") != BUCKET_POTENTIAL_UPDATE:
+                break
+            base.update(
+                _consistency_check(prep, classify_fn, retry_kwargs, base, classified, verbose=verbose)
+            )
     if classified.get("nearmap_budget_blocked") and base.get("bucket") != BUCKET_POTENTIAL_UPDATE:
         # Needed Nearmap the monthly budget refused: keep it queued for next month.
         base["holdout_reason"] = _NEARMAP_BUDGET_HOLDOUT
@@ -1371,11 +1566,21 @@ def _stamp_unique_db_update(
     hit,
     classify_lat: float,
     classify_lng: float,
+    *,
+    keep_existing: bool = False,
+    existing_site_type: str = "",
+    existing_source: str = "",
 ) -> dict[str, Any]:
-    """Salesforce candidate from a unique FCC/TowerSource hit (no imagery)."""
+    """Salesforce candidate from a unique registry hit (no imagery).
+
+    ``keep_existing`` (registry-only runs): a site that already has a
+    Site_Type keeps it and its pin; the hit only marks it verified, fills a
+    blank Verified_Site_Source, and logs what the registry said.
+    """
     sf_type = site_type_from_db_asset_type(hit.asset_type)
     base["bucket"] = BUCKET_POTENTIAL_UPDATE
     base["holdout_reason"] = "skip_classify_db_hit"
+    base["db_site_type"] = sf_type
     base["naip_site_type"] = "rooftop" if sf_type == "Rooftop" else "tower"
     base["update_lat"] = classify_lat
     base["update_lng"] = classify_lng
@@ -1383,6 +1588,13 @@ def _stamp_unique_db_update(
     base["update_site_type"] = sf_type
     base["update_verified_site"] = True
     base["update_verified_site_source"] = verified_source_for_match(base["match_source"])
+    if keep_existing and existing_site_type:
+        base["site_type_kept"] = existing_site_type
+        base["naip_site_type"] = "rooftop" if existing_site_type == "Rooftop" else "tower"
+        for key in ("update_lat", "update_lng", "update_coord_source", "update_site_type"):
+            base[key] = ""
+        if existing_source:
+            base["update_verified_site_source"] = ""
     return base
 
 
@@ -1463,6 +1675,8 @@ class _RunState:
             row = self.decorate(row)
         row["outcome_class"] = outcome_class(row)
         row.setdefault("sf_update_error", "")
+        if not row.get("attempted_at"):
+            row["attempted_at"] = utc_now_iso()
         row["sf_update_status"] = (
             "pending"
             if row.get("bucket") in {BUCKET_POTENTIAL_UPDATE, BUCKET_AUDIT_UNQUALIFY, BUCKET_AUDIT_HOLDOUT}
@@ -1754,7 +1968,11 @@ def run_enrichment(
             own_sql = True
             if verbose:
                 progress.result("connected")
-        classify = None if db_only else (classify_fn or classify_site_imagery)
+        if db_only and naip_confirm_enabled():
+            os.environ["NAIP_ONLY"] = "1"  # never buy Nearmap from a DB-only run
+            classify = classify_fn or classify_site_imagery
+        else:
+            classify = None if db_only else (classify_fn or classify_site_imagery)
 
     sql_state: dict[str, Any] = {"conn": sql_connection, "cursor": None}
     sink: SiteSink | None = None
@@ -1845,6 +2063,8 @@ def run_enrichment(
             prefetch_sites, geocodes, sql_state, max_m=max_m, verbose=verbose
         )
         signals = _prefetch_signals(prefetch_sites, sql_state, verbose=verbose)
+        for sf_id, density in _prefetch_density(prefetch_sites, sql_state, verbose=verbose).items():
+            signals[sf_id] = {**signals.get(sf_id, {}), **density}
 
         pending: list[tuple[int, PreparedSite]] = []
         classify_error: BaseException | None = None

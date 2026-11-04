@@ -266,6 +266,29 @@ class StaggeredObliqueTests(unittest.TestCase):
         self.assertEqual(fetched, [["Vert"], ["North"], ["East"]])
         self.assertEqual(sorted(views), ["East", "North", "Vert"])
 
+    def test_four_sides_are_bought_one_at_a_time_until_the_call_locks(self):
+        from classifier import asset_classifier as ac
+
+        fetched: list[list[str]] = []
+        open_call = {"site_type": "rooftop", "site_confidence": 0.8, "cell_equipment": False}
+        locked = {"site_type": "tower", "site_confidence": 0.95, "cell_equipment": True}
+
+        def fake_nearmap(lat, lon, chip_m=100, views=None, **_kw):
+            fetched.append(list(views or []))
+            return {v: Image.new("RGB", (64, 64)) for v in views}, "2026-05-01"
+
+        def fake_pass(_provider, _clients, views, *_a, **kw):
+            if kw.get("screen"):
+                return {"site_type": "rooftop", "site_confidence": 0.8}
+            return dict(locked if any(label == "South" for label, _img in views) else open_call)
+
+        with patch.object(ac, "fetch_nearmap_views", side_effect=fake_nearmap),                 patch.object(ac, "_classify_pass", side_effect=fake_pass),                 patch.object(ac, "NEARMAP_API_KEY", "x"),                 patch.object(ac, "NEARMAP_STAGGER_OBLIQUES", True),                 patch.object(ac, "OBLIQUE_VIEWS", ["North", "East", "South", "West"]):
+            _res, views, _d, _tier, _v = ac.classify_with_tiers(
+                43.0, -89.0, Image.new("RGB", (64, 64)), "gemini", {}, "p", "high",
+                lambda nm: [(k, v) for k, v in nm.items()],
+            )
+        self.assertEqual(fetched, [["Vert"], ["North"], ["East"], ["South"]])  # West never bought
+        self.assertEqual(sorted(views), ["East", "North", "South", "Vert"])
 
 if __name__ == "__main__":
     unittest.main()

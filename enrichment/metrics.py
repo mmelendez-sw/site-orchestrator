@@ -808,7 +808,7 @@ def shared_month_to_date_nearmap_bytes(
 
 
 _LIVE_STATUSES = frozenset(
-    {"updated", "dequeued", "classified_only", "unqualified", "failed"}
+    {"updated", "dequeued", "classified_only", "unqualified", "stamped", "duplicate_flagged", "failed"}
 )
 
 

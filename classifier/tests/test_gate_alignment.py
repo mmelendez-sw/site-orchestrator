@@ -100,5 +100,46 @@ class DisputedLabelTests(unittest.TestCase):
         self.assertEqual(audit_verdict(row), ("inconclusive", "gear_claim_disputed"))
 
 
+class DetailCloseUpTests(unittest.TestCase):
+    BOX = [400, 400, 500, 500]
+
+    def _vetoed(self):
+        return {"site_type": "rooftop", "cell_equipment": False, "cell_equipment_confidence": 0.8,
+                "cell_gear_kind": "none", "asset_box_2d": None, "asset_view": None,
+                "dual_model_resolution": "claude_veto", "cell_models_agree": False}
+
+    def _judge(self, reply):
+        with patch.object(ac, "classify_site", return_value=dict(reply)):
+            return ac.confirm_rooftop_cell_on_detail(
+                self._vetoed(), {"claude": object()}, [("Nearmap oblique (North), zoom-21 close-up", _img())],
+                gemini_box=self.BOX, gemini_view="Nearmap oblique (North)")
+
+    def test_strict_close_up_yes_agrees_on_gemini_box(self):
+        res, agree = self._judge({"cell_equipment": True, "cell_equipment_confidence": 0.9,
+                                  "cell_gear_kind": "rru", "cell_equipment_evidence": "Two RRUs on a pipe mount."})
+        self.assertTrue(agree)
+        self.assertEqual(res["dual_model_resolution"], "agree_crop")
+        self.assertEqual(res["asset_box_2d"], self.BOX)
+        self.assertEqual(res["asset_view"], "Nearmap oblique (North)")
+        self.assertEqual(res["claude_dual_mode"], "detail_zoom21")
+
+    def test_hedged_or_null_close_up_keeps_the_holdout(self):
+        for reply in ({"cell_equipment": True, "cell_equipment_confidence": 0.9, "cell_gear_kind": "rru",
+                       "cell_equipment_evidence": "boxes that appear to be RRUs"},
+                      {"cell_equipment": None, "cell_equipment_confidence": 0.4}):
+            res, agree = self._judge(reply)
+            self.assertFalse(agree, reply)
+            self.assertEqual(res["dual_model_resolution"], "claude_veto")
+            self.assertIsNone(res["asset_box_2d"])
+
+    def test_detail_view_name_only_for_nearmap_boxes(self):
+        from enrichment.naip_classify import detail_view_name
+
+        self.assertEqual(detail_view_name("Nearmap oblique (West)"), "West")
+        self.assertEqual(detail_view_name("Nearmap top-down"), "Vert")
+        self.assertIsNone(detail_view_name("NAIP top-down"))
+        self.assertIsNone(detail_view_name("Street-level photo (Mapillary 2020-05, camera 31 m NW)"))
+
+
 if __name__ == "__main__":
     unittest.main()

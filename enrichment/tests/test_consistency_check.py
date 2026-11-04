@@ -60,6 +60,11 @@ class ConsistencyCheckTests(unittest.TestCase):
                                               self.classified, verbose=False)
         self.assertEqual(out["holdout_reason"], "consistency_disagree")
 
+    def test_sides_seen_counts_obliques_only(self):
+        self.assertEqual(pipeline._oblique_sides_seen({"nearmap_views": "Vert,North"}), 1)
+        self.assertEqual(pipeline._oblique_sides_seen({"nearmap_views": "Vert,North,East,South,West"}), 4)
+        self.assertEqual(pipeline._oblique_sides_seen({}), 0)
+
     def test_no_chip_dir_skips(self):
         out, calls = self._run({}, kwargs=dict(self.kwargs, chip_dir=None))
         self.assertEqual((out, calls), ({"consistency_check": "skipped_no_chips"}, []))

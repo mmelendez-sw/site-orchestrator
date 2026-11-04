@@ -2,7 +2,7 @@
 
 ICEMAN decides whether a Salesforce `Site__c` record has cellular equipment and what structure hosts it (tower subtype, rooftop, stealth, water tower…), then writes the result back to Salesforce. It works through an evidence cascade, from cheapest to most expensive, and stops as soon as the evidence is strong enough:
 
-1. **FCC / TowerSource** registry match (Azure SQL). A unique hit within 25 m writes `Site_Type`, coordinates and `Verified_Site_Source` with no imagery at all.
+1. **Registry** match (Azure SQL): FCC (`dbo.FCCComprehensiveTowerData`; dismantled, canceled and terminated registrations never match), TowerSource, and tower-company portals (`dbo.ScrapedCompetitorSites`). Rows for one physical structure (a shared ASR number, or two registries within `SAME_STRUCTURE_M`, 10 m) count as one candidate, typed by the most specific label (TowerSource first). A unique structure within 25 m writes `Site_Type`, coordinates and `Verified_Site_Source` with no imagery at all.
 2. **Free evidence:** Overture building footprints (pin check), NAIP aerials, Mapillary street photos, FCC ULS microwave and OpenCelliD signals, and Nearmap imagery an earlier run already bought.
 3. **Gemini** classifies the views; **Claude** independently confirms cellular gear (dual-model agreement).
 4. **Nearmap** Vert + obliques (paid, metered against a monthly budget) only for sites that still need high-resolution sides.
@@ -75,6 +75,7 @@ python -m enrichment.budget                                  # month-to-date Nea
   $env:APPLY="1"; $env:APPLY_EXISTING="1"; $env:RUN_DIR="<run folder>"; python -m enrichment
   ```
 - **Salesforce rejects a write** (duplicate rule, validation): the site falls back to `LLM_Classified=false`, `LLM_Holdout=true` so it leaves the queue; the error is in `sf_update_apply_log.csv`.
+- **Duplicate rule** (`DUPLICATES_DETECTED`): the retry also ticks `Potential_Duplicate__c` and is the one write sent with the duplicate rule's `allowSave` header, so the flag lands. Modes that leave failures unchanged (audits, rooftop confirm, attempt-date stamps) get only the flag plus the attempt date (`sf_update_status = duplicate_flagged`). The decision write itself never bypasses the rule. `DUPLICATE_FLAG_FIELD=0` turns this off.
 - **Gemini 429/503:** all workers pause together. If `WARNING Gemini 429` repeats, lower `GEMINI_RPM`. `GEMINI_FALLBACK_MODEL` retries on a GA model and opens a circuit breaker after `GEMINI_FALLBACK_AFTER` failures.
 
 ## Run modes
@@ -85,7 +86,7 @@ All modes run through `python -m enrichment` (one process) or `python -m enrichm
 |---|---|---|---|
 | Blank-type enrichment (default) | — | `Site_Type` blank, `LLM_Classified=false`, `Stage = Outreach - Verified` unless `STAGES` is set | `Site_Type`, coords, `Verified_Site_Source`, `LLM_Classified`; undecided sites held out |
 | ConnectX audit | `CONNECTX_AUDIT=1` | Rep-owned ConnectX rooftops (`AUDIT_POOL=1`: the Site Acquisition Team's pool) | See verdict table below |
-| Registry only | `DB_ONLY=1` | Blank type across lead stages, any owner | FCC/TowerSource hits only; no imagery or models |
+| Registry only | `DB_ONLY=1` | Blank type across lead stages, any owner (`SITE_TYPE=any SITE_TYPE_EXCLUDE=Rooftop` for typed sites) | Registry hits only; no imagery or models. A site that already has a `Site_Type` keeps it and its pin: the hit sets `Verified_Site`, fills a blank `Verified_Site_Source`, and logs the registry type (`db_site_type`). Misses get the attempt date only and stay in the imagery queue |
 | NAIP rooftop confirm | `CONFIRM_ROOFTOP=1` | Existing `Site_Type=Rooftop` | Confirms a building roof from NAIP + Gemini; no Nearmap or Claude |
 | Holdout re-score | `RERUN_HOLDOUTS_FROM=<date>`, `REUSE_CHIPS_FROM=<date>` | Earlier holdouts | Re-classifies on already-bought chips (`error=no_saved_chips` when none) |
 
@@ -103,11 +104,12 @@ With `AUDIT_HOLDOUT_OWNER=<User Id>` the unqualify step is replaced: every `no_a
 
 ## What ICEMAN writes
 
-- **Registry hit:** unique FCC/TowerSource match ≤ 25 m (or the pin on the structure ≤ 5 m) writes type and coordinates with no imagery.
+- **Registry hit:** unique FCC/TowerSource match ≤ 25 m (or the pin on the structure ≤ 5 m; in DB-only runs the nearest structure ≤ 10 m wins a cluster) writes type and coordinates with no imagery. DB-only near misses (unsettled clusters, competitor-portal-only hits, lone structures to 50 m, 150 m in rural areas by registry density) go to `review_queue.csv` instead, with the registry's structure address compared to the site's and, with `REGISTRY_NAIP_CHECK=1`, a NAIP chip at the registry point read by Gemini (`enrichment/registry_checks.py`).
 - **Towers:** Gemini tower + cell at site confidence ≥ 0.85 and gear confidence ≥ `GEMINI_TOWER_LOCK_CELL_CONF` (0.80) auto-apply; Claude can confirm weaker towers.
 - **Rooftops:** Nearmap obliques + dual-model agreement, or NAIP-only when site and cell confidence ≥ 0.95 with named gear, unhedged evidence and an asset box. A Mapillary photo may stand in for an oblique only with Claude's own box, cell confidence ≥ 0.9, no hedged wording and a photo ≤ `STREET_CONFIRM_MAX_AGE_YEARS` (5) old; those write `Verified_Site_Source = Google Map`.
 - **Consistency re-check** (`CONFIRM_CONSISTENCY`, on): each imagery-only confirm is re-classified on its saved chips and written only when both passes agree; a disagreement holds out as `consistency_disagree`.
 - **Everything else** holds out (`LLM_Classified=false`, `LLM_Holdout=true`) with a `holdout_reason` in the detail CSV.
+- **Attempt date:** every live write also sets `LLM_Last_Attempted_Date__c` (UTC, when the site finished). Sites a mode leaves unwritten (DB-only misses, audit inconclusives, rooftop-confirm failures, `DEQUEUE_HOLDOUTS=0`) get that field alone (`sf_update_status = stamped`), so their queue flags do not change. SQL-error and Nearmap-budget holdouts get nothing and are retried. `LLM_ATTEMPTED_FIELD=0` turns it off. `NOT_ATTEMPTED_SINCE=YYYY-MM-DD` queues only sites never attempted or last attempted before that date, so a DB-only slice does not re-pull its own misses. History before 2026-11-02 was backfilled with `scripts/backfill_attempt_dates.py`.
 
 ## Evidence sources (on by default)
 

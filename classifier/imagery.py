@@ -486,7 +486,10 @@ def _tile_position(view: str, tx: int, ty: int, x0: int, x1: int, y0: int, y1: i
 
 # Purposes the budget guard drops first (at the soft limit); "pack" (the
 # primary Vert / first oblique) only stops at the hard limit.
-OPTIONAL_PURPOSES = frozenset({"wide", "second", "recenter", "oblique_extra"})
+OPTIONAL_PURPOSES = frozenset({"wide", "second", "recenter", "oblique_extra", "detail"})
+# Zoom-21 close-up of a disputed rooftop box (DETAIL_ZOOM_CROP): side length in m.
+NEARMAP_DETAIL_ZOOM = env_int("NEARMAP_DETAIL_ZOOM", 21)
+NEARMAP_DETAIL_CHIP_M = env_float("NEARMAP_DETAIL_CHIP_M", 50)
 
 
 class NearmapMeter:

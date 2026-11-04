@@ -468,6 +468,16 @@ the crown.
 """
 
 
+DETAIL_CROP_NOTE = """
+
+CLOSE-UP: the image is a higher-zoom Nearmap close-up of the spot another \
+model flagged as cellular gear. Judge only what is visible here: sector \
+panels, RRUs, cable trays and antenna mounts count; HVAC units, vents, \
+bulkheads, skylights, railings and satellite dishes do not. If the gear is \
+still too small or blurry to name, set cell_equipment to null, not true.
+"""
+
+
 # Appended when SUPPLEMENTAL_CAN_CONFIRM=1 and street-level photos are in the views.
 STREET_BOX_NOTE = """
 Street-level photos (labels starting "Street-level photo") were taken from a \
