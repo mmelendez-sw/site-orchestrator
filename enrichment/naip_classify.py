@@ -1349,7 +1349,15 @@ def _classify_site_imagery(
         # Dual-model Haiku crop confirm covers the old Gemini crop recheck.
         # No usable box ⇒ cannot keep rooftop cell=true (proof chain incomplete).
         res = ac.enforce_rooftop_cell_requires_box(res, views)
-        confirm_views, used_crop = ac.build_cell_confirm_views(res, views)
+        # Claude confirms on Nearmap only when street photos cannot confirm: a
+        # box it draws on one is never written (2026-11-03: two rooftops Claude
+        # agreed on at 0.88 / 0.92 stayed held out after all four sides).
+        def confirm_base() -> list:
+            if nearmap_views and not supplemental_can_confirm:
+                return build_views(nearmap_views, street=False)
+            return views
+
+        confirm_views, used_crop = ac.build_cell_confirm_views(res, confirm_base())
         if (
             str(res.get("site_type") or "").lower() == "rooftop"
             and res.get("cell_equipment") is True
@@ -1357,7 +1365,7 @@ def _classify_site_imagery(
         ):
             # Last resort: do not dual-confirm full-scene when box/crop failed.
             res = ac.enforce_rooftop_cell_requires_box(res, views)
-            confirm_views, used_crop = ac.build_cell_confirm_views(res, views)
+            confirm_views, used_crop = ac.build_cell_confirm_views(res, confirm_base())
         if used_crop and verbose:
             progress.step("dual-model on cell crop")
         # Gemini's box before Claude can veto it: the close-up below zooms on it.
@@ -1374,7 +1382,7 @@ def _classify_site_imagery(
             from_wide_rescue=from_wide_rescue,
             used_crop=used_crop,
             allow_gemini_solo=False,
-            all_views=views,
+            all_views=confirm_base(),
         )
         # Escalate on qualification, not on Gemini's confidence: until Claude
         # confirms the gear at the imagery-only bar, buy the next side this site
@@ -1438,11 +1446,11 @@ def _classify_site_imagery(
                     again = ac.enforce_rooftop_cell_requires_box(again, views)
                     gemini_claim_box = ac.get_valid_asset_box(again)
                     gemini_claim_view = str(again.get("asset_view") or "")
-                    again_views, again_crop = ac.build_cell_confirm_views(again, views)
+                    again_views, again_crop = ac.build_cell_confirm_views(again, confirm_base())
                     res, dual_again, cell_agree = ac.confirm_rooftop_cell_with_claude(
                         again, clients, again_views, already_escalated=False,
                         allow_soft_keep=False, from_wide_rescue=from_wide_rescue,
-                        used_crop=again_crop, allow_gemini_solo=False, all_views=views,
+                        used_crop=again_crop, allow_gemini_solo=False, all_views=confirm_base(),
                     )
                     dual_model = dual_again or dual_model
                     continue
